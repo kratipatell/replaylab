@@ -1,3 +1,5 @@
+pub mod strategy;
+
 /// A single OHLC candle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Candle {
