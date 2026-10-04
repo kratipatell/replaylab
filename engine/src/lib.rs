@@ -1,3 +1,4 @@
+pub mod backtest;
 pub mod strategy;
 
 /// A single OHLC candle.
