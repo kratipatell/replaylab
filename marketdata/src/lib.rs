@@ -39,6 +39,10 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn latest_closed_open_ts(now_ms: i64, step_ms: i64) -> i64 {
+    (now_ms - now_ms.rem_euclid(step_ms)) - step_ms
+}
+
 /// Keep only candles that have closed: `ts + step_ms <= now_ms`.
 pub fn drop_unclosed(candles: Vec<Candle>, step_ms: i64, now_ms: i64) -> Vec<Candle> {
     candles
@@ -378,6 +382,14 @@ pub fn load_or_fetch(
     validate_symbol(symbol)?;
     let step = interval_ms(interval).ok_or_else(|| format!("unknown interval: {interval}"))?;
     let start_ms = start_ms - start_ms.rem_euclid(step);
+    let effective_end = end_ms.min(
+        latest_closed_open_ts(now_ms(), step)
+            .saturating_add(step)
+            .saturating_sub(1),
+    );
+    if start_ms > effective_end {
+        return Ok(Vec::new());
+    }
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("failed to create cache dir: {e}"))?;
     let path = cache_path(cache_dir, symbol, interval);
     if path.exists() {
@@ -385,17 +397,17 @@ pub fn load_or_fetch(
             if !cached.is_empty() {
                 let first = cached.first().map(|c| c.ts).unwrap_or(i64::MAX);
                 let last = cached.last().map(|c| c.ts).unwrap_or(i64::MIN);
-                if first <= start_ms && last.saturating_add(step) >= end_ms {
+                if first <= start_ms && last.saturating_add(step) >= effective_end {
                     let sliced: Vec<Candle> = cached
                         .into_iter()
-                        .filter(|c| c.ts >= start_ms && c.ts <= end_ms)
+                        .filter(|c| c.ts >= start_ms && c.ts <= effective_end)
                         .collect();
                     return Ok(sliced);
                 }
             }
         }
     }
-    let fetched = fetch_range(source, symbol, interval, start_ms, end_ms, 1000)?;
+    let fetched = fetch_range(source, symbol, interval, start_ms, effective_end, 1000)?;
     write_cache_file(&path, &fetched)?;
     Ok(fetched)
 }
@@ -707,6 +719,107 @@ mod tests {
         with_hole.remove(2);
         let gaps = find_gaps(&with_hole, 60_000);
         assert_eq!(gaps, vec![(60_000, 180_000)]);
+    }
+
+    #[test]
+    fn load_or_fetch_end_now_hits_cache_on_second_call() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let step = 86_400_000_i64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let latest_closed = (now_ms - now_ms.rem_euclid(step)) - step;
+        let data: Vec<Candle> = (0..5)
+            .map(|i| mk_candle(latest_closed - (4 - i) * step, 100.0 + i as f64))
+            .collect();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marketdata_test_end_now_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = FakeSource::new(data);
+        let start = latest_closed - 4 * step;
+        let end = now_ms;
+        let first = load_or_fetch(&dir, &src, "BTCUSDT", "1d", start, end).expect("first");
+        assert_eq!(first.len(), 5);
+        let calls_after_first = src.calls.get();
+        assert!(calls_after_first > 0);
+        let second = load_or_fetch(&dir, &src, "BTCUSDT", "1d", start, end).expect("second");
+        assert_eq!(second, first);
+        assert_eq!(
+            src.calls.get(),
+            calls_after_first,
+            "second call should not hit the source"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_fetch_future_start_returns_empty() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let step = 86_400_000_i64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let latest_closed = (now_ms - now_ms.rem_euclid(step)) - step;
+        let data: Vec<Candle> = (0..5)
+            .map(|i| mk_candle(latest_closed - (4 - i) * step, 100.0 + i as f64))
+            .collect();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marketdata_test_future_start_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = FakeSource::new(data);
+        let start = now_ms + 10 * step;
+        let end = start + step;
+        let out = load_or_fetch(&dir, &src, "BTCUSDT", "1d", start, end).expect("fetch");
+        assert!(out.is_empty());
+        assert_eq!(src.calls.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_fetch_future_end_returns_closed_candles() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let step = 86_400_000_i64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let latest_closed = (now_ms - now_ms.rem_euclid(step)) - step;
+        let data: Vec<Candle> = (0..5)
+            .map(|i| mk_candle(latest_closed - (4 - i) * step, 100.0 + i as f64))
+            .collect();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marketdata_test_future_end_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = FakeSource::new(data);
+        let start = latest_closed - 4 * step;
+        let end = now_ms + 10 * step;
+        let out = load_or_fetch(&dir, &src, "BTCUSDT", "1d", start, end).expect("fetch");
+        assert_eq!(out.len(), 5);
+        assert_eq!(out.last().map(|c| c.ts), Some(latest_closed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
