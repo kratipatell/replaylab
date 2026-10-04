@@ -1,5 +1,6 @@
 use crate::strategy::{Condition, IndicatorKind, Op, Operand, Rules, Side, Strategy};
 use crate::{ema, rsi, sma, Candle};
+use serde::Serialize;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,7 +18,7 @@ impl Default for BacktestConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ExitReason {
     Signal,
     StopLoss,
@@ -25,7 +26,7 @@ pub enum ExitReason {
     EndOfData,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Trade {
     pub entry_idx: usize,
     pub exit_idx: usize,
@@ -38,7 +39,7 @@ pub struct Trade {
     pub reason: ExitReason,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BacktestResult {
     pub trades: Vec<Trade>,
     pub equity_curve: Vec<f64>,
