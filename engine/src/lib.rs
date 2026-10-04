@@ -3,7 +3,7 @@ pub mod stats;
 pub mod strategy;
 
 /// A single OHLC candle.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Candle {
     pub ts: i64,
     pub open: f64,
