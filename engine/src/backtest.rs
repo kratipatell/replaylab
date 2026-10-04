@@ -332,25 +332,35 @@ pub fn backtest(
                 ),
             };
             let exit_raw_opt: Option<(f64, ExitReason)> = if sl_hit && tp_hit {
-                // stop wins
-                let s = stop_level.unwrap();
-                let raw = match side {
-                    Side::Long => {
-                        if o <= s {
-                            o
-                        } else {
-                            s
-                        }
-                    }
-                    Side::Short => {
-                        if o >= s {
-                            o
-                        } else {
-                            s
-                        }
-                    }
+                let t = target_level.unwrap();
+                let tp_gap = match side {
+                    Side::Long => o >= t,
+                    Side::Short => o <= t,
                 };
-                Some((raw, ExitReason::StopLoss))
+                if tp_gap {
+                    // Bar opened at or beyond take-profit: TP fires at open first.
+                    Some((o, ExitReason::TakeProfit))
+                } else {
+                    // stop wins
+                    let s = stop_level.unwrap();
+                    let raw = match side {
+                        Side::Long => {
+                            if o <= s {
+                                o
+                            } else {
+                                s
+                            }
+                        }
+                        Side::Short => {
+                            if o >= s {
+                                o
+                            } else {
+                                s
+                            }
+                        }
+                    };
+                    Some((raw, ExitReason::StopLoss))
+                }
             } else if sl_hit {
                 let s = stop_level.unwrap();
                 let raw = match side {
@@ -840,6 +850,252 @@ mod tests {
             (res.equity_curve[0] - 1.0).abs() < 1e-12,
             "equity must start at 1.0, got {}",
             res.equity_curve[0]
+        );
+    }
+
+    #[test]
+    fn crosses_above_number_triggers_once() {
+        let closes = [95.0, 99.0, 101.0, 102.0, 103.0];
+        let candles: Vec<Candle> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
+            .collect();
+        let entry = Rules {
+            all: vec![Condition {
+                left: ind(IndicatorKind::Close, None),
+                op: Op::CrossesAbove,
+                right: num(100.0),
+            }],
+            any: vec![],
+        };
+        let strat = long_strategy(entry, None, None, None);
+        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        assert_eq!(
+            res.trades.len(),
+            1,
+            "expected exactly one trade, got {:?}",
+            res.trades
+        );
+        assert_eq!(res.trades[0].entry_idx, 3);
+    }
+
+    #[test]
+    fn crosses_below_number_triggers_once_short() {
+        let closes = [105.0, 101.0, 99.0, 98.0, 97.0];
+        let candles: Vec<Candle> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
+            .collect();
+        let entry = Rules {
+            all: vec![Condition {
+                left: ind(IndicatorKind::Close, None),
+                op: Op::CrossesBelow,
+                right: num(100.0),
+            }],
+            any: vec![],
+        };
+        let strat = short_strategy(entry, None, None, None);
+        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        assert_eq!(
+            res.trades.len(),
+            1,
+            "expected exactly one trade, got {:?}",
+            res.trades
+        );
+        assert_eq!(res.trades[0].entry_idx, 3);
+    }
+
+    #[test]
+    fn take_profit_fills_at_target_level() {
+        let candles = vec![
+            c(0, 90.0, 115.0, 90.0, 110.0),
+            c(1, 100.0, 101.0, 99.0, 100.0),
+            c(2, 100.0, 106.0, 99.0, 102.0),
+        ];
+        let strat = long_strategy(entry_close_gt(100.0), None, None, Some(5.0));
+        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        assert_eq!(
+            res.trades.len(),
+            1,
+            "expected one trade, got {:?}",
+            res.trades
+        );
+        let t = &res.trades[0];
+        assert_eq!(t.reason, ExitReason::TakeProfit);
+        assert!(
+            (t.exit_price - 105.0).abs() < 1e-12,
+            "exit {} expected exactly 105.0",
+            t.exit_price
+        );
+    }
+
+    #[test]
+    fn any_semantics_entry() {
+        let entry = Rules {
+            all: vec![],
+            any: vec![
+                Condition {
+                    left: ind(IndicatorKind::Close, None),
+                    op: Op::Lt,
+                    right: num(90.0),
+                },
+                Condition {
+                    left: ind(IndicatorKind::Close, None),
+                    op: Op::Gt,
+                    right: num(110.0),
+                },
+            ],
+        };
+        // Closes 100, 85, 100, 100: signal at idx 1 fills at idx 2.
+        let closes = [100.0, 85.0, 100.0, 100.0];
+        let candles: Vec<Candle> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
+            .collect();
+        let strat = long_strategy(entry.clone(), None, None, None);
+        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        assert_eq!(
+            res.trades.len(),
+            1,
+            "expected one trade, got {:?}",
+            res.trades
+        );
+        assert_eq!(res.trades[0].entry_idx, 2);
+        // All flat: no trades.
+        let flat_closes = [100.0, 100.0, 100.0, 100.0];
+        let flat: Vec<Candle> = flat_closes
+            .iter()
+            .enumerate()
+            .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
+            .collect();
+        let strat2 = long_strategy(entry, None, None, None);
+        let res2 = backtest(&strat2, &flat, &zero_cost()).unwrap();
+        assert!(
+            res2.trades.is_empty(),
+            "expected no trades, got {:?}",
+            res2.trades
+        );
+    }
+
+    #[test]
+    fn equity_curve_equals_compounded_trade_returns() {
+        let closes = [
+            95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0,
+        ];
+        let candles: Vec<Candle> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, cl)| c(i as i64, *cl, *cl + 1.0, *cl - 1.0, *cl))
+            .collect();
+        let entry = entry_close_gt(100.0);
+        let exit_rules = Rules {
+            all: vec![],
+            any: vec![Condition {
+                left: ind(IndicatorKind::Close, None),
+                op: Op::Lt,
+                right: num(100.0),
+            }],
+        };
+        let strat = long_strategy(entry, Some(exit_rules), None, None);
+        let cfg = BacktestConfig::default();
+        let res = backtest(&strat, &candles, &cfg).unwrap();
+        let mut expected = 1.0;
+        for t in &res.trades {
+            expected *= 1.0 + t.return_pct / 100.0;
+        }
+        let last = *res.equity_curve.last().expect("equity curve non-empty");
+        assert!(
+            (last - expected).abs() < 1e-9,
+            "last equity {last} != compounded {expected}"
+        );
+    }
+
+    #[test]
+    fn no_lookahead_with_indicator_truncation() {
+        let n = 40usize;
+        let closes: Vec<f64> = (0..n)
+            .map(|i| 100.0 + 10.0 * (i as f64 * 0.7).sin())
+            .collect();
+        let mut candles: Vec<Candle> = Vec::with_capacity(n);
+        let mut prev_close: f64 = 100.0;
+        for (i, cl) in closes.iter().enumerate() {
+            let open: f64 = if i == 0 { 100.0 } else { prev_close };
+            let high = open.max(*cl) + 1.0;
+            let low = open.min(*cl) - 1.0;
+            candles.push(c(i as i64, open, high, low, *cl));
+            prev_close = *cl;
+        }
+        let entry = Rules {
+            all: vec![Condition {
+                left: ind(IndicatorKind::Close, None),
+                op: Op::CrossesAbove,
+                right: ind(IndicatorKind::Sma, Some(3)),
+            }],
+            any: vec![],
+        };
+        let exit_rules = Rules {
+            all: vec![Condition {
+                left: ind(IndicatorKind::Close, None),
+                op: Op::CrossesBelow,
+                right: ind(IndicatorKind::Sma, Some(3)),
+            }],
+            any: vec![],
+        };
+        let strat = long_strategy(entry, Some(exit_rules), None, None);
+        let cfg = zero_cost();
+        let full = backtest(&strat, &candles, &cfg).unwrap();
+        let trunc = backtest(&strat, &candles[..25], &cfg).unwrap();
+        for tt in trunc
+            .trades
+            .iter()
+            .filter(|t| t.reason != ExitReason::EndOfData)
+        {
+            let found = full.trades.iter().any(|ft| {
+                ft.entry_idx == tt.entry_idx
+                    && ft.exit_idx == tt.exit_idx
+                    && ft.entry_ts == tt.entry_ts
+                    && ft.exit_ts == tt.exit_ts
+                    && ft.side == tt.side
+                    && (ft.entry_price - tt.entry_price).abs() < 1e-12
+                    && (ft.exit_price - tt.exit_price).abs() < 1e-12
+                    && (ft.return_pct - tt.return_pct).abs() < 1e-12
+                    && ft.reason == tt.reason
+            });
+            assert!(
+                found,
+                "truncated trade {:?} not found identically in full {:?}",
+                tt, full.trades
+            );
+        }
+        assert!(
+            trunc
+                .trades
+                .iter()
+                .any(|t| t.reason != ExitReason::EndOfData),
+            "expected at least one non-EndOfData trade in truncated run, got {:?}",
+            trunc.trades
+        );
+    }
+
+    #[test]
+    fn gap_up_open_beyond_target_fills_take_profit_at_open() {
+        let candles = vec![
+            c(0, 90.0, 115.0, 90.0, 110.0),
+            c(1, 100.0, 101.0, 99.0, 100.0),
+            c(2, 105.0, 106.0, 90.0, 95.0),
+        ];
+        let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), Some(2.0));
+        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        assert!(!res.trades.is_empty());
+        let t = &res.trades[0];
+        assert_eq!(t.reason, ExitReason::TakeProfit);
+        assert!(
+            (t.exit_price - 105.0).abs() < 1e-12,
+            "exit {} expected open 105.0",
+            t.exit_price
         );
     }
 }
