@@ -359,7 +359,27 @@ fn write_cache_file(path: &Path, candles: &[Candle]) -> Result<(), String> {
         writeln!(text, "{},{},{},{},{}", c.ts, c.open, c.high, c.low, c.close)
             .map_err(|e| format!("failed to format cache: {e}"))?;
     }
-    std::fs::write(path, text).map_err(|e| format!("failed to write cache: {e}"))?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cache.csv".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!("{file_name}.tmp-{}-{nanos}", std::process::id());
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
+    };
+    if let Err(e) = std::fs::write(&tmp_path, text) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to write cache: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to write cache: {e}"));
+    }
     Ok(())
 }
 
@@ -408,6 +428,9 @@ pub fn load_or_fetch(
         }
     }
     let fetched = fetch_range(source, symbol, interval, start_ms, effective_end, 1000)?;
+    if fetched.is_empty() {
+        return Ok(fetched);
+    }
     write_cache_file(&path, &fetched)?;
     Ok(fetched)
 }
