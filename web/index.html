@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ReplayLab</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header>
+  <h1>ReplayLab</h1>
+  <span id="status">idle</span>
+</header>
+<main>
+  <section class="card" id="runner">
+    <h2>Runner</h2>
+    <form id="run-form">
+      <div class="row">
+        <label>Symbol <input id="f-symbol" value="BTCUSDT" required /></label>
+        <label>Interval
+          <select id="f-interval">
+            <option>1m</option><option>5m</option><option>15m</option>
+            <option selected>1h</option><option>4h</option><option>1d</option>
+          </select>
+        </label>
+        <label>Side
+          <select id="f-side"><option value="long">long</option><option value="short">short</option></select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Start <input id="f-start" type="datetime-local" required /></label>
+        <label>End <input id="f-end" type="datetime-local" required /></label>
+      </div>
+      <fieldset>
+        <legend>Entry: indicator <em>op</em> value</legend>
+        <div class="row">
+          <select id="f-entry-ind">
+            <option value="close">close</option><option value="sma">sma</option>
+            <option value="ema">ema</option><option value="rsi">rsi</option>
+          </select>
+          <input id="f-entry-period" type="number" min="1" value="14" title="period" />
+          <select id="f-entry-op">
+            <option value=">">&gt;</option><option value="<">&lt;</option>
+            <option value="crosses_above">crosses_above</option>
+            <option value="crosses_below">crosses_below</option>
+          </select>
+          <input id="f-entry-val" type="number" step="any" value="100" required />
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend><label><input id="f-use-exit" type="checkbox" checked /> Exit</label></legend>
+        <div class="row">
+          <select id="f-exit-ind">
+            <option value="close">close</option><option value="sma">sma</option>
+            <option value="ema">ema</option><option value="rsi" selected>rsi</option>
+          </select>
+          <input id="f-exit-period" type="number" min="1" value="14" title="period" />
+          <select id="f-exit-op">
+            <option value=">">&gt;</option><option value="<">&lt;</option>
+            <option value="crosses_above">crosses_above</option>
+            <option value="crosses_below">crosses_below</option>
+          </select>
+          <input id="f-exit-val" type="number" step="any" value="55" />
+        </div>
+      </fieldset>
+      <div class="row">
+        <label>Stop % <input id="f-sl" type="number" step="any" min="0" placeholder="e.g. 2" /></label>
+        <label>Target % <input id="f-tp" type="number" step="any" min="0" placeholder="e.g. 4" /></label>
+        <label>Fee bps <input id="f-fee" type="number" step="any" value="5" /></label>
+        <label>Slip bps <input id="f-slip" type="number" step="any" value="2" /></label>
+      </div>
+      <button type="submit" id="run-btn">Run backtest</button>
+      <p id="error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <section class="card" id="results">
+    <h2>Results <span id="run-id"></span></h2>
+    <div id="stats" class="tiles"><p class="muted">No run yet. Run a backtest or load one below.</p></div>
+    <h3>Equity</h3>
+    <canvas id="ch-equity" width="640" height="180"></canvas>
+    <h3>Drawdown %</h3>
+    <canvas id="ch-dd" width="640" height="120"></canvas>
+    <h3>Monthly %</h3>
+    <canvas id="ch-monthly" width="640" height="160"></canvas>
+  </section>
+
+  <section class="card" id="runs-card">
+    <h2>Runs</h2>
+    <table id="runs-table">
+      <thead><tr><th>id</th><th>time</th><th>symbol</th><th>tf</th><th>trades</th><th>return %</th><th>sharpe</th><th>maxDD %</th><th></th></tr></thead>
+      <tbody id="runs-body"><tr><td colspan="9" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

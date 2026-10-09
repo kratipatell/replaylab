@@ -21,6 +21,8 @@ pub struct AppState {
     pub source: Arc<dyn crate::feeds::KlineSource + Send + Sync>,
     pub cache_dir: PathBuf,
     pub jobs: Arc<JobStore>,
+    pub db: Arc<crate::db::Db>,
+    pub web_dir: PathBuf,
 }
 
 pub struct JobStore {
@@ -128,6 +130,11 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, String> 
         .route("/backtest", post(post_backtest))
         .route("/optimize", post(post_optimize).get(list_optimize))
         .route("/optimize/{job_id}", get(get_optimize))
+        .route("/runs", get(list_runs))
+        .route("/runs/{id}", get(get_run))
+        .route("/", get(serve_index))
+        .route("/app.js", get(serve_app_js))
+        .route("/styles.css", get(serve_styles))
         .with_state(state)
         .layer(cors))
 }
@@ -228,9 +235,11 @@ struct BacktestBody {
 
 #[derive(Debug, Serialize)]
 struct BacktestResponse {
+    run_id: Option<i64>,
     candle_count: usize,
     gaps: Vec<(i64, i64)>,
     stats: crate::stats::Stats,
+    metrics: crate::stats::MetricsV2,
     in_sample: Option<crate::stats::Stats>,
     out_of_sample: Option<crate::stats::Stats>,
     trades: Vec<crate::backtest::Trade>,
@@ -349,10 +358,39 @@ async fn post_backtest(
         }
     };
     let gaps = crate::feeds::find_gaps(&candles, step);
+    let metrics = crate::stats::compute_v2(&result, &candles, bars_per_year);
+    let stats_v = serde_json::to_value(&stats).unwrap_or_default();
+    let metrics_v = serde_json::to_value(&metrics).unwrap_or_default();
+    let equity_v =
+        serde_json::to_value(&result.equity_curve).unwrap_or_default();
+    let trades_v = serde_json::to_value(&result.trades).unwrap_or_default();
+    let strategy_v = serde_json::to_value(&req.strategy).unwrap_or_default();
+    let run_id = match state.db.save_run(
+        &req.strategy.asset,
+        &req.strategy.timeframe,
+        req.start_ms,
+        req.end_ms,
+        &strategy_v,
+        &stats_v,
+        &metrics_v,
+        &equity_v,
+        &trades_v,
+    ) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("save run: {e}"),
+            )
+            .into_response()
+        }
+    };
     let resp = BacktestResponse {
+        run_id,
         candle_count: candles.len(),
         gaps,
         stats,
+        metrics,
         in_sample,
         out_of_sample,
         trades: result.trades,
@@ -519,6 +557,54 @@ async fn list_optimize(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({ "jobs": state.jobs.summaries() }))
 }
 
+async fn list_runs(State(state): State<AppState>) -> Response {
+    match state.db.list_runs(100) {
+        Ok(runs) => (StatusCode::OK, Json(serde_json::json!({ "runs": runs }))).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn get_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match state.db.get_run(id) {
+        Ok(Some(run)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(run).unwrap_or_default()),
+        )
+            .into_response(),
+        Ok(None) => err_json(StatusCode::NOT_FOUND, format!("unknown run: {id}")).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+fn serve_file(dir: &PathBuf, name: &str, content_type: &str) -> Response {
+    let path = dir.join(name);
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => err_json(StatusCode::NOT_FOUND, format!("missing {name}")).into_response(),
+    }
+}
+
+async fn serve_index(State(state): State<AppState>) -> Response {
+    serve_file(&state.web_dir, "index.html", "text/html; charset=utf-8")
+}
+
+async fn serve_app_js(State(state): State<AppState>) -> Response {
+    serve_file(
+        &state.web_dir,
+        "app.js",
+        "application/javascript; charset=utf-8",
+    )
+}
+
+async fn serve_styles(State(state): State<AppState>) -> Response {
+    serve_file(&state.web_dir, "styles.css", "text/css; charset=utf-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +691,8 @@ mod tests {
             source: Arc::new(FakeSource::new()),
             cache_dir: dir,
             jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            web_dir: PathBuf::from("web"),
         }
     }
 
@@ -974,6 +1062,8 @@ mod tests {
             source: Arc::new(FailingSource),
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            web_dir: PathBuf::from("web"),
         };
         let uri = format!(
             "/candles?symbol=BTCUSDT&interval=1h&start={}&end={}",
@@ -1146,6 +1236,67 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backtest_saves_run_and_lists_it() {
+        let dir = temp_dir("runs_save");
+        let fake = FakeSource::new();
+        let router = app(test_state(dir.clone()));
+        let body = serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": fake.start(),
+            "end_ms": fake.end(),
+        });
+        let res = router
+            .clone()
+            .oneshot(
+                Request::post("/backtest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let run_id = v["run_id"].as_i64().expect("run_id");
+        assert!(v["metrics"]["monthly"].is_object(), "metrics.monthly: {v}");
+        assert!(v["equity_curve"].is_array());
+
+        let res = router
+            .clone()
+            .oneshot(Request::get("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let listed = body_json(res).await;
+        let runs = listed["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"].as_i64().unwrap(), run_id);
+        assert_eq!(runs[0]["symbol"].as_str().unwrap(), "BTCUSDT");
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/runs/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let detail = body_json(res).await;
+        assert_eq!(detail["id"].as_i64().unwrap(), run_id);
+        assert!(detail["equity_curve"].is_array());
+        assert!(detail["trades"].is_array());
+
+        let res = router
+            .oneshot(Request::get("/runs/999999").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);

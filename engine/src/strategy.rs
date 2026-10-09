@@ -12,7 +12,7 @@ pub enum Side {
 ///
 /// Price indicators (`open`, `high`, `low`, `close`) carry no period;
 /// computed indicators (`sma`, `ema`, `rsi`) carry a period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndicatorKind {
     Open,
@@ -24,7 +24,7 @@ pub enum IndicatorKind {
     Rsi,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndicatorRef {
     pub ind: IndicatorKind,
@@ -32,7 +32,7 @@ pub struct IndicatorRef {
 }
 
 /// Either a literal number or an indicator reference.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Operand {
     Number(f64),
@@ -40,7 +40,7 @@ pub enum Operand {
 }
 
 /// Comparison / crossover operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Op {
     #[serde(rename = "<")]
     Lt,
@@ -52,7 +52,7 @@ pub enum Op {
     CrossesBelow,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Condition {
     pub left: Operand,
@@ -60,7 +60,7 @@ pub struct Condition {
     pub right: Operand,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rules {
     #[serde(default)]
@@ -69,14 +69,14 @@ pub struct Rules {
     pub any: Vec<Condition>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
     pub win_rate_pct: Option<f64>,
     pub quote: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Strategy {
     pub asset: String,
