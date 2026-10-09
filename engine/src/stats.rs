@@ -268,6 +268,274 @@ pub fn split_stats(
     Ok((is_stats, oos_stats))
 }
 
+/// One underwater excursion of the equity curve.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DrawdownPeriod {
+    pub start_idx: usize,
+    pub trough_idx: usize,
+    /// Recovery bar index, or `None` when still underwater at the end.
+    pub end_idx: Option<usize>,
+    pub depth_pct: f64,
+    pub length_bars: usize,
+}
+
+/// Extended metrics (Engine v2).
+///
+/// Conventions: risk-free rate is 0; `bars_per_year` annualises Sharpe and
+/// Sortino the same way. `calmar` is the simple ratio
+/// `total_return_pct / max_drawdown_pct` (0 when there is no drawdown),
+/// deliberately *not* CAGR-based so short intraday windows stay meaningful.
+/// Monthly and weekday returns compound per-bar equity returns geometrically.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MetricsV2 {
+    pub sortino: f64,
+    pub calmar: f64,
+    pub max_win_streak: usize,
+    pub max_loss_streak: usize,
+    pub drawdown_periods: Vec<DrawdownPeriod>,
+    pub monthly: std::collections::BTreeMap<String, f64>,
+    pub by_weekday: std::collections::BTreeMap<String, f64>,
+}
+
+pub const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// Days since Unix epoch for `ts_ms` (floored).
+fn days_since_epoch(ts_ms: i64) -> i64 {
+    ts_ms.div_euclid(86_400_000)
+}
+
+/// Monday=0..Sunday=6 for `ts_ms`. 1970-01-01 was a Thursday.
+fn weekday_idx(ts_ms: i64) -> usize {
+    (days_since_epoch(ts_ms) + 3).rem_euclid(7) as usize
+}
+
+/// Proleptic Gregorian (year, month, day) for `ts_ms` (UTC).
+/// Howard Hinnant's civil-from-days algorithm, no dependencies.
+fn ymd(ts_ms: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch(ts_ms) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    if m <= 2 {
+        y += 1;
+    }
+    (y as i32, m, d)
+}
+
+fn month_key(ts_ms: i64) -> String {
+    let (y, m, _) = ymd(ts_ms);
+    format!("{y:04}-{m:02}")
+}
+
+fn downside_deviation(equity: &[f64], bars_per_year: f64) -> f64 {
+    if equity.len() < 2 || !bars_per_year.is_finite() || bars_per_year <= 0.0 {
+        return 0.0;
+    }
+    let mut downside: Vec<f64> = Vec::new();
+    for w in equity.windows(2) {
+        let (prev, cur) = (w[0], w[1]);
+        if !prev.is_finite() || !cur.is_finite() || prev == 0.0 {
+            return 0.0;
+        }
+        let r = cur / prev - 1.0;
+        if r < 0.0 {
+            downside.push(r);
+        }
+    }
+    if downside.is_empty() {
+        return 0.0;
+    }
+    let mean = downside.iter().sum::<f64>() / downside.len() as f64;
+    if !mean.is_finite() {
+        return 0.0;
+    }
+    let var = downside
+        .iter()
+        .map(|r| (r - mean) * (r - mean))
+        .sum::<f64>()
+        / downside.len() as f64;
+    if !var.is_finite() {
+        return 0.0;
+    }
+    let std = var.sqrt();
+    if std == 0.0 || !std.is_finite() {
+        return 0.0;
+    }
+    // Mean excess return over all bars divided by downside deviation.
+    let all_mean = {
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for w in equity.windows(2) {
+            sum += w[1] / w[0] - 1.0;
+            n += 1;
+        }
+        sum / n as f64
+    };
+    all_mean / std * bars_per_year.sqrt()
+}
+
+fn streaks(trades: &[crate::backtest::Trade]) -> (usize, usize) {
+    let mut max_w = 0usize;
+    let mut max_l = 0usize;
+    let mut cur_w = 0usize;
+    let mut cur_l = 0usize;
+    for t in trades {
+        if t.return_pct > 0.0 {
+            cur_w += 1;
+            cur_l = 0;
+            if cur_w > max_w {
+                max_w = cur_w;
+            }
+        } else {
+            cur_l += 1;
+            cur_w = 0;
+            if cur_l > max_l {
+                max_l = cur_l;
+            }
+        }
+    }
+    (max_w, max_l)
+}
+
+fn drawdown_periods(equity: &[f64]) -> Vec<DrawdownPeriod> {
+    let mut out = Vec::new();
+    if equity.is_empty() {
+        return out;
+    }
+    let mut peak = equity[0];
+    let mut peak_idx = 0usize;
+    let mut trough_idx = 0usize;
+    let mut in_dd = false;
+    for (i, &e) in equity.iter().enumerate() {
+        if !e.is_finite() || !peak.is_finite() {
+            continue;
+        }
+        if e > peak {
+            if in_dd {
+                let depth = if peak != 0.0 {
+                    (peak - equity[trough_idx]) / peak * 100.0
+                } else {
+                    0.0
+                };
+                out.push(DrawdownPeriod {
+                    start_idx: peak_idx,
+                    trough_idx,
+                    end_idx: Some(i),
+                    depth_pct: depth,
+                    length_bars: i - peak_idx,
+                });
+                in_dd = false;
+            }
+            peak = e;
+            peak_idx = i;
+        } else if e < peak {
+            if !in_dd {
+                in_dd = true;
+                trough_idx = i;
+            } else if e < equity[trough_idx] {
+                trough_idx = i;
+            }
+        } else if in_dd && e >= peak {
+            let depth = if peak != 0.0 {
+                (peak - equity[trough_idx]) / peak * 100.0
+            } else {
+                0.0
+            };
+            out.push(DrawdownPeriod {
+                start_idx: peak_idx,
+                trough_idx,
+                end_idx: Some(i),
+                depth_pct: depth,
+                length_bars: i - peak_idx,
+            });
+            in_dd = false;
+        }
+    }
+    if in_dd {
+        let depth = if peak != 0.0 && peak.is_finite() {
+            (peak - equity[trough_idx]) / peak * 100.0
+        } else {
+            0.0
+        };
+        let last = equity.len() - 1;
+        out.push(DrawdownPeriod {
+            start_idx: peak_idx,
+            trough_idx,
+            end_idx: None,
+            depth_pct: depth,
+            length_bars: last - peak_idx,
+        });
+    }
+    out
+}
+
+/// Attribute per-bar equity returns to month and weekday buckets.
+///
+/// `candles[i].ts` dates bar `i`; the return `equity[i+1]/equity[i]-1`
+/// is credited to the month/weekday of bar `i+1`.
+fn attribute_buckets(
+    equity: &[f64],
+    candles: &[Candle],
+) -> (
+    std::collections::BTreeMap<String, f64>,
+    std::collections::BTreeMap<String, f64>,
+) {
+    use std::collections::BTreeMap;
+    let mut monthly_factor: BTreeMap<String, f64> = BTreeMap::new();
+    let mut weekday_factor: BTreeMap<String, f64> = BTreeMap::new();
+    let n = equity.len().min(candles.len());
+    if n < 2 {
+        return (BTreeMap::new(), BTreeMap::new());
+    }
+    for i in 1..n {
+        let (prev, cur) = (equity[i - 1], equity[i]);
+        if !prev.is_finite() || !cur.is_finite() || prev == 0.0 {
+            continue;
+        }
+        let growth = cur / prev;
+        let mk = month_key(candles[i].ts);
+        *monthly_factor.entry(mk).or_insert(1.0) *= growth;
+        let wd = WEEKDAY_NAMES[weekday_idx(candles[i].ts)].to_string();
+        *weekday_factor.entry(wd).or_insert(1.0) *= growth;
+    }
+    let monthly = monthly_factor
+        .into_iter()
+        .map(|(k, f)| (k, (f - 1.0) * 100.0))
+        .collect();
+    let by_weekday = weekday_factor
+        .into_iter()
+        .map(|(k, f)| (k, (f - 1.0) * 100.0))
+        .collect();
+    (monthly, by_weekday)
+}
+
+pub fn compute_v2(result: &BacktestResult, candles: &[Candle], bars_per_year: f64) -> MetricsV2 {
+    let base = compute_stats(result, candles, bars_per_year);
+    let sortino = downside_deviation(&result.equity_curve, bars_per_year);
+    let calmar = if base.max_drawdown_pct == 0.0 {
+        0.0
+    } else {
+        base.total_return_pct / base.max_drawdown_pct
+    };
+    let (max_win_streak, max_loss_streak) = streaks(&result.trades);
+    let dd = drawdown_periods(&result.equity_curve);
+    let (monthly, by_weekday) = attribute_buckets(&result.equity_curve, candles);
+    MetricsV2 {
+        sortino,
+        calmar,
+        max_win_streak,
+        max_loss_streak,
+        drawdown_periods: dd,
+        monthly,
+        by_weekday,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +755,100 @@ mod tests {
         let sharpe_1d = compute_stats(&result, &[], bpy_1d).sharpe;
         let expected = (8760.0_f64 / 365.0).sqrt();
         assert_approx(sharpe_1h / sharpe_1d, expected, 1e-9);
+    }
+
+    #[test]
+    fn v2_streaks_win_and_loss() {
+        let result = BacktestResult {
+            trades: vec![
+                mk_trade(1.0, 0),
+                mk_trade(1.0, 1),
+                mk_trade(-1.0, 2),
+                mk_trade(-1.0, 3),
+                mk_trade(-1.0, 4),
+                mk_trade(2.0, 5),
+            ],
+            equity_curve: vec![1.0; 7],
+        };
+        let m = compute_v2(&result, &[], 252.0);
+        assert_eq!(m.max_win_streak, 2);
+        assert_eq!(m.max_loss_streak, 3);
+    }
+
+    #[test]
+    fn v2_drawdown_period_recovered() {
+        // Peak 1.2 at idx 1, trough 0.9 at idx 2, recovered at idx 4.
+        let result = BacktestResult {
+            trades: Vec::new(),
+            equity_curve: vec![1.0, 1.2, 0.9, 1.1, 1.2],
+        };
+        let m = compute_v2(&result, &[], 252.0);
+        assert_eq!(m.drawdown_periods.len(), 1);
+        let dd = &m.drawdown_periods[0];
+        assert_eq!(dd.start_idx, 1);
+        assert_eq!(dd.trough_idx, 2);
+        assert_eq!(dd.end_idx, Some(4));
+        assert_approx(dd.depth_pct, 25.0, 1e-9);
+        assert_eq!(dd.length_bars, 3);
+        // Calmar = total 20% / maxDD 25% = 0.8.
+        assert_approx(m.calmar, 0.8, 1e-9);
+    }
+
+    #[test]
+    fn v2_drawdown_open_when_never_recovered() {
+        let result = BacktestResult {
+            trades: Vec::new(),
+            equity_curve: vec![1.0, 1.5, 1.0],
+        };
+        let m = compute_v2(&result, &[], 252.0);
+        assert_eq!(m.drawdown_periods.len(), 1);
+        assert_eq!(m.drawdown_periods[0].end_idx, None);
+    }
+
+    #[test]
+    fn v2_sortino_zero_without_losses() {
+        let result = BacktestResult {
+            trades: vec![mk_trade(1.0, 0)],
+            equity_curve: vec![1.0, 1.01, 1.02],
+        };
+        let m = compute_v2(&result, &[], 252.0);
+        assert_approx(m.sortino, 0.0, 1e-12);
+    }
+
+    #[test]
+    fn v2_monthly_and_weekday_attribution() {
+        // 1970-01-01 is a Thursday. Two bars: equity 1.0 -> 1.1.
+        let candles = vec![
+            Candle {
+                ts: 0,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+            Candle {
+                ts: 3_600_000,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+        ];
+        let result = BacktestResult {
+            trades: Vec::new(),
+            equity_curve: vec![1.0, 1.1],
+        };
+        let m = compute_v2(&result, &candles, 252.0);
+        assert_approx(m.monthly["1970-01"], 10.0, 1e-9);
+        assert_approx(m.by_weekday["Thu"], 10.0, 1e-9);
+        assert_eq!(m.monthly.len(), 1);
+    }
+
+    #[test]
+    fn v2_ymd_known_dates() {
+        assert_eq!(ymd(0), (1970, 1, 1));
+        assert_eq!(weekday_idx(0), 3); // Thursday
+                                       // 1970-01-05 is a Monday.
+        assert_eq!(weekday_idx(4 * 86_400_000), 0);
     }
 }

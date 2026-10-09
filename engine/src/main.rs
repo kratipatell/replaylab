@@ -3,10 +3,16 @@
 
 mod api;
 mod backtest;
+mod backtest_v2;
 mod config;
 mod feeds;
 mod indicators;
+mod instrument;
+mod orb_recon;
+mod session;
+mod sizing;
 mod stats;
+mod strategies;
 mod strategy;
 mod types;
 

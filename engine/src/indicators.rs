@@ -127,6 +127,49 @@ pub fn rsi(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+/// True range for one bar given the previous close.
+///
+/// `TR = max(high - low, |high - prev_close|, |low - prev_close|)`.
+pub fn true_range(high: f64, low: f64, prev_close: f64) -> f64 {
+    let hl = high - low;
+    let hc = (high - prev_close).abs();
+    let lc = (low - prev_close).abs();
+    hl.max(hc).max(lc)
+}
+
+/// Average true range with Wilder smoothing.
+///
+/// Returns a `Vec` the same length as the input. The first `n - 1` values
+/// are `f64::NAN`; entry `n - 1` is the simple mean of the first `n` true
+/// ranges, afterwards `atr = (prev * (n - 1) + tr) / n`.
+///
+/// Edge cases mirror [`sma`]: `n == 0`, empty input, or `n > len` yields
+/// all `NAN` (or empty).
+pub fn atr(candles: &[crate::types::Candle], n: usize) -> Vec<f64> {
+    let len = candles.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    if n == 0 || n > len {
+        return vec![f64::NAN; len];
+    }
+    let mut tr = Vec::with_capacity(len);
+    for (i, c) in candles.iter().enumerate() {
+        if i == 0 {
+            tr.push(c.high - c.low);
+        } else {
+            tr.push(true_range(c.high, c.low, candles[i - 1].close));
+        }
+    }
+    let mut out = vec![f64::NAN; len];
+    let seed: f64 = tr[..n].iter().sum::<f64>() / n as f64;
+    out[n - 1] = seed;
+    for i in n..len {
+        out[i] = (out[i - 1] * (n as f64 - 1.0) + tr[i]) / n as f64;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +322,40 @@ mod tests {
         assert!(got[0].is_nan() && got[1].is_nan() && got[2].is_nan());
         assert!(!got[3].is_nan());
         assert_approx_eq(got[3], 100.0, 1e-12);
+    }
+
+    fn mk_candle_ts(h: f64, l: f64, c: f64) -> crate::types::Candle {
+        crate::types::Candle {
+            ts: 0,
+            open: c,
+            high: h,
+            low: l,
+            close: c,
+        }
+    }
+
+    #[test]
+    fn atr_hand_computed_wilder() {
+        // TR0 = 10-9 = 1.0
+        // TR1 = max(11-9.5=1.5, |11-9.5|=1.5, |9.5-9.5|=0) = 1.5
+        // TR2 = max(12-10=2, |12-10.5|=1.5, |10-10.5|=0.5) = 2.0
+        // n=2: atr[1] = (1.0+1.5)/2 = 1.25, atr[2] = (1.25+2.0)/2 = 1.625
+        let candles = vec![
+            mk_candle_ts(10.0, 9.0, 9.5),
+            mk_candle_ts(11.0, 9.5, 10.5),
+            mk_candle_ts(12.0, 10.0, 11.0),
+        ];
+        let got = atr(&candles, 2);
+        let expected = vec![f64::NAN, 1.25, 1.625];
+        assert_vec_approx_eq(&got, &expected, 1e-12);
+    }
+
+    #[test]
+    fn atr_edges() {
+        let candles = vec![mk_candle_ts(10.0, 9.0, 9.5)];
+        assert!(atr(&candles, 5).iter().all(|v| v.is_nan()));
+        assert!(atr(&candles, 0).iter().all(|v| v.is_nan()));
+        let empty: Vec<crate::types::Candle> = Vec::new();
+        assert!(atr(&empty, 14).is_empty());
     }
 }

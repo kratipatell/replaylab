@@ -24,6 +24,8 @@ pub enum ExitReason {
     Signal,
     StopLoss,
     TakeProfit,
+    Trailing,
+    SessionEnd,
     EndOfData,
 }
 
