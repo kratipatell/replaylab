@@ -26,7 +26,7 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, String> 
         .parse()
         .map_err(|e| format!("invalid origin {origin:?}: {e}"))?;
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(origin_header))
+        .allow_origin(AllowOrigin::list([origin_header]))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
     Ok(Router::new()
@@ -229,6 +229,10 @@ async fn post_backtest(
         Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
         Ok(Ok(c)) => c,
     };
+    if candles.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "no candles in range".to_string())
+            .into_response();
+    }
     let cfg = engine::backtest::BacktestConfig {
         fee_bps,
         slippage_bps,
@@ -606,6 +610,184 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FailingSource;
+
+    impl marketdata::KlineSource for FailingSource {
+        fn fetch(
+            &self,
+            _symbol: &str,
+            _interval: &str,
+            _start_ms: i64,
+            _end_ms: i64,
+            _limit: usize,
+        ) -> Result<Vec<engine::Candle>, String> {
+            Err("boom".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_allows_configured_origin() {
+        let dir = temp_dir("cors_allow");
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let allow = res
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("cors allow-origin header");
+        assert_eq!(allow, "http://localhost:3000");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cors_blocks_other_origin() {
+        let dir = temp_dir("cors_block");
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::get("/health")
+                    .header("Origin", "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers().get("access-control-allow-origin").is_none(),
+            "evil origin must not get allow-origin header"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allowed_and_blocked() {
+        let dir = temp_dir("cors_preflight");
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/backtest")
+                    .header("Origin", "http://localhost:3000")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header("Access-Control-Request-Headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_success(),
+            "allowed preflight should succeed, got {}",
+            res.status()
+        );
+        let allow = res
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("allowed preflight should have allow-origin");
+        assert_eq!(allow, "http://localhost:3000");
+
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/backtest")
+                    .header("Origin", "http://evil.example")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header("Access-Control-Request-Headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.headers().get("access-control-allow-origin").is_none(),
+            "blocked preflight must not have allow-origin header"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn candles_upstream_failure_is_502() {
+        let dir = temp_dir("candles_502");
+        let fake = FakeSource::new();
+        let state = AppState {
+            source: Arc::new(FailingSource),
+            cache_dir: dir.clone(),
+        };
+        let uri = format!(
+            "/candles?symbol=BTCUSDT&interval=1h&start={}&end={}",
+            fake.start(),
+            fake.end()
+        );
+        let res = app(state)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let v = body_json(res).await;
+        let msg = v["error"].as_str().unwrap_or("").to_lowercase();
+        assert!(msg.contains("boom"), "error should mention boom: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backtest_empty_range_is_400() {
+        let dir = temp_dir("bt_empty_range");
+        let body = serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": 1_600_000_000_000i64,
+            "end_ms": 1_600_100_000_000i64,
+        });
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::post("/backtest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        let msg = v["error"].as_str().unwrap_or("").to_lowercase();
+        assert!(
+            msg.contains("no candles"),
+            "error should mention no candles: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn candles_empty_range_is_200_count_zero() {
+        let dir = temp_dir("candles_empty");
+        let uri = "/candles?symbol=BTCUSDT&interval=1h&start=1600000000000&end=1600100000000";
+        let res = app(test_state(dir.clone()))
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["count"].as_u64().unwrap(), 0);
+        assert!(v["candles"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_with_origin_rejects_bad_origin() {
+        let dir = temp_dir("bad_origin");
+        let state = test_state(dir.clone());
+        let res = app_with_origin(state, "bad\norigin");
+        assert!(res.is_err(), "expected Err for bad origin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

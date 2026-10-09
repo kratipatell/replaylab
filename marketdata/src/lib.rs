@@ -846,6 +846,61 @@ mod tests {
     }
 
     #[test]
+    fn load_or_fetch_leaves_no_tmp_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marketdata_test_no_tmp_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = FakeSource::new(ten_1m_candles());
+        let out = load_or_fetch(&dir, &src, "BTCUSDT", "1m", 0, 9 * 60_000).expect("fetch");
+        assert_eq!(out.len(), 10);
+        assert!(
+            dir.join("BTCUSDT_1m.csv").exists(),
+            "cache file not written"
+        );
+        let entries = std::fs::read_dir(&dir).expect("read cache dir");
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("tmp"), "tmp file left behind: {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_fetch_empty_fetch_keeps_cache_unchanged() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "marketdata_test_empty_keeps_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = FakeSource::new(ten_1m_candles());
+        let first = load_or_fetch(&dir, &src, "BTCUSDT", "1m", 0, 9 * 60_000).expect("first fetch");
+        assert_eq!(first.len(), 10);
+        let cache_path = dir.join("BTCUSDT_1m.csv");
+        let before = std::fs::read(&cache_path).expect("read cache file");
+        let out =
+            load_or_fetch(&dir, &src, "BTCUSDT", "1m", -10 * 60_000, -60_000).expect("empty fetch");
+        assert!(out.is_empty(), "expected empty vec, got {}", out.len());
+        let after = std::fs::read(&cache_path).expect("read cache file again");
+        assert_eq!(before, after, "cache file should be unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[ignore]
     fn live_fetch_btcusdt_1h() {
         let start = 1_704_067_200_000_i64;
