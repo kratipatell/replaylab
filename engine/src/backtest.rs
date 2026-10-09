@@ -1,5 +1,6 @@
+use crate::indicators::{ema, rsi, sma};
 use crate::strategy::{Condition, IndicatorKind, Op, Operand, Rules, Side, Strategy};
-use crate::{ema, rsi, sma, Candle};
+use crate::types::Candle;
 use serde::Serialize;
 use std::collections::HashMap;
 

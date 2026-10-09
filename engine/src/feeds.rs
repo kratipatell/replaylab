@@ -1,4 +1,4 @@
-use engine::Candle;
+use crate::types::Candle;
 use std::path::Path;
 
 /// Bar length in milliseconds (Binance open time, `ts` is in ms).

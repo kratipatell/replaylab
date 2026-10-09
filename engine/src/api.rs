@@ -11,7 +11,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub source: Arc<dyn marketdata::KlineSource + Send + Sync>,
+    pub source: Arc<dyn crate::feeds::KlineSource + Send + Sync>,
     pub cache_dir: PathBuf,
 }
 
@@ -69,10 +69,10 @@ async fn get_candles(
         Ok(q) => q.0,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    if let Err(e) = marketdata::validate_symbol(&q.symbol) {
+    if let Err(e) = crate::feeds::validate_symbol(&q.symbol) {
         return err_json(StatusCode::BAD_REQUEST, e).into_response();
     }
-    let step = match marketdata::interval_ms(&q.interval) {
+    let step = match crate::feeds::interval_ms(&q.interval) {
         Some(s) => s,
         None => {
             return err_json(
@@ -99,7 +99,7 @@ async fn get_candles(
     let start = q.start;
     let end = q.end;
     let loaded = tokio::task::spawn_blocking(move || {
-        marketdata::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
+        crate::feeds::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
     })
     .await;
     let candles = match loaded {
@@ -109,7 +109,7 @@ async fn get_candles(
         Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
         Ok(Ok(c)) => c,
     };
-    let gaps = marketdata::find_gaps(&candles, step);
+    let gaps = crate::feeds::find_gaps(&candles, step);
     let body = serde_json::json!({
         "symbol": q.symbol,
         "interval": q.interval,
@@ -123,7 +123,7 @@ async fn get_candles(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BacktestBody {
-    strategy: engine::strategy::Strategy,
+    strategy: crate::strategy::Strategy,
     start_ms: i64,
     end_ms: i64,
     fee_bps: Option<f64>,
@@ -135,10 +135,10 @@ struct BacktestBody {
 struct BacktestResponse {
     candle_count: usize,
     gaps: Vec<(i64, i64)>,
-    stats: engine::stats::Stats,
-    in_sample: Option<engine::stats::Stats>,
-    out_of_sample: Option<engine::stats::Stats>,
-    trades: Vec<engine::backtest::Trade>,
+    stats: crate::stats::Stats,
+    in_sample: Option<crate::stats::Stats>,
+    out_of_sample: Option<crate::stats::Stats>,
+    trades: Vec<crate::backtest::Trade>,
     equity_curve: Vec<f64>,
 }
 
@@ -155,10 +155,10 @@ async fn post_backtest(
     }
     let symbol = req.strategy.asset.clone();
     let interval = req.strategy.timeframe.clone();
-    if let Err(e) = marketdata::validate_symbol(&symbol) {
+    if let Err(e) = crate::feeds::validate_symbol(&symbol) {
         return err_json(StatusCode::BAD_REQUEST, e).into_response();
     }
-    let step = match marketdata::interval_ms(&interval) {
+    let step = match crate::feeds::interval_ms(&interval) {
         Some(s) => s,
         None => {
             return err_json(
@@ -178,7 +178,7 @@ async fn post_backtest(
     if let Err(e) = check_range_limit(req.start_ms, req.end_ms, step) {
         return err_json(StatusCode::BAD_REQUEST, e).into_response();
     }
-    let defaults = engine::backtest::BacktestConfig::default();
+    let defaults = crate::backtest::BacktestConfig::default();
     let fee_bps = req.fee_bps.unwrap_or(defaults.fee_bps);
     let slippage_bps = req.slippage_bps.unwrap_or(defaults.slippage_bps);
     if !(0.0..=1000.0).contains(&fee_bps) || !fee_bps.is_finite() {
@@ -195,7 +195,7 @@ async fn post_backtest(
         )
         .into_response();
     }
-    let bars_per_year = match engine::stats::bars_per_year(&interval) {
+    let bars_per_year = match crate::stats::bars_per_year(&interval) {
         Some(b) => b,
         None => {
             return err_json(
@@ -219,7 +219,7 @@ async fn post_backtest(
     let start = req.start_ms;
     let end = req.end_ms;
     let loaded = tokio::task::spawn_blocking(move || {
-        marketdata::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
+        crate::feeds::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
     })
     .await;
     let candles = match loaded {
@@ -233,27 +233,27 @@ async fn post_backtest(
         return err_json(StatusCode::BAD_REQUEST, "no candles in range".to_string())
             .into_response();
     }
-    let cfg = engine::backtest::BacktestConfig {
+    let cfg = crate::backtest::BacktestConfig {
         fee_bps,
         slippage_bps,
     };
-    let result = match engine::backtest::backtest(&req.strategy, &candles, &cfg) {
+    let result = match crate::backtest::backtest(&req.strategy, &candles, &cfg) {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let stats = engine::stats::compute_stats(&result, &candles, bars_per_year);
+    let stats = crate::stats::compute_stats(&result, &candles, bars_per_year);
     let (in_sample, out_of_sample) = match req.split {
         None => (None, None),
         Some(split) => {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let split_idx = (candles.len() as f64 * split).floor() as usize;
-            match engine::stats::split_stats(&result, &candles, split_idx, bars_per_year) {
+            match crate::stats::split_stats(&result, &candles, split_idx, bars_per_year) {
                 Ok((is, oos)) => (Some(is), Some(oos)),
                 Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
             }
         }
     };
-    let gaps = marketdata::find_gaps(&candles, step);
+    let gaps = crate::feeds::find_gaps(&candles, step);
     let resp = BacktestResponse {
         candle_count: candles.len(),
         gaps,
@@ -281,7 +281,7 @@ mod tests {
     use tower::ServiceExt;
 
     struct FakeSource {
-        data: Vec<engine::Candle>,
+        data: Vec<crate::types::Candle>,
     }
 
     impl FakeSource {
@@ -295,7 +295,7 @@ mod tests {
                 let open: f64 = if i == 0 { 100.0 } else { prev_close };
                 let high = open.max(close) + 1.0;
                 let low = open.min(close) - 1.0;
-                data.push(engine::Candle {
+                data.push(crate::types::Candle {
                     ts: start + i * step,
                     open,
                     high,
@@ -316,7 +316,7 @@ mod tests {
         }
     }
 
-    impl marketdata::KlineSource for FakeSource {
+    impl crate::feeds::KlineSource for FakeSource {
         fn fetch(
             &self,
             _symbol: &str,
@@ -324,7 +324,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             limit: usize,
-        ) -> Result<Vec<engine::Candle>, String> {
+        ) -> Result<Vec<crate::types::Candle>, String> {
             Ok(self
                 .data
                 .iter()
@@ -615,7 +615,7 @@ mod tests {
 
     struct FailingSource;
 
-    impl marketdata::KlineSource for FailingSource {
+    impl crate::feeds::KlineSource for FailingSource {
         fn fetch(
             &self,
             _symbol: &str,
@@ -623,7 +623,7 @@ mod tests {
             _start_ms: i64,
             _end_ms: i64,
             _limit: usize,
-        ) -> Result<Vec<engine::Candle>, String> {
+        ) -> Result<Vec<crate::types::Candle>, String> {
             Err("boom".to_string())
         }
     }

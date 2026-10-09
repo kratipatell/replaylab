@@ -3,21 +3,6 @@
 version = 4
 
 [[package]]
-name = "api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "engine",
- "http-body-util",
- "marketdata",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tower-http",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -162,8 +147,14 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+ "tower",
+ "tower-http",
 ]
 
 [[package]]
@@ -513,15 +504,6 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
-
-[[package]]
-name = "marketdata"
-version = "0.1.0"
-dependencies = [
- "engine",
- "reqwest",
- "serde_json",
-]
 
 [[package]]
 name = "matchit"

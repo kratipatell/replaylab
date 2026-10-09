@@ -1,5 +1,5 @@
 use crate::backtest::BacktestResult;
-use crate::Candle;
+use crate::types::Candle;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -273,7 +273,7 @@ mod tests {
     use super::*;
     use crate::backtest::{BacktestResult, ExitReason, Trade};
     use crate::strategy::Side;
-    use crate::Candle;
+    use crate::types::Candle;
 
     fn mk_trade(return_pct: f64, entry_idx: usize) -> Trade {
         Trade {
