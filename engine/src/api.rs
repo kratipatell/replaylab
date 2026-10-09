@@ -1,18 +1,111 @@
 use axum::{
-    extract::{rejection::JsonRejection, rejection::QueryRejection, Query, State},
+    extract::{rejection::JsonRejection, rejection::QueryRejection, Path, Query, State},
     http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
     pub source: Arc<dyn crate::feeds::KlineSource + Send + Sync>,
     pub cache_dir: PathBuf,
+    pub jobs: Arc<JobStore>,
+}
+
+pub struct JobStore {
+    next_id: AtomicU64,
+    inner: RwLock<HashMap<String, Job>>,
+}
+
+impl Default for JobStore {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl JobStore {
+    fn insert(&self, job: Job) {
+        if let Ok(mut map) = self.inner.write() {
+            map.insert(job.job_id.clone(), job);
+        }
+    }
+
+    fn update(&self, job_id: &str, f: impl FnOnce(&mut Job)) {
+        if let Ok(mut map) = self.inner.write() {
+            if let Some(job) = map.get_mut(job_id) {
+                f(job);
+            }
+        }
+    }
+
+    fn get(&self, job_id: &str) -> Option<Job> {
+        self.inner.read().ok()?.get(job_id).cloned()
+    }
+
+    fn summaries(&self) -> Vec<JobSummary> {
+        self.inner
+            .read()
+            .map(|map| map.values().map(JobSummary::from).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// An async optimizer sweep. `results` is the ranked trial table
+/// (in-sample vs. out-of-sample per trial); it is `None` until the job
+/// completes.
+#[derive(Debug, Clone, Serialize)]
+pub struct Job {
+    pub job_id: String,
+    pub status: JobStatus,
+    pub total_trials: usize,
+    pub completed_trials: usize,
+    pub objective: String,
+    pub validation: String,
+    pub results: Option<Vec<crate::optimizer::RankedTrial>>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JobSummary {
+    job_id: String,
+    status: JobStatus,
+    total_trials: usize,
+    completed_trials: usize,
+}
+
+impl From<&Job> for JobSummary {
+    fn from(j: &Job) -> Self {
+        Self {
+            job_id: j.job_id.clone(),
+            status: j.status,
+            total_trials: j.total_trials,
+            completed_trials: j.completed_trials,
+        }
+    }
 }
 
 const DEFAULT_ORIGIN: &str = "http://localhost:3000";
@@ -33,6 +126,8 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, String> 
         .route("/health", get(health))
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
+        .route("/optimize", post(post_optimize).get(list_optimize))
+        .route("/optimize/{job_id}", get(get_optimize))
         .with_state(state)
         .layer(cors))
 }
@@ -270,6 +365,160 @@ async fn post_backtest(
         .into_response()
 }
 
+async fn post_optimize(
+    State(state): State<AppState>,
+    body: Result<Json<crate::optimizer::OptimizeSpec>, JsonRejection>,
+) -> Response {
+    let req = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    if let Err(e) = req.strategy.validate() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("invalid base strategy: {e}"),
+        )
+        .into_response();
+    }
+    // Fail fast on bad search specs before touching market data.
+    let combos_len = match crate::optimizer::build_combos(&req) {
+        Ok(c) => c.len(),
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let symbol = req.strategy.asset.clone();
+    let interval = req.strategy.timeframe.clone();
+    if let Err(e) = crate::feeds::validate_symbol(&symbol) {
+        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let step = match crate::feeds::interval_ms(&interval) {
+        Some(s) => s,
+        None => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("unknown interval: {interval}"),
+            )
+            .into_response();
+        }
+    };
+    if req.start_ms >= req.end_ms {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "start_ms must be less than end_ms".to_string(),
+        )
+        .into_response();
+    }
+    if let Err(e) = check_range_limit(req.start_ms, req.end_ms, step) {
+        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let defaults = crate::backtest::BacktestConfig::default();
+    let fee_bps = req.fee_bps.unwrap_or(defaults.fee_bps);
+    let slippage_bps = req.slippage_bps.unwrap_or(defaults.slippage_bps);
+    if !(0.0..=1000.0).contains(&fee_bps) || !fee_bps.is_finite() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("fee_bps must be between 0 and 1000, got {fee_bps}"),
+        )
+        .into_response();
+    }
+    if !(0.0..=1000.0).contains(&slippage_bps) || !slippage_bps.is_finite() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("slippage_bps must be between 0 and 1000, got {slippage_bps}"),
+        )
+        .into_response();
+    }
+    let bars_per_year = match crate::stats::bars_per_year(&interval) {
+        Some(b) => b,
+        None => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("unknown timeframe: {interval}"),
+            )
+            .into_response();
+        }
+    };
+    let source = state.source.clone();
+    let cache_dir = state.cache_dir.clone();
+    let start = req.start_ms;
+    let end = req.end_ms;
+    let loaded = tokio::task::spawn_blocking(move || {
+        crate::feeds::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
+    })
+    .await;
+    let candles = match loaded {
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
+        Ok(Ok(c)) => c,
+    };
+    if candles.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "no candles in range".to_string())
+            .into_response();
+    }
+
+    let objective = req.objective.unwrap_or_default().as_str().to_string();
+    let job_id = format!("opt-{}", state.jobs.next_id.fetch_add(1, Ordering::SeqCst));
+    state.jobs.insert(Job {
+        job_id: job_id.clone(),
+        status: JobStatus::Running,
+        total_trials: combos_len,
+        completed_trials: 0,
+        objective,
+        validation: String::new(),
+        results: None,
+        warnings: Vec::new(),
+        error: None,
+    });
+
+    let jobs = state.jobs.clone();
+    let reply_id = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let cfg = crate::backtest::BacktestConfig {
+            fee_bps,
+            slippage_bps,
+        };
+        match crate::optimizer::sweep(&req, &candles, &cfg, bars_per_year) {
+            Ok(report) => jobs.update(&reply_id, |job| {
+                job.status = JobStatus::Completed;
+                job.completed_trials = report.total_trials;
+                job.validation = report.validation.clone();
+                job.results = Some(report.trials);
+                job.warnings = report.warnings;
+            }),
+            Err(e) => jobs.update(&reply_id, |job| {
+                job.status = JobStatus::Failed;
+                job.error = Some(e);
+            }),
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": job_id,
+            "status": JobStatus::Running,
+            "total_trials": combos_len,
+        })),
+    )
+        .into_response()
+}
+
+async fn get_optimize(State(state): State<AppState>, Path(job_id): Path<String>) -> Response {
+    match state.jobs.get(&job_id) {
+        Some(job) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(job).unwrap_or_default()),
+        )
+            .into_response(),
+        None => err_json(StatusCode::NOT_FOUND, format!("unknown job: {job_id}")).into_response(),
+    }
+}
+
+async fn list_optimize(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({ "jobs": state.jobs.summaries() }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +604,7 @@ mod tests {
         AppState {
             source: Arc::new(FakeSource::new()),
             cache_dir: dir,
+            jobs: Arc::new(JobStore::default()),
         }
     }
 
@@ -723,6 +973,7 @@ mod tests {
         let state = AppState {
             source: Arc::new(FailingSource),
             cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
         };
         let uri = format!(
             "/candles?symbol=BTCUSDT&interval=1h&start={}&end={}",
@@ -788,6 +1039,116 @@ mod tests {
         let state = test_state(dir.clone());
         let res = app_with_origin(state, "bad\norigin");
         assert!(res.is_err(), "expected Err for bad origin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn optimize_body(fake: &FakeSource, trials: usize) -> serde_json::Value {
+        serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": fake.start(),
+            "end_ms": fake.end(),
+            "search": {"method": "random", "trials": trials, "seed": 7},
+            "params": [
+                {"target": "entry.all.0.right", "kind": "float", "min": 95.0, "max": 105.0},
+                {"target": "stop_loss_pct", "kind": "float", "values": [1.0, 2.0]},
+            ],
+        })
+    }
+
+    async fn poll_job(router: &Router, job_id: &str) -> serde_json::Value {
+        for _ in 0..200 {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/optimize/{job_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let v = body_json(res).await;
+            if v["status"] == "completed" {
+                return v;
+            }
+            assert_ne!(v["status"], "failed", "job failed: {v}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("job {job_id} did not complete in time");
+    }
+
+    #[tokio::test]
+    async fn optimize_200_trial_sweep_returns_ranked_table() {
+        let dir = temp_dir("opt_200");
+        let fake = FakeSource::new();
+        let router = app(test_state(dir.clone()));
+        let res = router
+            .clone()
+            .oneshot(
+                Request::post("/optimize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(optimize_body(&fake, 200).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED, "expected 202");
+        let created = body_json(res).await;
+        assert_eq!(created["total_trials"].as_u64().unwrap(), 200);
+        let job_id = created["job_id"].as_str().unwrap().to_string();
+
+        let job = poll_job(&router, &job_id).await;
+        let trials = job["results"].as_array().expect("ranked table");
+        assert_eq!(trials.len(), 200);
+        for (i, t) in trials.iter().enumerate() {
+            assert_eq!(t["rank"].as_u64().unwrap() as usize, i + 1);
+            // In-sample vs out-of-sample performance per trial.
+            assert!(t["in_sample"]["trades"].is_number(), "trial {i}");
+            assert!(t["out_of_sample"]["trades"].is_number(), "trial {i}");
+            assert!(t["score"].is_number(), "trial {i}");
+            assert!(t["params"]["entry.all.0.right"].is_number());
+        }
+        for w in trials.windows(2) {
+            let a = w[0]["score"].as_f64().unwrap();
+            let b = w[1]["score"].as_f64().unwrap();
+            assert!(a >= b, "ranked table must be score-descending");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn optimize_bad_target_is_400() {
+        let dir = temp_dir("opt_bad");
+        let fake = FakeSource::new();
+        let mut body = optimize_body(&fake, 4);
+        body["params"] = serde_json::json!([
+            {"target": "entry.all.9.right", "kind": "float", "values": [100.0]},
+        ]);
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::post("/optimize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn optimize_unknown_job_is_404() {
+        let dir = temp_dir("opt_404");
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::get("/optimize/opt-999999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

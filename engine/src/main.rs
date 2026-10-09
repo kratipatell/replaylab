@@ -8,6 +8,7 @@ mod config;
 mod feeds;
 mod indicators;
 mod instrument;
+mod optimizer;
 mod orb_recon;
 mod session;
 mod sizing;
@@ -37,6 +38,7 @@ async fn main() {
     let state = AppState {
         source,
         cache_dir: cfg.cache_dir,
+        jobs: std::sync::Arc::new(crate::api::JobStore::default()),
     };
     let router = match app_with_origin(state, &cfg.origin) {
         Ok(router) => router,
