@@ -18,7 +18,13 @@ async fn main() {
         None => Arc::new(marketdata::BinanceSource::new()),
     };
     let state = AppState { source, cache_dir };
-    let router = app_with_origin(state, &origin);
+    let router = match app_with_origin(state, &origin) {
+        Ok(router) => router,
+        Err(e) => {
+            eprintln!("invalid ALLOWED_ORIGIN: {e}");
+            std::process::exit(1);
+        }
+    };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await

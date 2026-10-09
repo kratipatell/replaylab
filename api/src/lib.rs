@@ -18,26 +18,23 @@ pub struct AppState {
 const DEFAULT_ORIGIN: &str = "http://localhost:3000";
 
 pub fn app(state: AppState) -> Router {
-    app_with_origin(state, DEFAULT_ORIGIN)
+    app_with_origin(state, DEFAULT_ORIGIN).expect("default origin parses")
 }
 
-pub fn app_with_origin(state: AppState, origin: &str) -> Router {
+pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, String> {
+    let origin_header: HeaderValue = origin
+        .parse()
+        .map_err(|e| format!("invalid origin {origin:?}: {e}"))?;
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(
-            origin.parse::<HeaderValue>().unwrap_or_else(|_| {
-                DEFAULT_ORIGIN
-                    .parse::<HeaderValue>()
-                    .expect("default origin parses")
-            }),
-        ))
+        .allow_origin(AllowOrigin::exact(origin_header))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
-    Router::new()
+    Ok(Router::new()
         .route("/health", get(health))
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
         .with_state(state)
-        .layer(cors)
+        .layer(cors))
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
