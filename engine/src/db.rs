@@ -69,12 +69,10 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create db dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
             }
         }
-        let conn =
-            Connection::open(path).map_err(|e| format!("open runs db: {e}"))?;
+        let conn = Connection::open(path).map_err(|e| format!("open runs db: {e}"))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -82,8 +80,7 @@ impl Db {
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| format!("open memory db: {e}"))?;
+        let conn = Connection::open_in_memory().map_err(|e| format!("open memory db: {e}"))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -135,10 +132,7 @@ impl Db {
             interval: row.get(3)?,
             start_ms: row.get(4)?,
             end_ms: row.get(5)?,
-            trades: stats
-                .get("trades")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize,
+            trades: stats.get("trades").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             total_return_pct: stats
                 .get("total_return_pct")
                 .and_then(|v| v.as_f64())
@@ -214,8 +208,7 @@ mod tests {
     fn save_list_get_roundtrip() {
         let db = Db::open_in_memory().expect("mem db");
         let strat = serde_json::json!({"asset": "BTCUSDT"});
-        let stats =
-            serde_json::json!({"trades": 3, "total_return_pct": 5.0, "sharpe": 1.2, "max_drawdown_pct": 2.0});
+        let stats = serde_json::json!({"trades": 3, "total_return_pct": 5.0, "sharpe": 1.2, "max_drawdown_pct": 2.0});
         let id = db
             .save_run(
                 "BTCUSDT",

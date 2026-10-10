@@ -361,8 +361,7 @@ async fn post_backtest(
     let metrics = crate::stats::compute_v2(&result, &candles, bars_per_year);
     let stats_v = serde_json::to_value(&stats).unwrap_or_default();
     let metrics_v = serde_json::to_value(&metrics).unwrap_or_default();
-    let equity_v =
-        serde_json::to_value(&result.equity_curve).unwrap_or_default();
+    let equity_v = serde_json::to_value(&result.equity_curve).unwrap_or_default();
     let trades_v = serde_json::to_value(&result.trades).unwrap_or_default();
     let strategy_v = serde_json::to_value(&req.strategy).unwrap_or_default();
     let run_id = match state.db.save_run(
@@ -378,11 +377,8 @@ async fn post_backtest(
     ) {
         Ok(id) => Some(id),
         Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("save run: {e}"),
-            )
-            .into_response()
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("save run: {e}"))
+                .into_response()
         }
     };
     let resp = BacktestResponse {
@@ -576,7 +572,7 @@ async fn get_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response
     }
 }
 
-fn serve_file(dir: &PathBuf, name: &str, content_type: &str) -> Response {
+fn serve_file(dir: &std::path::Path, name: &str, content_type: &str) -> Response {
     let path = dir.join(name);
     match std::fs::read(&path) {
         Ok(bytes) => (

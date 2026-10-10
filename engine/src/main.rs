@@ -36,7 +36,9 @@ async fn main() {
         Some(url) => Arc::new(feeds::BinanceSource { base_url: url }),
         None => Arc::new(feeds::BinanceSource::new()),
     };
-    let db_path = std::env::var("RUNS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| cfg.cache_dir.join("runs.db"));
+    let db_path = std::env::var("RUNS_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| cfg.cache_dir.join("runs.db"));
     let db = match crate::db::Db::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
