@@ -8,7 +8,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Config, String> {
+    pub fn from_env() -> Config {
         let port: u16 = std::env::var("PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -18,11 +18,11 @@ impl Config {
         let base_url = std::env::var("BINANCE_BASE_URL").ok();
         let origin =
             std::env::var("ALLOWED_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string());
-        Ok(Config {
+        Config {
             port,
             cache_dir,
             base_url,
             origin,
-        })
+        }
     }
 }

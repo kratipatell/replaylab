@@ -55,12 +55,6 @@ fn sharpe_ratio(equity: &[f64], bars_per_year: f64) -> f64 {
     mean / std * bars_per_year.sqrt()
 }
 
-/// Returns the number of bars per year for a crypto timeframe.
-///
-/// Assumes 24/7 crypto markets (365 days per year, no market closes).
-///
-/// The result is meant to be passed as the `bars_per_year` argument of
-/// [`compute_stats`] and [`split_stats`].
 pub fn bars_per_year(timeframe: &str) -> Option<f64> {
     match timeframe {
         "1m" => Some(525600.0),
@@ -202,17 +196,24 @@ pub fn compute_stats(result: &BacktestResult, candles: &[Candle], bars_per_year:
     }
 }
 
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum StatsError {
+    #[error("invalid split_idx {0} for {1} candles")]
+    BadSplit(usize, usize),
+    #[error("missing equity base at split_idx {0}")]
+    MissingBase(usize),
+    #[error("invalid equity base {0} at split_idx {1}")]
+    BadBase(f64, usize),
+}
+
 pub fn split_stats(
     result: &BacktestResult,
     candles: &[Candle],
     split_idx: usize,
     bars_per_year: f64,
-) -> Result<(Stats, Stats), String> {
+) -> Result<(Stats, Stats), StatsError> {
     if split_idx == 0 || split_idx >= candles.len() {
-        return Err(format!(
-            "invalid split_idx {split_idx} for {} candles",
-            candles.len()
-        ));
+        return Err(StatsError::BadSplit(split_idx, candles.len()));
     }
 
     let is_candles = &candles[..split_idx];
@@ -240,13 +241,11 @@ pub fn split_stats(
     let base = match result.equity_curve.get(split_idx - 1).copied() {
         Some(b) => b,
         None => {
-            return Err(format!("missing equity base at split_idx {split_idx}",));
+            return Err(StatsError::MissingBase(split_idx));
         }
     };
     if base == 0.0 || !base.is_finite() {
-        return Err(format!(
-            "invalid equity base {base} at split_idx {split_idx}"
-        ));
+        return Err(StatsError::BadBase(base, split_idx));
     }
     let mut oos_equity: Vec<f64> = Vec::with_capacity(candles.len() - split_idx + 1);
     oos_equity.push(1.0);
@@ -268,24 +267,15 @@ pub fn split_stats(
     Ok((is_stats, oos_stats))
 }
 
-/// One underwater excursion of the equity curve.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct DrawdownPeriod {
     pub start_idx: usize,
     pub trough_idx: usize,
-    /// Recovery bar index, or `None` when still underwater at the end.
     pub end_idx: Option<usize>,
     pub depth_pct: f64,
     pub length_bars: usize,
 }
 
-/// Extended metrics (Engine v2).
-///
-/// Conventions: risk-free rate is 0; `bars_per_year` annualises Sharpe and
-/// Sortino the same way. `calmar` is the simple ratio
-/// `total_return_pct / max_drawdown_pct` (0 when there is no drawdown),
-/// deliberately *not* CAGR-based so short intraday windows stay meaningful.
-/// Monthly and weekday returns compound per-bar equity returns geometrically.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct MetricsV2 {
     pub sortino: f64,
@@ -299,18 +289,14 @@ pub struct MetricsV2 {
 
 pub const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/// Days since Unix epoch for `ts_ms` (floored).
 fn days_since_epoch(ts_ms: i64) -> i64 {
     ts_ms.div_euclid(86_400_000)
 }
 
-/// Monday=0..Sunday=6 for `ts_ms`. 1970-01-01 was a Thursday.
 fn weekday_idx(ts_ms: i64) -> usize {
     (days_since_epoch(ts_ms) + 3).rem_euclid(7) as usize
 }
 
-/// Proleptic Gregorian (year, month, day) for `ts_ms` (UTC).
-/// Howard Hinnant's civil-from-days algorithm, no dependencies.
 fn ymd(ts_ms: i64) -> (i32, u32, u32) {
     let z = days_since_epoch(ts_ms) + 719_468;
     let era = z.div_euclid(146_097);
@@ -366,7 +352,6 @@ fn downside_deviation(equity: &[f64], bars_per_year: f64) -> f64 {
     if std == 0.0 || !std.is_finite() {
         return 0.0;
     }
-    // Mean excess return over all bars divided by downside deviation.
     let all_mean = {
         let mut sum = 0.0;
         let mut n = 0usize;
@@ -474,10 +459,6 @@ fn drawdown_periods(equity: &[f64]) -> Vec<DrawdownPeriod> {
     out
 }
 
-/// Attribute per-bar equity returns to month and weekday buckets.
-///
-/// `candles[i].ts` dates bar `i`; the return `equity[i+1]/equity[i]-1`
-/// is credited to the month/weekday of bar `i+1`.
 fn attribute_buckets(
     equity: &[f64],
     candles: &[Candle],
@@ -777,7 +758,6 @@ mod tests {
 
     #[test]
     fn v2_drawdown_period_recovered() {
-        // Peak 1.2 at idx 1, trough 0.9 at idx 2, recovered at idx 4.
         let result = BacktestResult {
             trades: Vec::new(),
             equity_curve: vec![1.0, 1.2, 0.9, 1.1, 1.2],
@@ -790,7 +770,6 @@ mod tests {
         assert_eq!(dd.end_idx, Some(4));
         assert_approx(dd.depth_pct, 25.0, 1e-9);
         assert_eq!(dd.length_bars, 3);
-        // Calmar = total 20% / maxDD 25% = 0.8.
         assert_approx(m.calmar, 0.8, 1e-9);
     }
 
@@ -817,7 +796,6 @@ mod tests {
 
     #[test]
     fn v2_monthly_and_weekday_attribution() {
-        // 1970-01-01 is a Thursday. Two bars: equity 1.0 -> 1.1.
         let candles = vec![
             Candle {
                 ts: 0,
@@ -847,8 +825,7 @@ mod tests {
     #[test]
     fn v2_ymd_known_dates() {
         assert_eq!(ymd(0), (1970, 1, 1));
-        assert_eq!(weekday_idx(0), 3); // Thursday
-                                       // 1970-01-05 is a Monday.
+        assert_eq!(weekday_idx(0), 3);
         assert_eq!(weekday_idx(4 * 86_400_000), 0);
     }
 }

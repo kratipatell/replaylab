@@ -1,11 +1,3 @@
-/// Simple moving average.
-///
-/// Returns a `Vec` the same length as the input. The first `n - 1` values
-/// (the warmup period) are `f64::NAN`. Element `i >= n - 1` is the mean of
-/// `x[i + 1 - n ..= i]`.
-///
-/// Edge cases: if `n == 0`, `x` is empty, or `n > x.len()`, there is no valid
-/// window, so the result is all `NAN` (or empty for empty input).
 pub fn sma(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {
@@ -29,14 +21,6 @@ pub fn sma(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
-/// Exponential moving average.
-///
-/// Uses `k = 2 / (n + 1)` and seeds the first valid value at index `n - 1`
-/// with the simple moving average of the first `n` inputs. All earlier
-/// entries are `f64::NAN`.
-///
-/// Edge cases mirror [`sma`]: `n == 0`, empty input, or `n > x.len()`
-/// yields all `NAN` (or empty).
 pub fn ema(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {
@@ -49,7 +33,6 @@ pub fn ema(x: &[f64], n: usize) -> Vec<f64> {
     let mut out = vec![f64::NAN; len];
     let k = 2.0 / (n as f64 + 1.0);
 
-    // Seed with SMA of first `n` values.
     let seed: f64 = x[..n].iter().sum::<f64>() / n as f64;
     out[n - 1] = seed;
 
@@ -59,23 +42,6 @@ pub fn ema(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
-/// Relative strength index with Wilder smoothing.
-///
-/// Returns a `Vec` the same length as the input. The first `n` values are
-/// `f64::NAN` because `n` price changes (i.e. `n + 1` prices) are needed for
-/// the first reading at index `n`.
-///
-/// Method:
-/// * `gain[i] = max(close[i] - close[i-1], 0)`,
-///   `loss[i] = max(close[i-1] - close[i], 0)`.
-/// * First `avg_gain` / `avg_loss` are simple means of the first `n` gains/losses.
-/// * Afterwards: `avg = (prev * (n - 1) + current) / n` (Wilder).
-/// * `RSI = 100 - 100 / (1 + RS)` with `RS = avg_gain / avg_loss`.
-/// * If `avg_loss == 0`: RSI is `100.0` when `avg_gain > 0`, else `50.0`
-///   (flat series, no gain and no loss).
-///
-/// Edge cases: `n == 0` or `x.len() <= n` yields all `NAN` (or empty input
-/// yields empty output).
 pub fn rsi(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {
@@ -100,7 +66,6 @@ pub fn rsi(x: &[f64], n: usize) -> Vec<f64> {
 
     let mut out = vec![f64::NAN; len];
 
-    // Initial averages over deltas x[1]-x[0] .. x[n]-x[n-1].
     let mut avg_gain = 0.0;
     let mut avg_loss = 0.0;
     for i in 1..=n {
@@ -127,9 +92,7 @@ pub fn rsi(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
-/// True range for one bar given the previous close.
-///
-/// `TR = max(high - low, |high - prev_close|, |low - prev_close|)`.
+#[cfg(test)]
 pub fn true_range(high: f64, low: f64, prev_close: f64) -> f64 {
     let hl = high - low;
     let hc = (high - prev_close).abs();
@@ -137,14 +100,7 @@ pub fn true_range(high: f64, low: f64, prev_close: f64) -> f64 {
     hl.max(hc).max(lc)
 }
 
-/// Average true range with Wilder smoothing.
-///
-/// Returns a `Vec` the same length as the input. The first `n - 1` values
-/// are `f64::NAN`; entry `n - 1` is the simple mean of the first `n` true
-/// ranges, afterwards `atr = (prev * (n - 1) + tr) / n`.
-///
-/// Edge cases mirror [`sma`]: `n == 0`, empty input, or `n > len` yields
-/// all `NAN` (or empty).
+#[cfg(test)]
 pub fn atr(candles: &[crate::types::Candle], n: usize) -> Vec<f64> {
     let len = candles.len();
     if len == 0 {
@@ -208,7 +164,6 @@ mod tests {
 
     #[test]
     fn sma_basic() {
-        // Hand-computed: means of sliding windows of 3.
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let got = sma(&x, 3);
         let expected = vec![f64::NAN, f64::NAN, 2.0, 3.0, 4.0];
@@ -224,23 +179,18 @@ mod tests {
 
     #[test]
     fn sma_warmup_and_edges() {
-        // n > len -> all NaN, same length.
         let got = sma(&[1.0, 2.0], 5);
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|v| v.is_nan()));
 
-        // n == 0 -> all NaN.
         let got = sma(&[1.0, 2.0, 3.0], 0);
         assert!(got.iter().all(|v| v.is_nan()));
 
-        // Empty input -> empty output.
         assert!(sma(&[], 3).is_empty());
     }
 
     #[test]
     fn ema_basic() {
-        // n=3 => k=0.5, seed SMA(1,2,3)=2.0 at idx 2,
-        // idx3 = 4*0.5 + 2*0.5 = 3.0, idx4 = 5*0.5 + 3*0.5 = 4.0.
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let got = ema(&x, 3);
         let expected = vec![f64::NAN, f64::NAN, 2.0, 3.0, 4.0];
@@ -249,8 +199,6 @@ mod tests {
 
     #[test]
     fn ema_seed_and_smoothing() {
-        // n=2 => k=2/3, seed (10+11)/2=10.5 at idx1,
-        // idx2 = 12*(2/3) + 10.5*(1/3) = 8 + 3.5 = 11.5.
         let x = vec![10.0, 11.0, 12.0];
         let got = ema(&x, 2);
         let expected = vec![f64::NAN, 10.5, 11.5];
@@ -268,14 +216,12 @@ mod tests {
 
         assert!(ema(&[], 3).is_empty());
 
-        // Window of 1: k=1, EMA equals the price itself.
         let x = vec![2.0, 4.0, 6.0];
         assert_vec_approx_eq(&ema(&x, 1), &x, 1e-12);
     }
 
     #[test]
     fn rsi_all_gains_is_100() {
-        // Deltas are all +1, so avg_loss=0 -> RSI 100.
         let x = vec![10.0, 11.0, 12.0, 13.0, 14.0];
         let got = rsi(&x, 2);
         let expected = vec![f64::NAN, f64::NAN, 100.0, 100.0, 100.0];
@@ -292,11 +238,6 @@ mod tests {
 
     #[test]
     fn rsi_mixed_wilder_smoothing() {
-        // x=[10,11,10,11], n=2, hand-computed:
-        // deltas: +1,-1,+1
-        // idx2: avg_gain=(1+0)/2=0.5, avg_loss=(0+1)/2=0.5 -> RS=1 -> RSI=50
-        // idx3: avg_gain=(0.5*1+1)/2=0.75, avg_loss=(0.5*1+0)/2=0.25
-        //       RS=3 -> RSI=100-100/4=75
         let x = vec![10.0, 11.0, 10.0, 11.0];
         let got = rsi(&x, 2);
         let expected = vec![f64::NAN, f64::NAN, 50.0, 75.0];
@@ -305,7 +246,6 @@ mod tests {
 
     #[test]
     fn rsi_warmup_and_edges() {
-        // Need n+1 prices for the first value, so len <= n -> all NaN.
         let got = rsi(&[10.0, 11.0], 2);
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|v| v.is_nan()));
@@ -315,7 +255,6 @@ mod tests {
 
         assert!(rsi(&[], 14).is_empty());
 
-        // Same length as input, NaN warmup of exactly n.
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let got = rsi(&x, 3);
         assert_eq!(got.len(), x.len());
@@ -336,10 +275,6 @@ mod tests {
 
     #[test]
     fn atr_hand_computed_wilder() {
-        // TR0 = 10-9 = 1.0
-        // TR1 = max(11-9.5=1.5, |11-9.5|=1.5, |9.5-9.5|=0) = 1.5
-        // TR2 = max(12-10=2, |12-10.5|=1.5, |10-10.5|=0.5) = 2.0
-        // n=2: atr[1] = (1.0+1.5)/2 = 1.25, atr[2] = (1.25+2.0)/2 = 1.625
         let candles = vec![
             mk_candle_ts(10.0, 9.0, 9.5),
             mk_candle_ts(11.0, 9.5, 10.5),

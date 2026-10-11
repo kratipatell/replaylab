@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
-/// One persisted backtest run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedRun {
     pub id: i64,
@@ -19,7 +18,6 @@ pub struct SavedRun {
     pub trades: serde_json::Value,
 }
 
-/// Lightweight row for the runs table (no big blobs).
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
     pub id: i64,
@@ -59,28 +57,50 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS runs (
     trades TEXT NOT NULL
 )";
 
+#[derive(Debug, thiserror::Error)]
+pub enum DbError {
+    #[error("init runs db: {0}")]
+    Init(String),
+    #[error("create db dir: {0}")]
+    MkDir(String),
+    #[error("open runs db: {0}")]
+    Open(String),
+    #[cfg(test)]
+    #[error("open memory db: {0}")]
+    OpenMemory(String),
+    #[error("db lock: {0}")]
+    Lock(String),
+    #[error("save run: {0}")]
+    Save(String),
+    #[error("list runs: {0}")]
+    List(String),
+    #[error("get run: {0}")]
+    Get(String),
+}
+
 impl Db {
-    fn init(conn: &Connection) -> Result<(), String> {
+    fn init(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(SCHEMA)
-            .map_err(|e| format!("init runs db: {e}"))?;
+            .map_err(|e| DbError::Init(e.to_string()))?;
         Ok(())
     }
 
-    pub fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, DbError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| DbError::MkDir(e.to_string()))?;
             }
         }
-        let conn = Connection::open(path).map_err(|e| format!("open runs db: {e}"))?;
+        let conn = Connection::open(path).map_err(|e| DbError::Open(e.to_string()))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    pub fn open_in_memory() -> Result<Self, String> {
-        let conn = Connection::open_in_memory().map_err(|e| format!("open memory db: {e}"))?;
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, DbError> {
+        let conn = Connection::open_in_memory().map_err(|e| DbError::OpenMemory(e.to_string()))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -99,8 +119,8 @@ impl Db {
         metrics: &serde_json::Value,
         equity_curve: &serde_json::Value,
         trades: &serde_json::Value,
-    ) -> Result<i64, String> {
-        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         conn.execute(
             "INSERT INTO runs (created_at, symbol, interval, start_ms, end_ms, strategy, stats, metrics, equity_curve, trades)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -117,7 +137,7 @@ impl Db {
                 trades.to_string(),
             ],
         )
-        .map_err(|e| format!("save run: {e}"))?;
+        .map_err(|e| DbError::Save(e.to_string()))?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -145,33 +165,33 @@ impl Db {
         })
     }
 
-    pub fn list_runs(&self, limit: usize) -> Result<Vec<RunSummary>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+    pub fn list_runs(&self, limit: usize) -> Result<Vec<RunSummary>, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, created_at, symbol, interval, start_ms, end_ms, stats
                  FROM runs ORDER BY id DESC LIMIT ?1",
             )
-            .map_err(|e| format!("list runs: {e}"))?;
+            .map_err(|e| DbError::List(e.to_string()))?;
         let rows = stmt
             .query_map(params![limit as i64], Self::summary_from_row)
-            .map_err(|e| format!("list runs: {e}"))?;
+            .map_err(|e| DbError::List(e.to_string()))?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(|e| format!("list runs: {e}"))?);
+            out.push(r.map_err(|e| DbError::List(e.to_string()))?);
         }
         Ok(out)
     }
 
-    pub fn get_run(&self, id: i64) -> Result<Option<SavedRun>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+    pub fn get_run(&self, id: i64) -> Result<Option<SavedRun>, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, created_at, symbol, interval, start_ms, end_ms,
                         strategy, stats, metrics, equity_curve, trades
                  FROM runs WHERE id = ?1",
             )
-            .map_err(|e| format!("get run: {e}"))?;
+            .map_err(|e| DbError::Get(e.to_string()))?;
         let mut rows = stmt
             .query_map(params![id], |row| {
                 let parse = |i: usize| -> rusqlite::Result<serde_json::Value> {
@@ -192,10 +212,10 @@ impl Db {
                     trades: parse(10)?,
                 })
             })
-            .map_err(|e| format!("get run: {e}"))?;
+            .map_err(|e| DbError::Get(e.to_string()))?;
         match rows.next() {
             None => Ok(None),
-            Some(r) => Ok(Some(r.map_err(|e| format!("get run: {e}"))?)),
+            Some(r) => Ok(Some(r.map_err(|e| DbError::Get(e.to_string()))?)),
         }
     }
 }

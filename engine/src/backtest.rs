@@ -1,8 +1,9 @@
-use crate::indicators::{ema, rsi, sma};
-use crate::strategy::{Condition, IndicatorKind, Op, Operand, Rules, Side, Strategy};
+use crate::instrument::Instrument;
+use crate::session::SessionFilter;
+use crate::sizing::{quantity, Sizing};
+use crate::strategy::{BarStrategy, Side, Strategy};
 use crate::types::Candle;
 use serde::Serialize;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BacktestConfig {
@@ -48,172 +49,105 @@ pub struct BacktestResult {
     pub equity_curve: Vec<f64>,
 }
 
-fn kind_key(ind: IndicatorKind) -> u8 {
-    match ind {
-        IndicatorKind::Open => 0,
-        IndicatorKind::High => 1,
-        IndicatorKind::Low => 2,
-        IndicatorKind::Close => 3,
-        IndicatorKind::Sma => 4,
-        IndicatorKind::Ema => 5,
-        IndicatorKind::Rsi => 6,
-    }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bracket {
+    pub stop_pct: Option<f64>,
+    pub target_pct: Option<f64>,
+    pub trailing_pct: Option<f64>,
 }
 
-fn collect_refs(rules_list: &[&Rules], out: &mut Vec<(u8, Option<usize>)>) {
-    for rules in rules_list {
-        for c in rules.all.iter().chain(rules.any.iter()) {
-            for op in [&c.left, &c.right] {
-                if let Operand::Indicator(r) = op {
-                    let k = (kind_key(r.ind), r.period);
-                    if !out.contains(&k) {
-                        out.push(k);
-                    }
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BacktestError {
+    #[error("{0} must be > 0, got {1}")]
+    BadPct(String, f64),
+    #[error("initial_equity must be > 0, got {0}")]
+    BadEquity(f64),
+    #[error(transparent)]
+    Strategy(#[from] crate::strategy::StrategyError),
+    #[error(transparent)]
+    Instrument(#[from] crate::instrument::InstrumentError),
+    #[error(transparent)]
+    Sizing(#[from] crate::sizing::SizingError),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl Bracket {
+    pub fn validate(&self) -> Result<(), BacktestError> {
+        for (name, v) in [
+            ("stop_pct", self.stop_pct),
+            ("target_pct", self.target_pct),
+            ("trailing_pct", self.trailing_pct),
+        ] {
+            if let Some(x) = v {
+                if !x.is_finite() || x <= 0.0 {
+                    return Err(BacktestError::BadPct(name.to_string(), x));
                 }
             }
         }
+        Ok(())
     }
 }
 
-fn build_series(
-    candles: &[Candle],
-    refs: &[(u8, Option<usize>)],
-) -> HashMap<(u8, Option<usize>), Vec<f64>> {
-    let n = candles.len();
-    let opens: Vec<f64> = candles.iter().map(|c| c.open).collect();
-    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
-    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
-    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
-    let mut map = HashMap::new();
-    for (k, period) in refs {
-        let series = match *k {
-            0 => opens.clone(),
-            1 => highs.clone(),
-            2 => lows.clone(),
-            3 => closes.clone(),
-            4 => sma(&closes, period.unwrap()),
-            5 => ema(&closes, period.unwrap()),
-            6 => rsi(&closes, period.unwrap()),
-            _ => vec![f64::NAN; n],
-        };
-        map.insert((*k, *period), series);
-    }
-    map
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunConfig {
+    pub initial_equity: f64,
+    pub exit_at_session_end: bool,
 }
 
-fn operand_value(
-    op: &Operand,
-    idx: usize,
-    map: &HashMap<(u8, Option<usize>), Vec<f64>>,
-    opens: &[f64],
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-) -> f64 {
-    match op {
-        Operand::Number(v) => *v,
-        Operand::Indicator(r) => {
-            let key = (kind_key(r.ind), r.period);
-            if let Some(s) = map.get(&key) {
-                s[idx]
-            } else {
-                // Fallback (should not happen): compute directly.
-                match r.ind {
-                    IndicatorKind::Open => opens[idx],
-                    IndicatorKind::High => highs[idx],
-                    IndicatorKind::Low => lows[idx],
-                    IndicatorKind::Close => closes[idx],
-                    _ => f64::NAN,
-                }
-            }
+impl RunConfig {
+    pub fn new(initial_equity: f64, exit_at_session_end: bool) -> Result<RunConfig, BacktestError> {
+        if !initial_equity.is_finite() || initial_equity <= 0.0 {
+            return Err(BacktestError::BadEquity(initial_equity));
         }
+        Ok(RunConfig {
+            initial_equity,
+            exit_at_session_end,
+        })
     }
 }
 
-fn eval_condition(
-    c: &Condition,
-    i: usize,
-    map: &HashMap<(u8, Option<usize>), Vec<f64>>,
-    opens: &[f64],
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-) -> bool {
-    let l = operand_value(&c.left, i, map, opens, highs, lows, closes);
-    let r = operand_value(&c.right, i, map, opens, highs, lows, closes);
-    if l.is_nan() || r.is_nan() {
-        return false;
-    }
-    match c.op {
-        Op::Lt => l < r,
-        Op::Gt => l > r,
-        Op::CrossesAbove => {
-            if i == 0 {
-                return false;
-            }
-            let lp = operand_value(&c.left, i - 1, map, opens, highs, lows, closes);
-            let rp = operand_value(&c.right, i - 1, map, opens, highs, lows, closes);
-            if lp.is_nan() || rp.is_nan() {
-                return false;
-            }
-            lp <= rp && l > r
-        }
-        Op::CrossesBelow => {
-            if i == 0 {
-                return false;
-            }
-            let lp = operand_value(&c.left, i - 1, map, opens, highs, lows, closes);
-            let rp = operand_value(&c.right, i - 1, map, opens, highs, lows, closes);
-            if lp.is_nan() || rp.is_nan() {
-                return false;
-            }
-            lp >= rp && l < r
-        }
-    }
-}
-
-fn eval_rules(
-    rules: &Rules,
-    i: usize,
-    map: &HashMap<(u8, Option<usize>), Vec<f64>>,
-    opens: &[f64],
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-) -> bool {
-    if rules.all.is_empty() && rules.any.is_empty() {
-        return false;
-    }
-    for c in &rules.all {
-        if !eval_condition(c, i, map, opens, highs, lows, closes) {
-            return false;
-        }
-    }
-    if rules.any.is_empty() {
-        return true;
-    }
-    for c in &rules.any {
-        if eval_condition(c, i, map, opens, highs, lows, closes) {
-            return true;
-        }
-    }
-    false
-}
-
-struct OpenPosition {
+struct OpenPos {
     entry_idx: usize,
     entry_ts: i64,
-    raw_open: f64,
-    entry_price: f64,
+    entry_raw: f64,
+    side: Side,
+    qty: f64,
     equity_at_entry: f64,
+    entry_cost: f64,
+    peak: f64,
 }
 
-pub fn backtest(
-    strategy: &Strategy,
+fn levels(side: Side, entry: f64, b: &Bracket) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let pct = |p: f64| p / 100.0;
+    match side {
+        Side::Long => (
+            b.stop_pct.map(|s| entry * (1.0 - pct(s))),
+            b.target_pct.map(|t| entry * (1.0 + pct(t))),
+            b.trailing_pct.map(|t| entry * (1.0 - pct(t))),
+        ),
+        Side::Short => (
+            b.stop_pct.map(|s| entry * (1.0 + pct(s))),
+            b.target_pct.map(|t| entry * (1.0 - pct(t))),
+            b.trailing_pct.map(|t| entry * (1.0 + pct(t))),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    strategy: &mut dyn BarStrategy,
     candles: &[Candle],
-    cfg: &BacktestConfig,
-) -> Result<BacktestResult, String> {
-    strategy.validate()?;
+    instrument: &Instrument,
+    sizing: Sizing,
+    bracket: &Bracket,
+    session: &SessionFilter,
+    cfg: &RunConfig,
+) -> Result<BacktestResult, BacktestError> {
+    bracket.validate()?;
+    if !cfg.initial_equity.is_finite() || cfg.initial_equity <= 0.0 {
+        return Err(BacktestError::BadEquity(cfg.initial_equity));
+    }
     let n = candles.len();
     if n == 0 {
         return Ok(BacktestResult {
@@ -221,274 +155,297 @@ pub fn backtest(
             equity_curve: Vec::new(),
         });
     }
-
-    let opens: Vec<f64> = candles.iter().map(|c| c.open).collect();
-    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
-    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
-    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
-
-    let mut refs: Vec<(u8, Option<usize>)> = Vec::new();
-    {
-        let mut lists: Vec<&Rules> = vec![&strategy.entry];
-        if let Some(exit) = &strategy.exit {
-            lists.push(exit);
-        }
-        // collect_refs takes &[&Rules]
-        collect_refs(&lists, &mut refs);
-    }
-    let map = build_series(candles, &refs);
-
-    let cost = (cfg.fee_bps + cfg.slippage_bps) / 10000.0;
-    let side = strategy.side;
-    let sign = match side {
-        Side::Long => 1.0,
-        Side::Short => -1.0,
-    };
+    let cost_rate = instrument.cost_rate();
+    let pv = instrument.point_value;
 
     let mut trades: Vec<Trade> = Vec::new();
     let mut equity_curve: Vec<f64> = Vec::with_capacity(n);
-    let mut equity: f64 = 1.0;
-    let mut position: Option<OpenPosition> = None;
-    let mut pending_entry = false;
+    let mut equity = cfg.initial_equity;
+    let mut position: Option<OpenPos> = None;
+    let mut pending: Option<(Side, usize)> = None;
     let mut pending_exit = false;
-    let mut armed = true;
 
-    // Precompute entry/exit rule truth per bar? Evaluate on demand at close.
-    // We need entry truth per bar for armed logic; evaluate in loop.
+    let close_position = |pos: &OpenPos,
+                          exit_raw: f64,
+                          exit_ts: i64,
+                          exit_idx: usize,
+                          reason: ExitReason,
+                          equity_before: f64|
+     -> (f64, Trade) {
+        let sign = match pos.side {
+            Side::Long => 1.0,
+            Side::Short => -1.0,
+        };
+        let exit_cost = cost_rate * pos.qty * pv * exit_raw;
+        let pnl = sign * pos.qty * pv * (exit_raw - pos.entry_raw);
+        let after = equity_before + pnl - pos.entry_cost - exit_cost;
+        let ret = 100.0 * (after / equity_before - 1.0);
+        let trade = Trade {
+            entry_idx: pos.entry_idx,
+            exit_idx,
+            entry_ts: pos.entry_ts,
+            exit_ts,
+            side: pos.side,
+            entry_price: pos.entry_raw,
+            exit_price: exit_raw,
+            return_pct: ret,
+            reason,
+        };
+        (after, trade)
+    };
 
     for i in 0..n {
-        // (1) at the open, fill pending
-        if let Some(_pos) = &position {
-            if pending_exit {
-                let raw = candles[i].open;
-                let exit_price = match side {
-                    Side::Long => raw * (1.0 - cost),
-                    Side::Short => raw * (1.0 + cost),
-                };
-                let pos = position.take().unwrap();
-                let ret = 100.0 * sign * (exit_price / pos.entry_price - 1.0);
-                equity = pos.equity_at_entry * (1.0 + sign * (exit_price / pos.entry_price - 1.0));
-                trades.push(Trade {
-                    entry_idx: pos.entry_idx,
-                    exit_idx: i,
-                    entry_ts: pos.entry_ts,
-                    exit_ts: candles[i].ts,
-                    side,
-                    entry_price: pos.entry_price,
-                    exit_price,
-                    return_pct: ret,
-                    reason: ExitReason::Signal,
-                });
-                pending_exit = false;
-                // pending_entry should be false while in position; ensure cleared?
-                pending_entry = false;
-                armed = false;
+        if pending_exit {
+            if let Some(pos) = position.take() {
+                let raw_exit = candles[i].open;
+                let (after, trade) =
+                    close_position(&pos, raw_exit, candles[i].ts, i, ExitReason::Signal, equity);
+                equity = after;
+                trades.push(trade);
             }
-        } else if pending_entry {
-            let raw = candles[i].open;
-            let entry_price = match side {
-                Side::Long => raw * (1.0 + cost),
-                Side::Short => raw * (1.0 - cost),
-            };
-            position = Some(OpenPosition {
-                entry_idx: i,
-                entry_ts: candles[i].ts,
-                raw_open: raw,
-                entry_price,
-                equity_at_entry: equity,
-            });
-            pending_entry = false;
             pending_exit = false;
         }
+        if position.is_none() {
+            if let Some((side, sig_idx)) = pending.take() {
+                if session.contains(candles[sig_idx].ts) && session.contains(candles[i].ts) {
+                    let entry_raw = instrument.round_to_tick(candles[i].open);
+                    let qty = quantity(sizing, equity, entry_raw)?;
+                    let entry_cost = cost_rate * qty * pv * entry_raw;
+                    position = Some(OpenPos {
+                        entry_idx: i,
+                        entry_ts: candles[i].ts,
+                        entry_raw,
+                        side,
+                        qty,
+                        equity_at_entry: equity,
+                        entry_cost,
+                        peak: entry_raw,
+                    });
+                    strategy.on_fill(i);
+                }
+            }
+        }
 
-        // (2) check stop loss / take profit using this bar's high and low
-        if let Some(pos) = &position {
-            let raw_entry = pos.raw_open;
-            let (stop_level, target_level): (Option<f64>, Option<f64>) = match side {
-                Side::Long => (
-                    strategy
-                        .stop_loss_pct
-                        .map(|sl| raw_entry * (1.0 - sl / 100.0)),
-                    strategy
-                        .take_profit_pct
-                        .map(|tp| raw_entry * (1.0 + tp / 100.0)),
-                ),
-                Side::Short => (
-                    strategy
-                        .stop_loss_pct
-                        .map(|sl| raw_entry * (1.0 + sl / 100.0)),
-                    strategy
-                        .take_profit_pct
-                        .map(|tp| raw_entry * (1.0 - tp / 100.0)),
-                ),
-            };
+        if let Some(pos) = position.take() {
+            let (fixed_stop, target, base_trail) = levels(pos.side, pos.entry_raw, bracket);
+            let incoming_trail = base_trail;
+            // Ratchet trailing on excursion so a new high cannot stop itself.
+            let mut peak = pos.peak;
+            let mut trail = incoming_trail;
+            if let Some(pct) = bracket.trailing_pct {
+                let t = pct / 100.0;
+                match pos.side {
+                    Side::Long => {
+                        if candles[i].high > peak {
+                            peak = candles[i].high;
+                        }
+                        let candidate = peak * (1.0 - t);
+                        trail = Some(trail.map_or(candidate, |old| old.max(candidate)));
+                    }
+                    Side::Short => {
+                        if candles[i].low < peak {
+                            peak = candles[i].low;
+                        }
+                        let candidate = peak * (1.0 + t);
+                        trail = Some(trail.map_or(candidate, |old| old.min(candidate)));
+                    }
+                }
+            }
             let o = candles[i].open;
             let h = candles[i].high;
             let l = candles[i].low;
-            let (sl_hit, tp_hit) = match side {
-                Side::Long => (
-                    stop_level.map(|s| l <= s || o <= s).unwrap_or(false),
-                    target_level.map(|t| h >= t || o >= t).unwrap_or(false),
-                ),
-                Side::Short => (
-                    stop_level.map(|s| h >= s || o >= s).unwrap_or(false),
-                    target_level.map(|t| l <= t || o <= t).unwrap_or(false),
-                ),
-            };
-            let exit_raw_opt: Option<(f64, ExitReason)> = if sl_hit && tp_hit {
-                let t = target_level.unwrap();
-                let tp_gap = match side {
-                    Side::Long => o >= t,
-                    Side::Short => o <= t,
-                };
-                if tp_gap {
-                    // Bar opened at or beyond take-profit: TP fires at open first.
-                    Some((o, ExitReason::TakeProfit))
-                } else {
-                    // stop wins
-                    let s = stop_level.unwrap();
-                    let raw = match side {
+            let tighter = |f: Option<f64>, t: Option<f64>| -> (Option<f64>, bool) {
+                match (f, t) {
+                    (Some(f), Some(t)) => match pos.side {
                         Side::Long => {
-                            if o <= s {
-                                o
+                            if t >= f {
+                                (Some(t), true)
                             } else {
-                                s
+                                (Some(f), false)
                             }
                         }
                         Side::Short => {
-                            if o >= s {
-                                o
+                            if t <= f {
+                                (Some(t), true)
                             } else {
-                                s
+                                (Some(f), false)
                             }
                         }
-                    };
-                    Some((raw, ExitReason::StopLoss))
+                    },
+                    (Some(f), None) => (Some(f), false),
+                    (None, Some(t)) => (Some(t), true),
+                    (None, None) => (None, false),
+                }
+            };
+            let (gap_stop, gap_is_trail) = tighter(fixed_stop, incoming_trail);
+            let (stop_level, stop_is_trail) = tighter(fixed_stop, trail);
+            let (sl_hit, tp_hit) = match pos.side {
+                Side::Long => (
+                    stop_level.map(|s| l <= s).unwrap_or(false)
+                        || gap_stop.map(|s| o <= s).unwrap_or(false),
+                    target.map(|t| h >= t || o >= t).unwrap_or(false),
+                ),
+                Side::Short => (
+                    stop_level.map(|s| h >= s).unwrap_or(false)
+                        || gap_stop.map(|s| o >= s).unwrap_or(false),
+                    target.map(|t| l <= t || o <= t).unwrap_or(false),
+                ),
+            };
+            // Both hit intrabar without gap: stop wins.
+            let exit: Option<(f64, ExitReason)> = if sl_hit && tp_hit {
+                let gap_up = match (pos.side, target) {
+                    (Side::Long, Some(t)) => o >= t,
+                    (Side::Short, Some(t)) => o <= t,
+                    _ => false,
+                };
+                if gap_up {
+                    Some((o, ExitReason::TakeProfit))
+                } else {
+                    let gap_hit = gap_stop.map(|g| match pos.side {
+                        Side::Long => o <= g,
+                        Side::Short => o >= g,
+                    });
+                    if gap_hit.unwrap_or(false) {
+                        let reason = if gap_is_trail {
+                            ExitReason::Trailing
+                        } else {
+                            ExitReason::StopLoss
+                        };
+                        Some((o, reason))
+                    } else {
+                        match stop_level {
+                            Some(s) => {
+                                let reason = if stop_is_trail {
+                                    ExitReason::Trailing
+                                } else {
+                                    ExitReason::StopLoss
+                                };
+                                Some((s, reason))
+                            }
+                            None => None,
+                        }
+                    }
                 }
             } else if sl_hit {
-                let s = stop_level.unwrap();
-                let raw = match side {
-                    Side::Long => {
-                        if o <= s {
-                            o
-                        } else {
-                            s
+                let gap_hit = gap_stop.map(|g| match pos.side {
+                    Side::Long => o <= g,
+                    Side::Short => o >= g,
+                });
+                if gap_hit.unwrap_or(false) {
+                    let reason = if gap_is_trail {
+                        ExitReason::Trailing
+                    } else {
+                        ExitReason::StopLoss
+                    };
+                    Some((o, reason))
+                } else {
+                    match stop_level {
+                        Some(s) => {
+                            let reason = if stop_is_trail {
+                                ExitReason::Trailing
+                            } else {
+                                ExitReason::StopLoss
+                            };
+                            Some((s, reason))
                         }
+                        None => None,
                     }
-                    Side::Short => {
-                        if o >= s {
-                            o
-                        } else {
-                            s
-                        }
-                    }
-                };
-                Some((raw, ExitReason::StopLoss))
+                }
             } else if tp_hit {
-                let t = target_level.unwrap();
-                let raw = match side {
-                    Side::Long => {
-                        if o >= t {
-                            o
-                        } else {
-                            t
-                        }
+                match target {
+                    Some(t) => {
+                        let raw = match pos.side {
+                            Side::Long => {
+                                if o >= t {
+                                    o
+                                } else {
+                                    t
+                                }
+                            }
+                            Side::Short => {
+                                if o <= t {
+                                    o
+                                } else {
+                                    t
+                                }
+                            }
+                        };
+                        Some((raw, ExitReason::TakeProfit))
                     }
-                    Side::Short => {
-                        if o <= t {
-                            o
-                        } else {
-                            t
-                        }
-                    }
-                };
-                Some((raw, ExitReason::TakeProfit))
+                    None => None,
+                }
             } else {
                 None
             };
-            if let Some((raw_exit, reason)) = exit_raw_opt {
-                let exit_price = match side {
-                    Side::Long => raw_exit * (1.0 - cost),
-                    Side::Short => raw_exit * (1.0 + cost),
-                };
-                let pos = position.take().unwrap();
-                let ret = 100.0 * sign * (exit_price / pos.entry_price - 1.0);
-                equity = pos.equity_at_entry * (1.0 + sign * (exit_price / pos.entry_price - 1.0));
-                trades.push(Trade {
-                    entry_idx: pos.entry_idx,
-                    exit_idx: i,
-                    entry_ts: pos.entry_ts,
-                    exit_ts: candles[i].ts,
-                    side,
-                    entry_price: pos.entry_price,
-                    exit_price,
-                    return_pct: ret,
-                    reason,
-                });
-                armed = false;
-                // Any pending scheduled for this bar was already filled; no pending for next yet.
-                // Clear pending just in case (should already be false).
-                pending_entry = false;
-                pending_exit = false;
+            if let Some((raw_exit, reason)) = exit {
+                let (after, trade) =
+                    close_position(&pos, raw_exit, candles[i].ts, i, reason, equity);
+                equity = after;
+                trades.push(trade);
+            } else {
+                position = Some(OpenPos { peak, ..pos });
+                if cfg.exit_at_session_end
+                    && session.contains(candles[i].ts)
+                    && (i + 1 == n || !session.contains(candles[i + 1].ts))
+                {
+                    let Some(pos) = position.take() else {
+                        return Err(BacktestError::Internal("missing position".to_string()));
+                    };
+                    let raw_exit = candles[i].close;
+                    let (after, trade) = close_position(
+                        &pos,
+                        raw_exit,
+                        candles[i].ts,
+                        i,
+                        ExitReason::SessionEnd,
+                        equity,
+                    );
+                    equity = after;
+                    trades.push(trade);
+                }
             }
         }
 
-        // (3) at the close, evaluate signals and schedule pending for i+1
-        let entry_true = eval_rules(&strategy.entry, i, &map, &opens, &highs, &lows, &closes);
-        let exit_true = match &strategy.exit {
-            Some(rules) => eval_rules(rules, i, &map, &opens, &highs, &lows, &closes),
-            None => false,
-        };
-        // Re-arm when entry is false (on this bar).
-        if !entry_true {
-            armed = true;
-        }
         if i + 1 < n {
             if position.is_some() {
-                if exit_true {
+                if strategy.exit_on_bar(i, candles) {
                     pending_exit = true;
                 }
-            } else if armed && entry_true {
-                pending_entry = true;
+            } else if pending.is_none() && session.contains(candles[i].ts) {
+                if let Some(side) = strategy.on_bar(i, candles) {
+                    pending = Some((side, i));
+                }
             }
         }
 
-        // Equity marking at close
         if let Some(pos) = &position {
-            let mtm_raw = closes[i];
-            let mtm_exit = match side {
-                Side::Long => mtm_raw * (1.0 - cost),
-                Side::Short => mtm_raw * (1.0 + cost),
+            let sign = match pos.side {
+                Side::Long => 1.0,
+                Side::Short => -1.0,
             };
-            let mtm_equity =
-                pos.equity_at_entry * (1.0 + sign * (mtm_exit / pos.entry_price - 1.0));
-            equity_curve.push(mtm_equity);
+            let mtm_cost = cost_rate * pos.qty * pv * candles[i].close;
+            let mtm = pos.equity_at_entry
+                + sign * pos.qty * pv * (candles[i].close - pos.entry_raw)
+                - pos.entry_cost
+                - mtm_cost;
+            equity_curve.push(mtm);
         } else {
             equity_curve.push(equity);
         }
     }
 
-    // If still in a position after the last candle, close at last close with EndOfData.
     if let Some(pos) = position.take() {
         let raw_exit = candles[n - 1].close;
-        let exit_price = match side {
-            Side::Long => raw_exit * (1.0 - cost),
-            Side::Short => raw_exit * (1.0 + cost),
-        };
-        let ret = 100.0 * sign * (exit_price / pos.entry_price - 1.0);
-        equity = pos.equity_at_entry * (1.0 + sign * (exit_price / pos.entry_price - 1.0));
-        trades.push(Trade {
-            entry_idx: pos.entry_idx,
-            exit_idx: n - 1,
-            entry_ts: pos.entry_ts,
-            exit_ts: candles[n - 1].ts,
-            side,
-            entry_price: pos.entry_price,
-            exit_price,
-            return_pct: ret,
-            reason: ExitReason::EndOfData,
-        });
-        // Overwrite last equity mark with final close equity.
+        let (after, trade) = close_position(
+            &pos,
+            raw_exit,
+            candles[n - 1].ts,
+            n - 1,
+            ExitReason::EndOfData,
+            equity,
+        );
+        equity = after;
+        trades.push(trade);
         if let Some(last) = equity_curve.last_mut() {
             *last = equity;
         }
@@ -500,8 +457,326 @@ pub fn backtest(
     })
 }
 
+pub fn backtest_strategy(
+    spec: &Strategy,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+) -> Result<BacktestResult, BacktestError> {
+    spec.validate()?;
+    let (instrument, sizing, bracket, session, run_cfg) =
+        crate::strategy::rules_v2_setup(spec, cfg)?;
+    let mut strategy = crate::strategy::RulesStrategy::new(spec);
+    run(
+        &mut strategy,
+        candles,
+        &instrument,
+        sizing,
+        &bracket,
+        &session,
+        &run_cfg,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::session::MS_PER_MIN;
+
+    fn c(ts: i64, o: f64, h: f64, l: f64, cl: f64) -> Candle {
+        Candle {
+            ts,
+            open: o,
+            high: h,
+            low: l,
+            close: cl,
+        }
+    }
+
+    fn inst() -> Instrument {
+        Instrument::new("TEST", 0.01, 1.0, 0.0, 0.0).expect("valid")
+    }
+
+    fn session_all() -> SessionFilter {
+        SessionFilter::all_day()
+    }
+
+    fn run_cfg() -> RunConfig {
+        RunConfig::new(10_000.0, false).expect("valid")
+    }
+
+    struct Sig(Vec<Option<Side>>);
+
+    impl BarStrategy for Sig {
+        fn on_bar(&mut self, idx: usize, _candles: &[Candle]) -> Option<Side> {
+            self.0.get(idx).copied().flatten()
+        }
+    }
+
+    #[test]
+    fn stop_loss_fires_at_level() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 101.0, 97.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None]);
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].entry_idx, 1);
+        assert_eq!(r.trades[0].exit_idx, 1);
+        assert!((r.trades[0].exit_price - 98.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::StopLoss);
+        assert!((r.equity_curve[1] - 9_998.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn take_profit_fires_at_level() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 103.0, 100.0, 102.0),
+            c(2 * MS_PER_MIN, 102.0, 102.0, 102.0, 102.0),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: Some(2.0),
+            trailing_pct: None,
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert!((r.trades[0].exit_price - 102.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::TakeProfit);
+        assert!((r.equity_curve[1] - 10_002.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trailing_ratchets_and_fires() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 110.0, 109.0, 109.0),
+            c(2 * MS_PER_MIN, 109.0, 109.0, 108.0, 108.5),
+            c(3 * MS_PER_MIN, 108.5, 108.5, 108.5, 108.5),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None, None]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: Some(1.0),
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].reason, ExitReason::Trailing);
+        assert!((r.trades[0].exit_price - 108.9).abs() < 1e-9);
+        assert_eq!(r.trades[0].exit_idx, 2);
+    }
+
+    #[test]
+    fn out_of_session_signal_is_dropped() {
+        let eight = 8 * 60 * MS_PER_MIN;
+        let ten = 10 * 60 * MS_PER_MIN;
+        let candles = vec![
+            c(eight, 100.0, 100.0, 100.0, 100.0),
+            c(eight + MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(ten, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: None,
+        };
+        let session = SessionFilter::new(9 * 60 + 30, 16 * 60).expect("valid");
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session,
+            &run_cfg(),
+        )
+        .unwrap();
+        assert!(r.trades.is_empty());
+    }
+
+    struct SigExit {
+        entries: Vec<Option<Side>>,
+        exits: Vec<bool>,
+    }
+
+    impl BarStrategy for SigExit {
+        fn on_bar(&mut self, idx: usize, _candles: &[Candle]) -> Option<Side> {
+            self.entries.get(idx).copied().flatten()
+        }
+        fn exit_on_bar(&mut self, idx: usize, _candles: &[Candle]) -> bool {
+            self.exits.get(idx).copied().unwrap_or(false)
+        }
+    }
+
+    fn flat_bracket() -> Bracket {
+        Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: None,
+        }
+    }
+
+    #[test]
+    fn signal_exit_fills_next_open() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 105.0, 105.0, 105.0, 105.0),
+            c(3 * MS_PER_MIN, 105.0, 105.0, 105.0, 105.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None, None],
+            exits: vec![false, true, false, false],
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].entry_idx, 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert!((r.trades[0].exit_price - 105.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::Signal);
+    }
+
+    #[test]
+    fn signal_on_last_bar_is_end_of_data() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None],
+            exits: vec![false, false, true],
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert_eq!(r.trades[0].reason, ExitReason::EndOfData);
+    }
+
+    #[test]
+    fn pending_signal_exit_beats_gap_through_stop() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 90.0, 91.0, 89.0, 90.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None],
+            exits: vec![false, true, false],
+        };
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert!((r.trades[0].exit_price - 90.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::Signal);
+    }
+
+    #[test]
+    fn default_strategy_never_exits() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None]);
+        assert!(!s.exit_on_bar(0, &candles));
+        assert!(!s.exit_on_bar(1, &candles));
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].reason, ExitReason::EndOfData);
+    }
+
+    #[test]
+    fn bracket_rejects_bad_pct() {
+        let b = Bracket {
+            stop_pct: Some(0.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        assert!(b.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
     use super::*;
     use crate::strategy::{
         Condition, IndicatorKind, IndicatorRef, Op, Operand, Rules, Side, Strategy,
@@ -592,7 +867,6 @@ mod tests {
 
     #[test]
     fn entry_fill_is_next_bar_open_not_signal_close() {
-        // Signal at close of bar 1 (close 110 > 100), fill must be open of bar 2 (200).
         let candles = vec![
             c(0, 90.0, 95.0, 85.0, 90.0),
             c(1, 90.0, 115.0, 90.0, 110.0),
@@ -600,7 +874,7 @@ mod tests {
             c(3, 205.0, 210.0, 200.0, 206.0),
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, None, None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(res.trades.len(), 1);
         let t = &res.trades[0];
         assert_eq!(t.entry_idx, 2, "entry must fill at bar 2 open, not bar 1");
@@ -614,7 +888,6 @@ mod tests {
 
     #[test]
     fn truncated_run_trades_appear_in_full_run_no_lookahead() {
-        // Oscillating closes to generate multiple signal round-trips.
         let closes = [
             95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0, 95.0, 105.0,
         ];
@@ -634,11 +907,10 @@ mod tests {
         };
         let strat = long_strategy(entry, Some(exit_rules), None, None);
         let cfg = zero_cost();
-        let full = backtest(&strat, &candles, &cfg).unwrap();
+        let full = backtest_strategy(&strat, &candles, &cfg).unwrap();
         let k = 6;
         let trunc_candles = &candles[..k];
-        let trunc = backtest(&strat, trunc_candles, &cfg).unwrap();
-        // Every non-EndOfData trade in truncated must appear identically in full.
+        let trunc = backtest_strategy(&strat, trunc_candles, &cfg).unwrap();
         for tt in trunc
             .trades
             .iter()
@@ -661,7 +933,6 @@ mod tests {
                 tt, full.trades
             );
         }
-        // Sanity: truncated run produced at least one closed signal trade.
         assert!(
             trunc.trades.iter().any(|t| t.reason == ExitReason::Signal),
             "expected at least one signal trade in truncated run, got {:?}",
@@ -678,7 +949,7 @@ mod tests {
             c(3, 100.0, 101.0, 99.0, 90.0),
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), Some(2.0));
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert!(!res.trades.is_empty());
         let t = &res.trades[0];
         assert_eq!(t.entry_idx, 1);
@@ -700,7 +971,7 @@ mod tests {
             c(3, 92.0, 93.0, 91.0, 90.0),
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert!(!res.trades.is_empty());
         let t = &res.trades[0];
         assert_eq!(t.reason, ExitReason::StopLoss);
@@ -715,25 +986,17 @@ mod tests {
     #[test]
     fn flat_prices_with_fees_lose_about_point_two_percent() {
         let candles: Vec<Candle> = (0..5).map(|i| c(i, 100.0, 100.0, 100.0, 100.0)).collect();
-        // close 100 > 99 always true -> enter at bar 1, hold to end.
         let strat = long_strategy(entry_close_gt(99.0), None, None, None);
         let cfg = BacktestConfig {
             fee_bps: 10.0,
             slippage_bps: 0.0,
         };
-        let res = backtest(&strat, &candles, &cfg).unwrap();
+        let res = backtest_strategy(&strat, &candles, &cfg).unwrap();
         assert_eq!(res.trades.len(), 1);
         let t = &res.trades[0];
-        // Expected: cost=0.001, entry=100.1, exit=99.9, ret ~ -0.1998%
-        let expected = 100.0 * (99.9 / 100.1 - 1.0);
         assert!(
-            (t.return_pct - expected).abs() < 1e-9,
-            "return {} expected {expected}",
-            t.return_pct
-        );
-        assert!(
-            (t.return_pct - (-0.2)).abs() < 1e-3,
-            "return {} should be about -0.2%",
+            (t.return_pct - (-0.2)).abs() < 1e-9,
+            "return {} expected -0.2",
             t.return_pct
         );
     }
@@ -741,16 +1004,16 @@ mod tests {
     #[test]
     fn reentry_after_stopout_requires_entry_false_bar() {
         let candles = vec![
-            c(0, 100.0, 110.0, 100.0, 110.0), // signal true
-            c(1, 100.0, 101.0, 90.0, 110.0),  // entry fill 100 + SL hit same bar
-            c(2, 100.0, 101.0, 99.0, 110.0),  // entry true but must NOT enter (disarmed)
-            c(3, 100.0, 101.0, 99.0, 90.0),   // entry false -> re-arm
-            c(4, 100.0, 101.0, 99.0, 110.0),  // entry true -> schedule entry
-            c(5, 100.0, 101.0, 99.0, 110.0),  // entry fill
-            c(6, 100.0, 101.0, 99.0, 100.0),  // hold to end
+            c(0, 100.0, 110.0, 100.0, 110.0),
+            c(1, 100.0, 101.0, 90.0, 110.0), // entry fill 100 + SL hit same bar,
+            c(2, 100.0, 101.0, 99.0, 110.0), // entry true but must NOT enter (disarmed),
+            c(3, 100.0, 101.0, 99.0, 90.0),  // entry false -> re-arm,
+            c(4, 100.0, 101.0, 99.0, 110.0), // entry true -> schedule entry,
+            c(5, 100.0, 101.0, 99.0, 110.0), // entry fill,
+            c(6, 100.0, 101.0, 99.0, 100.0), // hold to end,
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(
             res.trades.len(),
             2,
@@ -759,7 +1022,6 @@ mod tests {
         );
         assert_eq!(res.trades[0].entry_idx, 1);
         assert_eq!(res.trades[0].reason, ExitReason::StopLoss);
-        // No trade with entry_idx 2 or 3 (immediate re-entry forbidden).
         assert!(
             !res.trades
                 .iter()
@@ -776,7 +1038,6 @@ mod tests {
 
     #[test]
     fn short_gains_when_price_falls_and_stop_is_above_entry() {
-        // Falling: short should gain.
         let fall = vec![
             c(0, 100.0, 100.0, 90.0, 90.0),
             c(1, 100.0, 101.0, 99.0, 95.0),
@@ -784,7 +1045,7 @@ mod tests {
             c(3, 90.0, 91.0, 85.0, 85.0),
         ];
         let strat = short_strategy(entry_close_lt(95.0), None, None, None);
-        let res = backtest(&strat, &fall, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &fall, &zero_cost()).unwrap();
         assert_eq!(res.trades.len(), 1);
         let t = &res.trades[0];
         assert_eq!(t.side, Side::Short);
@@ -794,7 +1055,6 @@ mod tests {
             t.return_pct
         );
 
-        // Rising with stop 2%: stop = 102 above entry 100, must trigger StopLoss and lose.
         let rise = vec![
             c(0, 100.0, 100.0, 90.0, 90.0),
             c(1, 100.0, 101.0, 99.0, 95.0),
@@ -802,7 +1062,7 @@ mod tests {
             c(3, 108.0, 109.0, 107.0, 108.0),
         ];
         let strat_sl = short_strategy(entry_close_lt(95.0), None, Some(2.0), None);
-        let res2 = backtest(&strat_sl, &rise, &zero_cost()).unwrap();
+        let res2 = backtest_strategy(&strat_sl, &rise, &zero_cost()).unwrap();
         assert_eq!(res2.trades.len(), 1);
         let t2 = &res2.trades[0];
         assert_eq!(t2.reason, ExitReason::StopLoss);
@@ -830,7 +1090,7 @@ mod tests {
             None,
         );
         let candles = vec![c(0, 100.0, 101.0, 99.0, 100.0)];
-        let res = backtest(&bad, &candles, &zero_cost());
+        let res = backtest_strategy(&bad, &candles, &zero_cost());
         assert!(res.is_err(), "invalid strategy must return Err");
     }
 
@@ -848,7 +1108,7 @@ mod tests {
             })
             .collect();
         let strat = long_strategy(entry_close_gt(100.0), None, None, None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(res.equity_curve.len(), candles.len());
         assert!(
             (res.equity_curve[0] - 1.0).abs() < 1e-12,
@@ -874,7 +1134,7 @@ mod tests {
             any: vec![],
         };
         let strat = long_strategy(entry, None, None, None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(
             res.trades.len(),
             1,
@@ -901,7 +1161,7 @@ mod tests {
             any: vec![],
         };
         let strat = short_strategy(entry, None, None, None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(
             res.trades.len(),
             1,
@@ -919,7 +1179,7 @@ mod tests {
             c(2, 100.0, 106.0, 99.0, 102.0),
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, None, Some(5.0));
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(
             res.trades.len(),
             1,
@@ -952,7 +1212,6 @@ mod tests {
                 },
             ],
         };
-        // Closes 100, 85, 100, 100: signal at idx 1 fills at idx 2.
         let closes = [100.0, 85.0, 100.0, 100.0];
         let candles: Vec<Candle> = closes
             .iter()
@@ -960,7 +1219,7 @@ mod tests {
             .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
             .collect();
         let strat = long_strategy(entry.clone(), None, None, None);
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert_eq!(
             res.trades.len(),
             1,
@@ -968,7 +1227,6 @@ mod tests {
             res.trades
         );
         assert_eq!(res.trades[0].entry_idx, 2);
-        // All flat: no trades.
         let flat_closes = [100.0, 100.0, 100.0, 100.0];
         let flat: Vec<Candle> = flat_closes
             .iter()
@@ -976,7 +1234,7 @@ mod tests {
             .map(|(i, cl)| c(i as i64, *cl, *cl, *cl, *cl))
             .collect();
         let strat2 = long_strategy(entry, None, None, None);
-        let res2 = backtest(&strat2, &flat, &zero_cost()).unwrap();
+        let res2 = backtest_strategy(&strat2, &flat, &zero_cost()).unwrap();
         assert!(
             res2.trades.is_empty(),
             "expected no trades, got {:?}",
@@ -1005,7 +1263,7 @@ mod tests {
         };
         let strat = long_strategy(entry, Some(exit_rules), None, None);
         let cfg = BacktestConfig::default();
-        let res = backtest(&strat, &candles, &cfg).unwrap();
+        let res = backtest_strategy(&strat, &candles, &cfg).unwrap();
         let mut expected = 1.0;
         for t in &res.trades {
             expected *= 1.0 + t.return_pct / 100.0;
@@ -1050,8 +1308,8 @@ mod tests {
         };
         let strat = long_strategy(entry, Some(exit_rules), None, None);
         let cfg = zero_cost();
-        let full = backtest(&strat, &candles, &cfg).unwrap();
-        let trunc = backtest(&strat, &candles[..25], &cfg).unwrap();
+        let full = backtest_strategy(&strat, &candles, &cfg).unwrap();
+        let trunc = backtest_strategy(&strat, &candles[..25], &cfg).unwrap();
         for tt in trunc
             .trades
             .iter()
@@ -1092,7 +1350,7 @@ mod tests {
             c(2, 105.0, 106.0, 90.0, 95.0),
         ];
         let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), Some(2.0));
-        let res = backtest(&strat, &candles, &zero_cost()).unwrap();
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
         assert!(!res.trades.is_empty());
         let t = &res.trades[0];
         assert_eq!(t.reason, ExitReason::TakeProfit);
@@ -1101,5 +1359,95 @@ mod tests {
             "exit {} expected open 105.0",
             t.exit_price
         );
+    }
+}
+
+#[cfg(test)]
+mod orb_recon_tests {
+    use crate::backtest::ExitReason;
+    use crate::backtest::{Bracket, RunConfig};
+    use crate::instrument::Instrument;
+    use crate::session::{SessionFilter, MS_PER_MIN};
+    use crate::sizing::Sizing;
+    use crate::stats::{bars_per_year, compute_stats, compute_v2};
+    use crate::strategy::{Orb, OrbConfig};
+    use crate::types::Candle;
+
+    fn c(ts: i64, o: f64, h: f64, l: f64, cl: f64) -> Candle {
+        Candle {
+            ts,
+            open: o,
+            high: h,
+            low: l,
+            close: cl,
+        }
+    }
+
+    #[test]
+    fn orb_run_reconciles_by_hand() {
+        let candles = vec![
+            c(0, 100.0, 101.0, 99.0, 100.0),
+            c(MS_PER_MIN, 100.0, 102.0, 99.5, 101.0),
+            c(2 * MS_PER_MIN, 101.0, 103.0, 100.0, 102.5),
+            c(3 * MS_PER_MIN, 102.5, 104.0, 102.0, 103.5),
+            c(4 * MS_PER_MIN, 103.5, 107.0, 103.0, 106.0),
+        ];
+        let mut orb = Orb::new(OrbConfig::new(2, 0.0, 1).expect("valid"));
+        let inst = Instrument::new("TEST", 0.01, 1.0, 0.0, 0.0).expect("valid");
+        let bracket = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: Some(4.0),
+            trailing_pct: None,
+        };
+        let session = SessionFilter::all_day();
+        let cfg = RunConfig::new(10_000.0, false).expect("valid");
+
+        let result = crate::backtest::run(
+            &mut orb,
+            &candles,
+            &inst,
+            Sizing::FixedQty(1.0),
+            &bracket,
+            &session,
+            &cfg,
+        )
+        .expect("run");
+
+        assert_eq!(orb.range(), Some((102.0, 99.0)));
+
+        assert_eq!(result.trades.len(), 1);
+        let t = &result.trades[0];
+        assert_eq!(t.entry_idx, 3);
+        assert_eq!(t.exit_idx, 4);
+        assert!((t.entry_price - 102.5).abs() < 1e-9);
+        assert!((t.exit_price - 106.6).abs() < 1e-9);
+        assert_eq!(t.reason, ExitReason::TakeProfit);
+        assert!((t.return_pct - 0.041).abs() < 1e-9);
+
+        let expected = [10_000.0, 10_000.0, 10_000.0, 10_001.0, 10_004.1];
+        assert_eq!(result.equity_curve.len(), expected.len());
+        for (i, (got, want)) in result.equity_curve.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "equity[{i}]: got {got}, want {want}"
+            );
+        }
+
+        let bpy = bars_per_year("1m").expect("1m");
+        let s = compute_stats(&result, &candles, bpy);
+        assert_eq!(s.trades, 1);
+        assert_eq!(s.wins, 1);
+        assert!((s.total_return_pct - 0.041).abs() < 1e-9);
+        assert!((s.max_drawdown_pct - 0.0).abs() < 1e-12);
+
+        let m = compute_v2(&result, &candles, bpy);
+        assert_eq!(m.max_win_streak, 1);
+        assert_eq!(m.max_loss_streak, 0);
+        assert!(m.drawdown_periods.is_empty());
+        assert!((m.calmar - 0.0).abs() < 1e-12);
+        assert!((m.sortino - 0.0).abs() < 1e-12);
+        assert_eq!(m.monthly.len(), 1);
+        assert!((m.monthly["1970-01"] - 0.041).abs() < 1e-9);
+        assert!((m.by_weekday["Thu"] - 0.041).abs() < 1e-9);
     }
 }

@@ -1,8 +1,3 @@
-/// Tradable instrument definition.
-///
-/// `tick_size` is the minimum price increment, `point_value` converts one
-/// price point into account currency per unit of quantity. `fee_bps` and
-/// `slippage_bps` are in basis points per side (like [`crate::backtest`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instrument {
     pub symbol: String,
@@ -12,6 +7,18 @@ pub struct Instrument {
     pub slippage_bps: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum InstrumentError {
+    #[error("symbol must not be empty")]
+    EmptySymbol,
+    #[error("tick_size must be > 0, got {0}")]
+    BadTick(f64),
+    #[error("point_value must be > 0, got {0}")]
+    BadPointValue(f64),
+    #[error("{0} must be between 0 and 1000, got {1}")]
+    BadCost(String, f64),
+}
+
 impl Instrument {
     pub fn new(
         symbol: &str,
@@ -19,19 +26,19 @@ impl Instrument {
         point_value: f64,
         fee_bps: f64,
         slippage_bps: f64,
-    ) -> Result<Instrument, String> {
+    ) -> Result<Instrument, InstrumentError> {
         if symbol.is_empty() {
-            return Err("symbol must not be empty".to_string());
+            return Err(InstrumentError::EmptySymbol);
         }
         if !tick_size.is_finite() || tick_size <= 0.0 {
-            return Err(format!("tick_size must be > 0, got {tick_size}"));
+            return Err(InstrumentError::BadTick(tick_size));
         }
         if !point_value.is_finite() || point_value <= 0.0 {
-            return Err(format!("point_value must be > 0, got {point_value}"));
+            return Err(InstrumentError::BadPointValue(point_value));
         }
         for (name, v) in [("fee_bps", fee_bps), ("slippage_bps", slippage_bps)] {
             if !v.is_finite() || !(0.0..=1000.0).contains(&v) {
-                return Err(format!("{name} must be between 0 and 1000, got {v}"));
+                return Err(InstrumentError::BadCost(name.to_string(), v));
             }
         }
         Ok(Instrument {
@@ -43,12 +50,10 @@ impl Instrument {
         })
     }
 
-    /// Combined per-side cost rate, e.g. 7 bps -> 0.0007.
     pub fn cost_rate(&self) -> f64 {
         (self.fee_bps + self.slippage_bps) / 10_000.0
     }
 
-    /// Round a price to the nearest tick.
     pub fn round_to_tick(&self, price: f64) -> f64 {
         (price / self.tick_size).round() * self.tick_size
     }

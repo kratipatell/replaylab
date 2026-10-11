@@ -1,20 +1,14 @@
-// Temporary: allow dead code while workspace is restructured into one binary crate.
-#![allow(dead_code)]
-
 mod api;
 mod backtest;
-mod backtest_v2;
 mod config;
 mod db;
 mod feeds;
 mod indicators;
 mod instrument;
 mod optimizer;
-mod orb_recon;
 mod session;
 mod sizing;
 mod stats;
-mod strategies;
 mod strategy;
 mod types;
 
@@ -25,13 +19,7 @@ use crate::config::Config;
 
 #[tokio::main]
 async fn main() {
-    let cfg = match Config::from_env() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
+    let cfg = Config::from_env();
     let source: Arc<dyn feeds::KlineSource + Send + Sync> = match cfg.base_url {
         Some(url) => Arc::new(feeds::BinanceSource { base_url: url }),
         None => Arc::new(feeds::BinanceSource::new()),

@@ -1,7 +1,78 @@
 use crate::types::Candle;
 use std::path::Path;
 
-/// Bar length in milliseconds (Binance open time, `ts` is in ms).
+#[derive(Debug, thiserror::Error)]
+pub enum FeedError {
+    #[error("invalid symbol: expected 2 to 20 characters, got {0}")]
+    BadSymbolLen(usize),
+    #[error("invalid symbol: {0:?}")]
+    BadSymbol(String),
+    #[error("row {0}: invalid {1} number: {2}")]
+    BadNumber(usize, String, String),
+    #[error("row {0}: invalid {1}, expected string or number, got {2}")]
+    BadType(usize, String, String),
+    #[error("row {0}: open time out of range: {1}")]
+    BadTimeRange(usize, u64),
+    #[error("row {0}: invalid open time: {1}")]
+    BadTime(usize, String),
+    #[error("row {0}: invalid open time, expected number, got {1}")]
+    BadTimeType(usize, String),
+    #[error("invalid JSON: {0}")]
+    BadJson(String),
+    #[error("invalid klines: expected top-level JSON array")]
+    BadTopLevel,
+    #[error("row {0}: expected JSON array")]
+    BadRow(usize),
+    #[error("row {0}: expected at least 5 fields, got {1}")]
+    BadFields(usize, usize),
+    #[error("candle {0}: timestamps not strictly ascending ({1} <= {2})")]
+    BadTs(usize, i64, i64),
+    #[error("candle {0}: {1} is not finite: {2}")]
+    BadFinite(usize, String, f64),
+    #[error("candle {0}: high ({1}) < low ({2})")]
+    BadHighLow(usize, f64, f64),
+    #[error("candle {0}: high ({1}) < max(open, close) ({2})")]
+    BadHigh(usize, f64, f64),
+    #[error("candle {0}: low ({1}) > min(open, close) ({2})")]
+    BadLow(usize, f64, f64),
+    #[error("request failed: {0}")]
+    Request(String),
+    #[error("HTTP {0}: {1}")]
+    Http(String, String),
+    #[error("failed to read response body: {0}")]
+    BadBody(String),
+    #[error("unknown interval: {0}")]
+    BadInterval(String),
+    #[error("page_limit must be greater than 0")]
+    BadPageLimit,
+    #[error("source did not advance")]
+    NoAdvance,
+    #[error("too many candles")]
+    TooMany,
+    #[error("timestamp overflow")]
+    Overflow,
+    #[error("failed to read cache: {0}")]
+    BadRead(String),
+    #[error("invalid cache row {0}: expected 5 fields, got {1}")]
+    BadCacheRow(usize, usize),
+    #[error("invalid cache ts on row {0}: {1:?}")]
+    BadCacheTs(usize, String),
+    #[error("invalid cache open on row {0}: {1:?}")]
+    BadCacheOpen(usize, String),
+    #[error("invalid cache high on row {0}: {1:?}")]
+    BadCacheHigh(usize, String),
+    #[error("invalid cache low on row {0}: {1:?}")]
+    BadCacheLow(usize, String),
+    #[error("invalid cache close on row {0}: {1:?}")]
+    BadCacheClose(usize, String),
+    #[error("failed to format cache: {0}")]
+    BadFormat(String),
+    #[error("failed to write cache: {0}")]
+    BadWrite(String),
+    #[error("failed to create cache dir: {0}")]
+    BadDir(String),
+}
+
 pub fn interval_ms(interval: &str) -> Option<i64> {
     match interval {
         "1m" => Some(60_000),
@@ -14,20 +85,16 @@ pub fn interval_ms(interval: &str) -> Option<i64> {
     }
 }
 
-/// Validate a trading symbol: 2 to 20 characters, ASCII uppercase letters
-/// and digits only.
-pub fn validate_symbol(symbol: &str) -> Result<(), String> {
+pub fn validate_symbol(symbol: &str) -> Result<(), FeedError> {
     let len = symbol.len();
     if !(2..=20).contains(&len) {
-        return Err(format!(
-            "invalid symbol: expected 2 to 20 characters, got {len}"
-        ));
+        return Err(FeedError::BadSymbolLen(len));
     }
     if !symbol
         .bytes()
         .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
     {
-        return Err(format!("invalid symbol: {symbol:?}"));
+        return Err(FeedError::BadSymbol(symbol.to_string()));
     }
     Ok(())
 }
@@ -43,7 +110,6 @@ fn latest_closed_open_ts(now_ms: i64, step_ms: i64) -> i64 {
     (now_ms - now_ms.rem_euclid(step_ms)) - step_ms
 }
 
-/// Keep only candles that have closed: `ts + step_ms <= now_ms`.
 pub fn drop_unclosed(candles: Vec<Candle>, step_ms: i64, now_ms: i64) -> Vec<Candle> {
     candles
         .into_iter()
@@ -51,8 +117,6 @@ pub fn drop_unclosed(candles: Vec<Candle>, step_ms: i64, now_ms: i64) -> Vec<Can
         .collect()
 }
 
-/// Return `(previous_ts, next_ts)` for every pair of consecutive candles
-/// whose `ts` difference is greater than `step_ms`.
 pub fn find_gaps(candles: &[Candle], step_ms: i64) -> Vec<(i64, i64)> {
     let mut gaps = Vec::new();
     for w in candles.windows(2) {
@@ -63,64 +127,51 @@ pub fn find_gaps(candles: &[Candle], step_ms: i64) -> Vec<(i64, i64)> {
     gaps
 }
 
-fn parse_f64(value: &serde_json::Value, row: usize, field: &str) -> Result<f64, String> {
+fn parse_f64(value: &serde_json::Value, row: usize, field: &str) -> Result<f64, FeedError> {
     match value {
         serde_json::Value::String(s) => s
             .parse::<f64>()
-            .map_err(|_| format!("row {row}: invalid {field} number: {s:?}")),
+            .map_err(|_| FeedError::BadNumber(row, field.to_string(), format!("{s:?}"))),
         serde_json::Value::Number(n) => n
             .as_f64()
-            .ok_or_else(|| format!("row {row}: invalid {field} number: {n}")),
-        other => Err(format!(
-            "row {row}: invalid {field}, expected string or number, got {other}"
+            .ok_or_else(|| FeedError::BadNumber(row, field.to_string(), n.to_string())),
+        other => Err(FeedError::BadType(
+            row,
+            field.to_string(),
+            other.to_string(),
         )),
     }
 }
 
-fn parse_ts(value: &serde_json::Value, row: usize) -> Result<i64, String> {
+fn parse_ts(value: &serde_json::Value, row: usize) -> Result<i64, FeedError> {
     match value {
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_i64() {
                 Ok(v)
             } else if let Some(v) = n.as_u64() {
-                i64::try_from(v).map_err(|_| format!("row {row}: open time out of range: {v}"))
+                i64::try_from(v).map_err(|_| FeedError::BadTimeRange(row, v))
             } else if let Some(v) = n.as_f64() {
                 Ok(v as i64)
             } else {
-                Err(format!("row {row}: invalid open time: {n}"))
+                Err(FeedError::BadTime(row, n.to_string()))
             }
         }
         serde_json::Value::String(s) => s
             .parse::<i64>()
-            .map_err(|_| format!("row {row}: invalid open time: {s:?}")),
-        other => Err(format!(
-            "row {other_row}: invalid open time, expected number, got {other}",
-            other_row = row
-        )),
+            .map_err(|_| FeedError::BadTime(row, format!("{s:?}"))),
+        other => Err(FeedError::BadTimeType(row, other.to_string())),
     }
 }
 
-/// Parse Binance `GET /api/v3/klines` JSON.
-///
-/// Expects a JSON array of arrays:
-/// `[openTimeMs (number), open, high, low, close, volume, ...]`
-/// where `open`/`high`/`low`/`close` are strings.
-pub fn parse_klines(json: &str) -> Result<Vec<Candle>, String> {
+pub fn parse_klines(json: &str) -> Result<Vec<Candle>, FeedError> {
     let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
-    let rows = value
-        .as_array()
-        .ok_or_else(|| "invalid klines: expected top-level JSON array".to_string())?;
+        serde_json::from_str(json).map_err(|e| FeedError::BadJson(e.to_string()))?;
+    let rows = value.as_array().ok_or(FeedError::BadTopLevel)?;
     let mut out = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let cols = row
-            .as_array()
-            .ok_or_else(|| format!("row {i}: expected JSON array"))?;
+        let cols = row.as_array().ok_or(FeedError::BadRow(i))?;
         if cols.len() < 5 {
-            return Err(format!(
-                "row {i}: expected at least 5 fields, got {}",
-                cols.len()
-            ));
+            return Err(FeedError::BadFields(i, cols.len()));
         }
         let ts = parse_ts(&cols[0], i)?;
         let open = parse_f64(&cols[1], i, "open")?;
@@ -138,16 +189,10 @@ pub fn parse_klines(json: &str) -> Result<Vec<Candle>, String> {
     Ok(out)
 }
 
-/// Validate candles: strictly ascending `ts`, finite OHLC, and
-/// `high >= low`, `high >= max(open, close)`, `low <= min(open, close)`.
-pub fn validate_candles(c: &[Candle]) -> Result<(), String> {
+pub fn validate_candles(c: &[Candle]) -> Result<(), FeedError> {
     for (i, candle) in c.iter().enumerate() {
         if i > 0 && candle.ts <= c[i - 1].ts {
-            return Err(format!(
-                "candle {i}: timestamps not strictly ascending ({} <= {})",
-                candle.ts,
-                c[i - 1].ts
-            ));
+            return Err(FeedError::BadTs(i, candle.ts, c[i - 1].ts));
         }
         for (name, v) in [
             ("open", candle.open),
@@ -156,34 +201,24 @@ pub fn validate_candles(c: &[Candle]) -> Result<(), String> {
             ("close", candle.close),
         ] {
             if !v.is_finite() {
-                return Err(format!("candle {i}: {name} is not finite: {v}"));
+                return Err(FeedError::BadFinite(i, name.to_string(), v));
             }
         }
         if candle.high < candle.low {
-            return Err(format!(
-                "candle {i}: high ({}) < low ({})",
-                candle.high, candle.low
-            ));
+            return Err(FeedError::BadHighLow(i, candle.high, candle.low));
         }
         let max_oc = candle.open.max(candle.close);
         let min_oc = candle.open.min(candle.close);
         if candle.high < max_oc {
-            return Err(format!(
-                "candle {i}: high ({}) < max(open, close) ({max_oc})",
-                candle.high
-            ));
+            return Err(FeedError::BadHigh(i, candle.high, max_oc));
         }
         if candle.low > min_oc {
-            return Err(format!(
-                "candle {i}: low ({}) > min(open, close) ({min_oc})",
-                candle.low
-            ));
+            return Err(FeedError::BadLow(i, candle.low, min_oc));
         }
     }
     Ok(())
 }
 
-/// A paged source of klines.
 pub trait KlineSource {
     fn fetch(
         &self,
@@ -192,10 +227,9 @@ pub trait KlineSource {
         start_ms: i64,
         end_ms: i64,
         limit: usize,
-    ) -> Result<Vec<Candle>, String>;
+    ) -> Result<Vec<Candle>, FeedError>;
 }
 
-/// Binance REST klines source.
 pub struct BinanceSource {
     pub base_url: String,
 }
@@ -222,7 +256,7 @@ impl KlineSource for BinanceSource {
         start_ms: i64,
         end_ms: i64,
         limit: usize,
-    ) -> Result<Vec<Candle>, String> {
+    ) -> Result<Vec<Candle>, FeedError> {
         let url = format!("{}/api/v3/klines", self.base_url.trim_end_matches('/'));
         let client = reqwest::blocking::Client::new();
         let resp = client
@@ -235,20 +269,17 @@ impl KlineSource for BinanceSource {
                 ("limit", limit.to_string()),
             ])
             .send()
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| FeedError::Request(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();
-            return Err(format!("HTTP {status}: {body}"));
+            return Err(FeedError::Http(status.to_string(), body));
         }
-        let text = resp
-            .text()
-            .map_err(|e| format!("failed to read response body: {e}"))?;
+        let text = resp.text().map_err(|e| FeedError::BadBody(e.to_string()))?;
         parse_klines(&text)
     }
 }
 
-/// Page through `[start_ms, end_ms]`, dedupe, sort ascending and validate.
 pub fn fetch_range(
     source: &dyn KlineSource,
     symbol: &str,
@@ -256,12 +287,12 @@ pub fn fetch_range(
     start_ms: i64,
     end_ms: i64,
     page_limit: usize,
-) -> Result<Vec<Candle>, String> {
+) -> Result<Vec<Candle>, FeedError> {
     validate_symbol(symbol)?;
-    let step = interval_ms(interval).ok_or_else(|| format!("unknown interval: {interval}"))?;
+    let step = interval_ms(interval).ok_or_else(|| FeedError::BadInterval(interval.to_string()))?;
     let start_ms = start_ms - start_ms.rem_euclid(step);
     if page_limit == 0 {
-        return Err("page_limit must be greater than 0".to_string());
+        return Err(FeedError::BadPageLimit);
     }
     let mut all: Vec<Candle> = Vec::new();
     let mut next_start = start_ms;
@@ -279,15 +310,13 @@ pub fn fetch_range(
         if last_ts >= end_ms {
             break;
         }
-        let next = last_ts
-            .checked_add(step)
-            .ok_or_else(|| "timestamp overflow".to_string())?;
+        let next = last_ts.checked_add(step).ok_or(FeedError::Overflow)?;
         if next <= next_start {
-            return Err("source did not advance".to_string());
+            return Err(FeedError::NoAdvance);
         }
         next_start = next;
         if all.len() > 1_000_000 {
-            return Err("too many candles".to_string());
+            return Err(FeedError::TooMany);
         }
     }
     let mut filtered: Vec<Candle> = all
@@ -305,12 +334,12 @@ fn cache_path(cache_dir: &Path, symbol: &str, interval: &str) -> std::path::Path
     cache_dir.join(format!("{symbol}_{interval}.csv"))
 }
 
-fn read_cache_file(path: &Path) -> Result<Vec<Candle>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("failed to read cache: {e}"))?;
+fn read_cache_file(path: &Path) -> Result<Vec<Candle>, FeedError> {
+    let text = std::fs::read_to_string(path).map_err(|e| FeedError::BadRead(e.to_string()))?;
     let mut out = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         if idx == 0 {
-            continue; // header ts,open,high,low,close
+            continue;
         }
         let line = line.trim();
         if line.is_empty() {
@@ -318,27 +347,23 @@ fn read_cache_file(path: &Path) -> Result<Vec<Candle>, String> {
         }
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() != 5 {
-            return Err(format!(
-                "invalid cache row {}: expected 5 fields, got {}",
-                idx,
-                parts.len()
-            ));
+            return Err(FeedError::BadCacheRow(idx, parts.len()));
         }
         let ts: i64 = parts[0]
             .parse()
-            .map_err(|_| format!("invalid cache ts on row {idx}: {:?}", parts[0]))?;
+            .map_err(|_| FeedError::BadCacheTs(idx, parts[0].to_string()))?;
         let open: f64 = parts[1]
             .parse()
-            .map_err(|_| format!("invalid cache open on row {idx}: {:?}", parts[1]))?;
+            .map_err(|_| FeedError::BadCacheOpen(idx, parts[1].to_string()))?;
         let high: f64 = parts[2]
             .parse()
-            .map_err(|_| format!("invalid cache high on row {idx}: {:?}", parts[2]))?;
+            .map_err(|_| FeedError::BadCacheHigh(idx, parts[2].to_string()))?;
         let low: f64 = parts[3]
             .parse()
-            .map_err(|_| format!("invalid cache low on row {idx}: {:?}", parts[3]))?;
+            .map_err(|_| FeedError::BadCacheLow(idx, parts[3].to_string()))?;
         let close: f64 = parts[4]
             .parse()
-            .map_err(|_| format!("invalid cache close on row {idx}: {:?}", parts[4]))?;
+            .map_err(|_| FeedError::BadCacheClose(idx, parts[4].to_string()))?;
         out.push(Candle {
             ts,
             open,
@@ -352,12 +377,12 @@ fn read_cache_file(path: &Path) -> Result<Vec<Candle>, String> {
     Ok(out)
 }
 
-fn write_cache_file(path: &Path, candles: &[Candle]) -> Result<(), String> {
+fn write_cache_file(path: &Path, candles: &[Candle]) -> Result<(), FeedError> {
     use std::fmt::Write as _;
     let mut text = String::from("ts,open,high,low,close\n");
     for c in candles {
         writeln!(text, "{},{},{},{},{}", c.ts, c.open, c.high, c.low, c.close)
-            .map_err(|e| format!("failed to format cache: {e}"))?;
+            .map_err(|e| FeedError::BadFormat(e.to_string()))?;
     }
     let file_name = path
         .file_name()
@@ -374,23 +399,15 @@ fn write_cache_file(path: &Path, candles: &[Candle]) -> Result<(), String> {
     };
     if let Err(e) = std::fs::write(&tmp_path, text) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("failed to write cache: {e}"));
+        return Err(FeedError::BadWrite(e.to_string()));
     }
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("failed to write cache: {e}"));
+        return Err(FeedError::BadWrite(e.to_string()));
     }
     Ok(())
 }
 
-/// Load `[start_ms, end_ms]` from disk cache or fetch and populate it.
-///
-/// Cache file is `{cache_dir}/{symbol}_{interval}.csv` with header
-/// `ts,open,high,low,close`. If cached data covers the range
-/// (`first ts <= start_ms` and `last ts + interval_ms >= end_ms`),
-/// the slice within `[start_ms, end_ms]` is returned without calling
-/// `source`. Otherwise the full range is fetched with `page_limit` 1000,
-/// the cache is overwritten, and the fetched candles are returned.
 pub fn load_or_fetch(
     cache_dir: &Path,
     source: &dyn KlineSource,
@@ -398,9 +415,9 @@ pub fn load_or_fetch(
     interval: &str,
     start_ms: i64,
     end_ms: i64,
-) -> Result<Vec<Candle>, String> {
+) -> Result<Vec<Candle>, FeedError> {
     validate_symbol(symbol)?;
-    let step = interval_ms(interval).ok_or_else(|| format!("unknown interval: {interval}"))?;
+    let step = interval_ms(interval).ok_or_else(|| FeedError::BadInterval(interval.to_string()))?;
     let start_ms = start_ms - start_ms.rem_euclid(step);
     let effective_end = end_ms.min(
         latest_closed_open_ts(now_ms(), step)
@@ -410,7 +427,7 @@ pub fn load_or_fetch(
     if start_ms > effective_end {
         return Ok(Vec::new());
     }
-    std::fs::create_dir_all(cache_dir).map_err(|e| format!("failed to create cache dir: {e}"))?;
+    std::fs::create_dir_all(cache_dir).map_err(|e| FeedError::BadDir(e.to_string()))?;
     let path = cache_path(cache_dir, symbol, interval);
     if path.exists() {
         if let Ok(cached) = read_cache_file(&path) {
@@ -462,7 +479,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             limit: usize,
-        ) -> Result<Vec<Candle>, String> {
+        ) -> Result<Vec<Candle>, FeedError> {
             self.calls.set(self.calls.get() + 1);
             Ok(self
                 .data
@@ -549,18 +566,16 @@ mod tests {
 
         let err = fetch_range(&src, "BTCUSDT", "7m", 0, 60_000, 10).unwrap_err();
         assert!(
-            err.contains("7m") || err.to_lowercase().contains("interval"),
+            err.to_string().contains("7m") || err.to_string().to_lowercase().contains("interval"),
             "{err}"
         );
     }
 
     #[test]
     fn validate_candles_rejects_bad_data() {
-        // descending timestamps
         let bad_ts = vec![mk_candle(2000, 100.0), mk_candle(1000, 100.0)];
         assert!(validate_candles(&bad_ts).is_err());
 
-        // NaN
         let bad_nan = vec![Candle {
             ts: 0,
             open: f64::NAN,
@@ -570,7 +585,6 @@ mod tests {
         }];
         assert!(validate_candles(&bad_nan).is_err());
 
-        // high < low
         let bad_hl = vec![Candle {
             ts: 0,
             open: 100.0,
@@ -635,7 +649,7 @@ mod tests {
         let data = ten_1m_candles();
         let src = FakeSource::new(data);
         let err = fetch_range(&src, "../x", "1m", 0, 9 * 60_000, 10).unwrap_err();
-        assert!(!err.is_empty());
+        assert!(!err.to_string().is_empty());
         assert_eq!(src.calls.get(), 0);
 
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -651,7 +665,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let src2 = FakeSource::new(ten_1m_candles());
         let err2 = load_or_fetch(&dir, &src2, "../x", "1m", 0, 9 * 60_000).unwrap_err();
-        assert!(!err2.is_empty());
+        assert!(!err2.to_string().is_empty());
         assert_eq!(src2.calls.get(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

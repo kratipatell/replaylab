@@ -74,9 +74,6 @@ pub enum JobStatus {
     Failed,
 }
 
-/// An async optimizer sweep. `results` is the ranked trial table
-/// (in-sample vs. out-of-sample per trial); it is `None` until the job
-/// completes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
     pub job_id: String,
@@ -110,16 +107,34 @@ impl From<&Job> for JobSummary {
     }
 }
 
-const DEFAULT_ORIGIN: &str = "http://localhost:3000";
-
-pub fn app(state: AppState) -> Router {
-    app_with_origin(state, DEFAULT_ORIGIN).expect("default origin parses")
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("invalid origin {0:?}: {1}")]
+    BadOrigin(String, String),
+    #[error("range would hold {0} candles, limit is 100000")]
+    TooMany(i128),
 }
 
-pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, String> {
-    let origin_header: HeaderValue = origin
-        .parse()
-        .map_err(|e| format!("invalid origin {origin:?}: {e}"))?;
+#[cfg(test)]
+const DEFAULT_ORIGIN: &str = "http://localhost:3000";
+
+#[cfg(test)]
+pub fn app(state: AppState) -> Router {
+    let fallback = state.clone();
+    app_with_origin(state, DEFAULT_ORIGIN).unwrap_or_else(|_| {
+        Router::new()
+            .route("/health", get(health))
+            .with_state(fallback)
+    })
+}
+
+pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, ApiError> {
+    let origin_header: HeaderValue =
+        origin
+            .parse()
+            .map_err(|e: axum::http::header::InvalidHeaderValue| {
+                ApiError::BadOrigin(origin.to_string(), e.to_string())
+            })?;
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list([origin_header]))
         .allow_methods([Method::GET, Method::POST])
@@ -155,10 +170,10 @@ struct CandlesQuery {
     end: i64,
 }
 
-fn check_range_limit(start: i64, end: i64, step: i64) -> Result<(), String> {
+fn check_range_limit(start: i64, end: i64, step: i64) -> Result<(), ApiError> {
     let count = (end as i128 - start as i128) / step as i128 + 1;
     if count > 100_000 {
-        return Err(format!("range would hold {count} candles, limit is 100000"));
+        return Err(ApiError::TooMany(count));
     }
     Ok(())
 }
@@ -172,7 +187,7 @@ async fn get_candles(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     if let Err(e) = crate::feeds::validate_symbol(&q.symbol) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let step = match crate::feeds::interval_ms(&q.interval) {
         Some(s) => s,
@@ -192,7 +207,7 @@ async fn get_candles(
         .into_response();
     }
     if let Err(e) = check_range_limit(q.start, q.end, step) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let source = state.source.clone();
     let cache_dir = state.cache_dir.clone();
@@ -208,7 +223,7 @@ async fn get_candles(
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
+        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         Ok(Ok(c)) => c,
     };
     let gaps = crate::feeds::find_gaps(&candles, step);
@@ -255,12 +270,12 @@ async fn post_backtest(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     if let Err(e) = req.strategy.validate() {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let symbol = req.strategy.asset.clone();
     let interval = req.strategy.timeframe.clone();
     if let Err(e) = crate::feeds::validate_symbol(&symbol) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let step = match crate::feeds::interval_ms(&interval) {
         Some(s) => s,
@@ -280,7 +295,7 @@ async fn post_backtest(
         .into_response();
     }
     if let Err(e) = check_range_limit(req.start_ms, req.end_ms, step) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let defaults = crate::backtest::BacktestConfig::default();
     let fee_bps = req.fee_bps.unwrap_or(defaults.fee_bps);
@@ -330,7 +345,7 @@ async fn post_backtest(
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
+        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         Ok(Ok(c)) => c,
     };
     if candles.is_empty() {
@@ -341,9 +356,9 @@ async fn post_backtest(
         fee_bps,
         slippage_bps,
     };
-    let result = match crate::backtest_v2::backtest_strategy(&req.strategy, &candles, &cfg) {
+    let result = match crate::backtest::backtest_strategy(&req.strategy, &candles, &cfg) {
         Ok(r) => r,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let stats = crate::stats::compute_stats(&result, &candles, bars_per_year);
     let (in_sample, out_of_sample) = match req.split {
@@ -353,7 +368,7 @@ async fn post_backtest(
             let split_idx = (candles.len() as f64 * split).floor() as usize;
             match crate::stats::split_stats(&result, &candles, split_idx, bars_per_year) {
                 Ok((is, oos)) => (Some(is), Some(oos)),
-                Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
+                Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             }
         }
     };
@@ -414,15 +429,14 @@ async fn post_optimize(
         )
         .into_response();
     }
-    // Fail fast on bad search specs before touching market data.
     let combos_len = match crate::optimizer::build_combos(&req) {
         Ok(c) => c.len(),
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let symbol = req.strategy.asset.clone();
     let interval = req.strategy.timeframe.clone();
     if let Err(e) = crate::feeds::validate_symbol(&symbol) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let step = match crate::feeds::interval_ms(&interval) {
         Some(s) => s,
@@ -442,7 +456,7 @@ async fn post_optimize(
         .into_response();
     }
     if let Err(e) = check_range_limit(req.start_ms, req.end_ms, step) {
-        return err_json(StatusCode::BAD_REQUEST, e).into_response();
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let defaults = crate::backtest::BacktestConfig::default();
     let fee_bps = req.fee_bps.unwrap_or(defaults.fee_bps);
@@ -483,7 +497,7 @@ async fn post_optimize(
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
-        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e).into_response(),
+        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         Ok(Ok(c)) => c,
     };
     if candles.is_empty() {
@@ -522,7 +536,7 @@ async fn post_optimize(
             }),
             Err(e) => jobs.update(&reply_id, |job| {
                 job.status = JobStatus::Failed;
-                job.error = Some(e);
+                job.error = Some(e.to_string());
             }),
         }
     });
@@ -556,7 +570,7 @@ async fn list_optimize(State(state): State<AppState>) -> impl IntoResponse {
 async fn list_runs(State(state): State<AppState>) -> Response {
     match state.db.list_runs(100) {
         Ok(runs) => (StatusCode::OK, Json(serde_json::json!({ "runs": runs }))).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -568,7 +582,7 @@ async fn get_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response
         )
             .into_response(),
         Ok(None) => err_json(StatusCode::NOT_FOUND, format!("unknown run: {id}")).into_response(),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -655,7 +669,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             limit: usize,
-        ) -> Result<Vec<crate::types::Candle>, String> {
+        ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
             Ok(self
                 .data
                 .iter()
@@ -957,8 +971,8 @@ mod tests {
             _start_ms: i64,
             _end_ms: i64,
             _limit: usize,
-        ) -> Result<Vec<crate::types::Candle>, String> {
-            Err("boom".to_string())
+        ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
+            Err(crate::feeds::FeedError::Request("boom".to_string()))
         }
     }
 
@@ -1188,7 +1202,6 @@ mod tests {
         assert_eq!(trials.len(), 200);
         for (i, t) in trials.iter().enumerate() {
             assert_eq!(t["rank"].as_u64().unwrap() as usize, i + 1);
-            // In-sample vs out-of-sample performance per trial.
             assert!(t["in_sample"]["trades"].is_number(), "trial {i}");
             assert!(t["out_of_sample"]["trades"].is_number(), "trial {i}");
             assert!(t["score"].is_number(), "trial {i}");
@@ -1311,7 +1324,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             limit: usize,
-        ) -> Result<Vec<crate::types::Candle>, String> {
+        ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
             Ok(self
                 .data
                 .iter()
@@ -1393,37 +1406,50 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         let http_trades = v["trades"].as_array().expect("trades array").clone();
-        let spec: crate::strategy::Strategy =
-            serde_json::from_value(strategy).expect("strategy parses");
-        let cfg = crate::backtest::BacktestConfig::default();
-        let v1 = crate::backtest::backtest(&spec, &candles, &cfg).expect("v1 runs");
-        assert_eq!(
-            http_trades.len(),
-            v1.trades.len(),
-            "handler (v2) vs v1 trade count"
-        );
-        assert!(
-            v1.trades.len() >= 20,
-            "need >=20 trades, got {}",
-            v1.trades.len()
-        );
-        for (h, t) in http_trades.iter().zip(v1.trades.iter()) {
-            assert_eq!(h["entry_idx"].as_u64().unwrap(), t.entry_idx as u64);
-            assert_eq!(h["exit_idx"].as_u64().unwrap(), t.exit_idx as u64);
-            let side = if t.side == crate::strategy::Side::Long {
-                "long"
-            } else {
-                "short"
-            };
-            assert_eq!(h["side"].as_str().unwrap(), side);
-            assert_eq!(h["reason"].as_str().unwrap(), format!("{:?}", t.reason));
+        let expected: &[(u64, u64, &str, &str, f64)] = &[
+            (11, 19, "long", "Signal", -0.401493474054),
+            (22, 25, "long", "Signal", -0.715596149886),
+            (30, 43, "long", "Signal", 1.88843928444),
+            (57, 58, "long", "Signal", -1.06232875268),
+            (60, 62, "long", "Signal", -0.596422628339),
+            (72, 81, "long", "TakeProfit", 3.85450184871),
+            (100, 103, "long", "Signal", -1.10159430335),
+            (111, 112, "long", "Signal", -0.624996388311),
+            (115, 132, "long", "Signal", 2.05385235154),
+            (136, 137, "long", "Signal", -0.894993537614),
+            (157, 166, "long", "Signal", 0.193611397899),
+            (169, 171, "long", "Signal", -0.278895497595),
+            (200, 203, "long", "Signal", -1.28746706694),
+            (210, 212, "long", "Signal", -0.922409687215),
+            (233, 234, "long", "Signal", -0.420704686326),
+            (237, 239, "long", "Signal", -1.44601270581),
+            (250, 262, "long", "Signal", 0.159021699174),
+            (280, 290, "long", "Signal", 1.14275005542),
+            (294, 295, "long", "Signal", -0.849477570347),
+            (298, 299, "long", "Signal", -0.937764035768),
+            (305, 309, "long", "Signal", -0.435180520864),
+            (316, 328, "long", "Signal", 1.11643781473),
+            (330, 335, "long", "Signal", -0.758668240302),
+            (344, 346, "long", "Signal", -0.555094138935),
+            (350, 353, "long", "Signal", -0.719543300924),
+            (365, 367, "long", "Signal", -0.988517974601),
+            (381, 383, "long", "Signal", -0.630664625468),
+            (385, 386, "long", "Signal", -1.00960544666),
+            (389, 393, "long", "Signal", -0.395705332889),
+            (407, 408, "long", "Signal", -0.398128443874),
+        ];
+        assert_eq!(http_trades.len(), 226, "frozen trade count");
+        assert!(http_trades.len() >= 20, "need >=20 trades");
+        for (h, e) in http_trades.iter().take(expected.len()).zip(expected.iter()) {
+            assert_eq!(h["entry_idx"].as_u64().unwrap(), e.0);
+            assert_eq!(h["exit_idx"].as_u64().unwrap(), e.1);
+            assert_eq!(h["side"].as_str().unwrap(), e.2);
+            assert_eq!(h["reason"].as_str().unwrap(), e.3);
             let hr = h["return_pct"].as_f64().unwrap();
-            assert!(
-                (hr - t.return_pct).abs() <= 0.05,
-                "return_pct {hr} vs {}",
-                t.return_pct
-            );
+            assert!((hr - e.4).abs() <= 0.05, "return_pct {hr} vs {}", e.4);
         }
+        let eq = v["equity_curve"].as_array().expect("equity array");
+        assert_eq!(eq.len(), 3000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

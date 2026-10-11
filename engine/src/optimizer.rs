@@ -10,14 +10,29 @@ use crate::stats::{self, Stats};
 use crate::strategy::{Operand, Strategy};
 use crate::types::Candle;
 
-/// Hard caps to keep sweeps bounded.
+#[derive(Debug, thiserror::Error)]
+pub enum OptimizerError {
+    #[error("{0}")]
+    Msg(String),
+    #[error(transparent)]
+    Strategy(#[from] crate::strategy::StrategyError),
+    #[error(transparent)]
+    Backtest(#[from] crate::backtest::BacktestError),
+    #[error(transparent)]
+    Stats(#[from] crate::stats::StatsError),
+}
+
+impl From<String> for OptimizerError {
+    fn from(s: String) -> Self {
+        OptimizerError::Msg(s)
+    }
+}
+
 pub const MAX_TRIALS: usize = 2000;
 pub const MAX_PARAMS: usize = 8;
 pub const MAX_FOLDS: usize = 10;
-/// Minimum candles per walk-forward window (train or test).
 const MIN_WINDOW: usize = 5;
 
-/// Integer or float search dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamKind {
@@ -25,20 +40,6 @@ pub enum ParamKind {
     Float,
 }
 
-/// One tunable dimension of the base strategy.
-///
-/// `target` addresses a field of the strategy:
-/// * `"stop_loss_pct"`, `"take_profit_pct"`
-/// * `"entry.all.{i}.left|right"`, `"entry.any.{i}.left|right"`,
-///   `"exit.all.{i}.left|right"`, `"exit.any.{i}.left|right"` — sets a
-///   numeric literal operand.
-/// * Same condition-operand path with a `.period` suffix
-///   (e.g. `"entry.all.0.left.period"`) — sets an indicator period
-///   (`sma`/`ema`/`rsi` only, integer >= 1).
-///
-/// The search values come either from explicit `values` or from a
-/// `min`/`max` range (`step` required for grid floats; for random floats
-/// without `step` the range is sampled continuously).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
@@ -75,11 +76,8 @@ pub enum SearchMethod {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationSpec {
-    /// Single in-sample/out-of-sample split fraction, (0, 1). Default 0.7.
     #[serde(default)]
     pub split: Option<f64>,
-    /// Walk-forward fold count (anchored, expanding train). 2..=MAX_FOLDS.
-    /// Mutually exclusive with `split`.
     #[serde(default)]
     pub folds: Option<usize>,
 }
@@ -94,7 +92,6 @@ pub enum Objective {
     ProfitFactor,
 }
 
-/// Full optimizer request (mirrors the POST /optimize body).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizeSpec {
@@ -144,7 +141,7 @@ pub(crate) enum Target {
     },
 }
 
-fn parse_target(target: &str) -> Result<Target, String> {
+fn parse_target(target: &str) -> Result<Target, OptimizerError> {
     if target == "stop_loss_pct" {
         return Ok(Target::StopLoss);
     }
@@ -152,32 +149,31 @@ fn parse_target(target: &str) -> Result<Target, String> {
         return Ok(Target::TakeProfit);
     }
     let parts: Vec<&str> = target.split('.').collect();
-    // Expect section.group.idx.side[.period]
     if parts.len() != 4 && parts.len() != 5 {
-        return Err(format!(
+        return Err(OptimizerError::Msg(format!(
             "invalid target {target:?}: expected \
              entry|exit.all|any.{{idx}}.left|right[.period], \
              stop_loss_pct or take_profit_pct"
-        ));
+        )));
     }
     let section = match parts[0] {
         "entry" => Section::Entry,
         "exit" => Section::Exit,
         _ => {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "invalid target {target:?}: unknown section {:?}",
                 parts[0]
-            ))
+            )))
         }
     };
     let group = match parts[1] {
         "all" => Group::All,
         "any" => Group::Any,
         _ => {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "invalid target {target:?}: unknown group {:?}",
                 parts[1]
-            ))
+            )))
         }
     };
     let idx: usize = parts[2].parse().map_err(|_| {
@@ -190,19 +186,19 @@ fn parse_target(target: &str) -> Result<Target, String> {
         "left" => Side::Left,
         "right" => Side::Right,
         _ => {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "invalid target {target:?}: unknown side {:?}",
                 parts[3]
-            ))
+            )))
         }
     };
     let period = match parts.get(4) {
         None => false,
         Some(&"period") => true,
         Some(other) => {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "invalid target {target:?}: unknown suffix {other:?}"
-            ));
+            )));
         }
     };
     Ok(Target::Operand {
@@ -220,12 +216,16 @@ fn operand_mut(
     group: Group,
     idx: usize,
     side: Side,
-) -> Result<&mut Operand, String> {
+) -> Result<&mut Operand, OptimizerError> {
     let rules = match section {
         Section::Entry => &mut strategy.entry,
         Section::Exit => match strategy.exit.as_mut() {
             Some(r) => r,
-            None => return Err("target addresses exit rules but strategy has no exit".to_string()),
+            None => {
+                return Err(OptimizerError::Msg(
+                    "target addresses exit rules but strategy has no exit".to_string(),
+                ))
+            }
         },
     };
     let conds = match group {
@@ -242,24 +242,27 @@ fn operand_mut(
     })
 }
 
-/// Apply one trial's values to a cloned base strategy.
 pub(crate) fn apply_params(
     strategy: &mut Strategy,
     targets: &[Target],
     combo: &[f64],
-) -> Result<(), String> {
+) -> Result<(), OptimizerError> {
     debug_assert_eq!(targets.len(), combo.len());
     for (target, value) in targets.iter().zip(combo.iter()) {
         match target {
             Target::StopLoss => {
                 if !value.is_finite() || *value <= 0.0 {
-                    return Err(format!("stop_loss_pct must be > 0, got {value}"));
+                    return Err(OptimizerError::Msg(format!(
+                        "stop_loss_pct must be > 0, got {value}"
+                    )));
                 }
                 strategy.stop_loss_pct = Some(*value);
             }
             Target::TakeProfit => {
                 if !value.is_finite() || *value <= 0.0 {
-                    return Err(format!("take_profit_pct must be > 0, got {value}"));
+                    return Err(OptimizerError::Msg(format!(
+                        "take_profit_pct must be > 0, got {value}"
+                    )));
                 }
                 strategy.take_profit_pct = Some(*value);
             }
@@ -274,9 +277,9 @@ pub(crate) fn apply_params(
                 if *period {
                     let v = value.round();
                     if !value.is_finite() || v < 1.0 || v > 100_000.0 {
-                        return Err(format!(
+                        return Err(OptimizerError::Msg(format!(
                             "indicator period must be in 1..=100000, got {value}"
-                        ));
+                        )));
                     }
                     match op {
                         Operand::Indicator(r) => match r.ind {
@@ -286,37 +289,41 @@ pub(crate) fn apply_params(
                                 r.period = Some(v as usize);
                             }
                             other => {
-                                return Err(format!(
+                                return Err(OptimizerError::Msg(format!(
                                     "target .period addresses a {other:?} indicator \
                                      (only sma/ema/rsi take periods)"
-                                ));
+                                )));
                             }
                         },
                         Operand::Number(_) => {
-                            return Err("target .period addresses a numeric literal".to_string());
+                            return Err(OptimizerError::Msg(
+                                "target .period addresses a numeric literal".to_string(),
+                            ));
                         }
                     }
                 } else {
                     match op {
                         Operand::Number(v) => {
                             if !value.is_finite() {
-                                return Err(format!("threshold must be finite, got {value}"));
+                                return Err(OptimizerError::Msg(format!(
+                                    "threshold must be finite, got {value}"
+                                )));
                             }
                             *v = *value;
                         }
                         Operand::Indicator(_) => {
-                            return Err(
+                            return Err(OptimizerError::Msg(
                                 "target addresses an indicator operand; use the .period suffix \
                                  to tune its period"
                                     .to_string(),
-                            );
+                            ));
                         }
                     }
                 }
             }
         }
     }
-    strategy.validate()
+    strategy.validate().map_err(OptimizerError::Strategy)
 }
 
 impl Objective {
@@ -339,73 +346,81 @@ impl Objective {
     }
 }
 
-/// Expand one ParamSpec into its discrete grid values.
-fn expand_values(spec: &ParamSpec, kind: ParamKind) -> Result<Vec<f64>, String> {
+fn expand_values(spec: &ParamSpec, kind: ParamKind) -> Result<Vec<f64>, OptimizerError> {
     if let Some(values) = &spec.values {
         if spec.min.is_some() || spec.max.is_some() || spec.step.is_some() {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "param {:?}: use either `values` or `min`/`max`, not both",
                 spec.target
-            ));
+            )));
         }
         if values.is_empty() {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "param {:?}: `values` must not be empty",
                 spec.target
-            ));
+            )));
         }
         for v in values {
             if !v.is_finite() {
-                return Err(format!(
+                return Err(OptimizerError::Msg(format!(
                     "param {:?}: values must be finite, got {v}",
                     spec.target
-                ));
+                )));
             }
         }
         let mut out: Vec<f64> = match kind {
             ParamKind::Int => values.iter().map(|v| v.round()).collect(),
             ParamKind::Float => values.clone(),
         };
-        out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         out.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
         if out.len() > 512 {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "param {:?}: too many distinct values ({} > 512)",
                 spec.target,
                 out.len()
-            ));
+            )));
         }
         return Ok(out);
     }
     let (min, max) = match (spec.min, spec.max) {
         (Some(a), Some(b)) => (a, b),
         _ => {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "param {:?}: need `values` or both `min` and `max`",
                 spec.target
-            ));
+            )));
         }
     };
     if !min.is_finite() || !max.is_finite() {
-        return Err(format!("param {:?}: min/max must be finite", spec.target));
+        return Err(OptimizerError::Msg(format!(
+            "param {:?}: min/max must be finite",
+            spec.target
+        )));
     }
     if min > max {
-        return Err(format!("param {:?}: min {min} > max {max}", spec.target));
+        return Err(OptimizerError::Msg(format!(
+            "param {:?}: min {min} > max {max}",
+            spec.target
+        )));
     }
     let step = spec.step.unwrap_or(f64::NAN);
     match kind {
         ParamKind::Int => {
             let step_v = if step.is_nan() { 1.0 } else { step };
             if !step_v.is_finite() || step_v <= 0.0 {
-                return Err(format!("param {:?}: step must be > 0", spec.target));
+                return Err(OptimizerError::Msg(format!(
+                    "param {:?}: step must be > 0",
+                    spec.target
+                )));
             }
             let lo = min.ceil() as i64;
             let hi = max.floor() as i64;
             if lo > hi {
-                return Err(format!(
+                return Err(OptimizerError::Msg(format!(
                     "param {:?}: no integer in [{min}, {max}]",
                     spec.target
-                ));
+                )));
             }
             let step_i = step_v.round().max(1.0) as i64;
             let mut out = Vec::new();
@@ -413,61 +428,80 @@ fn expand_values(spec: &ParamSpec, kind: ParamKind) -> Result<Vec<f64>, String> 
             while v <= hi {
                 out.push(v as f64);
                 if out.len() > 512 {
-                    return Err(format!(
+                    return Err(OptimizerError::Msg(format!(
                         "param {:?}: range expands to > 512 values",
                         spec.target
-                    ));
+                    )));
                 }
                 v += step_i;
             }
-            if (*out.last().unwrap() - hi as f64).abs() > 1e-9 {
-                out.push(hi as f64);
+            match out.last() {
+                Some(last) if (*last - hi as f64).abs() <= 1e-9 => {}
+                Some(_) => out.push(hi as f64),
+                None => {
+                    return Err(OptimizerError::Msg(format!(
+                        "param {:?}: range expands to > 512 values",
+                        spec.target
+                    )));
+                }
             }
             Ok(out)
         }
         ParamKind::Float => {
             if step.is_nan() {
-                return Err(format!(
+                return Err(OptimizerError::Msg(format!(
                     "param {:?}: float range needs `step` for grid search \
                      (omit `step` only for random search)",
                     spec.target
-                ));
+                )));
             }
             if !step.is_finite() || step <= 0.0 {
-                return Err(format!("param {:?}: step must be > 0", spec.target));
+                return Err(OptimizerError::Msg(format!(
+                    "param {:?}: step must be > 0",
+                    spec.target
+                )));
             }
             let mut out = Vec::new();
             let mut v = min;
             while v <= max + 1e-9 {
                 out.push(v);
                 if out.len() > 512 {
-                    return Err(format!(
+                    return Err(OptimizerError::Msg(format!(
                         "param {:?}: range expands to > 512 values",
                         spec.target
-                    ));
+                    )));
                 }
                 v += step;
             }
-            if (max - out.last().unwrap()).abs() > 1e-9 {
-                out.push(max);
+            match out.last() {
+                Some(last) if (max - last).abs() <= 1e-9 => {}
+                Some(_) => out.push(max),
+                None => {
+                    return Err(OptimizerError::Msg(format!(
+                        "param {:?}: range expands to > 512 values",
+                        spec.target
+                    )));
+                }
             }
             Ok(out)
         }
     }
 }
 
-fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), String> {
+fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), OptimizerError> {
     spec.strategy
         .validate()
         .map_err(|e| format!("invalid base strategy: {e}"))?;
     if spec.params.is_empty() {
-        return Err("`params` must not be empty".to_string());
+        return Err(OptimizerError::Msg(
+            "`params` must not be empty".to_string(),
+        ));
     }
     if spec.params.len() > MAX_PARAMS {
-        return Err(format!(
+        return Err(OptimizerError::Msg(format!(
             "too many params ({} > {MAX_PARAMS})",
             spec.params.len()
-        ));
+        )));
     }
     let mut targets = Vec::with_capacity(spec.params.len());
     let mut kinds = Vec::with_capacity(spec.params.len());
@@ -479,30 +513,30 @@ fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), 
                 p.target
             )
         })?;
-        // Period targets must be int with min >= 1.
         if matches!(target, Target::Operand { period: true, .. }) {
             if kind != ParamKind::Int {
-                return Err(format!(
+                return Err(OptimizerError::Msg(format!(
                     "param {:?}: .period targets require kind \"int\"",
                     p.target
-                ));
+                )));
             }
             if let Some(values) = &p.values {
                 if values.iter().any(|v| !v.is_finite() || v.round() < 1.0) {
-                    return Err(format!(
+                    return Err(OptimizerError::Msg(format!(
                         "param {:?}: .period values must all be >= 1",
                         p.target
-                    ));
+                    )));
                 }
             }
             if let Some(min) = p.min {
                 if !min.is_finite() || min.round() < 1.0 {
-                    return Err(format!("param {:?}: .period min must be >= 1", p.target));
+                    return Err(OptimizerError::Msg(format!(
+                        "param {:?}: .period min must be >= 1",
+                        p.target
+                    )));
                 }
             }
         }
-        // Fail fast if the target does not address a tunable field of the
-        // base strategy (bad index, wrong operand kind, missing exit, ...).
         {
             let dummy = match &target {
                 Target::Operand { period: true, .. } => 14.0,
@@ -510,12 +544,12 @@ fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), 
                 Target::Operand { .. } => 0.0,
             };
             let mut probe = spec.strategy.clone();
-            if let Err(e) = apply_params(&mut probe, std::slice::from_ref(&target), &[dummy]) {
-                return Err(format!("param {:?}: {e}", p.target));
+            if let Err(OptimizerError::Msg(e)) =
+                apply_params(&mut probe, std::slice::from_ref(&target), &[dummy])
+            {
+                return Err(OptimizerError::Msg(format!("param {:?}: {e}", p.target)));
             }
         }
-        // Eagerly expand discrete specs so grid-cap errors surface early.
-        // (Random float ranges without step stay continuous.)
         let discrete = p.values.is_some() || p.step.is_some() || kind == ParamKind::Int;
         if discrete {
             expand_values(p, kind)?;
@@ -523,14 +557,17 @@ fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), 
             match (p.min, p.max) {
                 (Some(a), Some(b)) => {
                     if !a.is_finite() || !b.is_finite() || a > b {
-                        return Err(format!("param {:?}: invalid min/max", p.target));
+                        return Err(OptimizerError::Msg(format!(
+                            "param {:?}: invalid min/max",
+                            p.target
+                        )));
                     }
                 }
                 _ => {
-                    return Err(format!(
+                    return Err(OptimizerError::Msg(format!(
                         "param {:?}: need `values` or both `min` and `max`",
                         p.target
-                    ));
+                    )));
                 }
             }
         }
@@ -540,13 +577,14 @@ fn validate_specs(spec: &OptimizeSpec) -> Result<(Vec<Target>, Vec<ParamKind>), 
     Ok((targets, kinds))
 }
 
-/// Build the trial matrix: one `Vec<f64>` per trial, aligned with `params`.
-pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, String> {
+pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, OptimizerError> {
     let (_targets, kinds) = validate_specs(spec)?;
     match spec.search.method {
         SearchMethod::Grid => {
             if spec.search.trials.is_some() {
-                return Err("`search.trials` is only valid for random search".to_string());
+                return Err(OptimizerError::Msg(
+                    "`search.trials` is only valid for random search".to_string(),
+                ));
             }
             let mut grids: Vec<Vec<f64>> = Vec::with_capacity(spec.params.len());
             for (p, k) in spec.params.iter().zip(kinds.iter()) {
@@ -554,16 +592,15 @@ pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, String> {
             }
             let total: usize = grids.iter().map(|g| g.len()).product();
             if total == 0 {
-                return Err("grid is empty".to_string());
+                return Err(OptimizerError::Msg("grid is empty".to_string()));
             }
             if total > MAX_TRIALS {
-                return Err(format!(
+                return Err(OptimizerError::Msg(format!(
                     "grid has {total} combinations (> {MAX_TRIALS} max); \
                      narrow the ranges or use random search"
-                ));
+                )));
             }
             let mut combos = vec![Vec::with_capacity(grids.len()); total];
-            // Cartesian product, first param outermost (stable order).
             let mut stride = total;
             for values in grids.iter() {
                 stride /= values.len();
@@ -576,12 +613,12 @@ pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, String> {
         SearchMethod::Random => {
             let trials = spec.search.trials.unwrap_or(200);
             if trials == 0 || trials > MAX_TRIALS {
-                return Err(format!("`search.trials` must be in 1..={MAX_TRIALS}"));
+                return Err(OptimizerError::Msg(format!(
+                    "`search.trials` must be in 1..={MAX_TRIALS}"
+                )));
             }
             let seed = spec.search.seed.unwrap_or(42);
             let mut rng = StdRng::seed_from_u64(seed);
-            // Discrete dims sample from their expansion; continuous float
-            // ranges (no step) sample uniformly.
             let mut discrete: Vec<Option<Vec<f64>>> = Vec::with_capacity(spec.params.len());
             for (p, k) in spec.params.iter().zip(kinds.iter()) {
                 if p.values.is_some() || p.step.is_some() || *k == ParamKind::Int {
@@ -598,8 +635,17 @@ pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, String> {
                         let j = rng.random_range(0..values.len());
                         combo.push(values[j]);
                     } else {
-                        let (min, max) = (p.min.unwrap(), p.max.unwrap());
-                        combo.push(rng.random_range(min..=max));
+                        match (p.min, p.max) {
+                            (Some(min), Some(max)) => {
+                                combo.push(rng.random_range(min..=max));
+                            }
+                            _ => {
+                                return Err(OptimizerError::Msg(format!(
+                                    "param {:?}: need `values` or both `min` and `max`",
+                                    p.target
+                                )));
+                            }
+                        }
                     }
                 }
                 combos.push(combo);
@@ -609,18 +655,22 @@ pub fn build_combos(spec: &OptimizeSpec) -> Result<Vec<Vec<f64>>, String> {
     }
 }
 
-fn validate_search_trials(spec: &OptimizeSpec) -> Result<(), String> {
+fn validate_search_trials(spec: &OptimizeSpec) -> Result<(), OptimizerError> {
     match spec.search.method {
         SearchMethod::Grid => {
             if spec.search.trials.is_some() {
-                return Err("`search.trials` is only valid for random search".to_string());
+                return Err(OptimizerError::Msg(
+                    "`search.trials` is only valid for random search".to_string(),
+                ));
             }
             Ok(())
         }
         SearchMethod::Random => {
             let t = spec.search.trials.unwrap_or(200);
             if t == 0 || t > MAX_TRIALS {
-                return Err(format!("`search.trials` must be in 1..={MAX_TRIALS}"));
+                return Err(OptimizerError::Msg(format!(
+                    "`search.trials` must be in 1..={MAX_TRIALS}"
+                )));
             }
             Ok(())
         }
@@ -663,8 +713,6 @@ pub struct SweepReport {
     pub warnings: Vec<String>,
 }
 
-/// Stats over `candles[start..end]` with trades filtered by entry index and
-/// the equity curve rebased to 1.0 (mirrors `split_stats` conventions).
 fn window_stats(
     result: &BacktestResult,
     candles: &[Candle],
@@ -688,7 +736,6 @@ fn window_stats(
         for e in &result.equity_curve[start + 1..end] {
             v.push(e / base);
         }
-        // A one-bar window has no post-base equity; keep the seed point.
         if v.len() == 1 {
             v.push(1.0);
         }
@@ -729,9 +776,6 @@ fn mean_stats(all: &[Stats]) -> Stats {
     }
 }
 
-/// Overfit heuristic on Sharpe (+ return sign-flip guard).
-///
-/// Returns `(overfit, gap, reason)` with `gap = is_sharpe - oos_sharpe`.
 pub fn overfit_flag(is_stats: &Stats, oos_stats: &Stats) -> (bool, f64, Option<String>) {
     let gap = is_stats.sharpe - oos_stats.sharpe;
     if is_stats.sharpe > 0.5 && oos_stats.sharpe < 0.0 {
@@ -786,10 +830,14 @@ struct EvalCtx<'a> {
     objective: Objective,
 }
 
-fn evaluate_combo(base: &Strategy, ctx: &EvalCtx<'_>, combo: &[f64]) -> Result<Evaluated, String> {
+fn evaluate_combo(
+    base: &Strategy,
+    ctx: &EvalCtx<'_>,
+    combo: &[f64],
+) -> Result<Evaluated, OptimizerError> {
     let mut strategy = base.clone();
     apply_params(&mut strategy, ctx.targets, combo)?;
-    let result = crate::backtest_v2::backtest_strategy(&strategy, ctx.candles, ctx.cfg)?;
+    let result = crate::backtest::backtest_strategy(&strategy, ctx.candles, ctx.cfg)?;
     let params: BTreeMap<String, f64> = ctx
         .param_names
         .iter()
@@ -867,23 +915,25 @@ enum ResolvedValidation {
 fn resolve_validation(
     validation: &ValidationSpec,
     n: usize,
-) -> Result<(ResolvedValidation, String), String> {
+) -> Result<(ResolvedValidation, String), OptimizerError> {
     if let Some(folds) = validation.folds {
         if validation.split.is_some() {
-            return Err(
+            return Err(OptimizerError::Msg(
                 "`validation.split` and `validation.folds` are mutually exclusive".to_string(),
-            );
+            ));
         }
         if !(2..=MAX_FOLDS).contains(&folds) {
-            return Err(format!("`validation.folds` must be in 2..={MAX_FOLDS}"));
+            return Err(OptimizerError::Msg(format!(
+                "`validation.folds` must be in 2..={MAX_FOLDS}"
+            )));
         }
         let chunks = folds + 1;
         if n < chunks * MIN_WINDOW {
-            return Err(format!(
+            return Err(OptimizerError::Msg(format!(
                 "not enough candles ({n}) for {folds} walk-forward folds \
                  (need at least {})",
                 chunks * MIN_WINDOW
-            ));
+            )));
         }
         let mut boundaries = Vec::with_capacity(chunks + 1);
         for i in 0..=chunks {
@@ -896,30 +946,28 @@ fn resolve_validation(
     }
     let split = validation.split.unwrap_or(0.7);
     if !(split > 0.0 && split < 1.0) || !split.is_finite() {
-        return Err(format!(
+        return Err(OptimizerError::Msg(format!(
             "`validation.split` must be strictly between 0 and 1, got {split}"
-        ));
+        )));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (n as f64 * split).floor() as usize;
     if idx == 0 || idx >= n {
-        return Err(format!(
+        return Err(OptimizerError::Msg(format!(
             "split {split} gives invalid split index {idx} for {n} candles"
-        ));
+        )));
     }
     Ok((ResolvedValidation::Split { idx }, format!("split({split})")))
 }
 
-/// Run the full sweep: expand combos, evaluate trials in parallel with
-/// Rayon, rank by out-of-sample objective (descending).
 pub fn sweep(
     spec: &OptimizeSpec,
     candles: &[Candle],
     cfg: &BacktestConfig,
     bars_per_year: f64,
-) -> Result<SweepReport, String> {
+) -> Result<SweepReport, OptimizerError> {
     if candles.is_empty() {
-        return Err("no candles in range".to_string());
+        return Err(OptimizerError::Msg("no candles in range".to_string()));
     }
     validate_search_trials(spec)?;
     let (targets, _kinds) = validate_specs(spec)?;
@@ -929,8 +977,6 @@ pub fn sweep(
     let (validation, validation_name) = resolve_validation(&validation_spec, candles.len())?;
     let objective = spec.objective.unwrap_or_default();
 
-    // Rayon parallel evaluation over trials; `collect` preserves order so
-    // the subsequent stable sort is deterministic.
     let ctx = EvalCtx {
         param_names: &param_names,
         targets: &targets,
@@ -940,12 +986,13 @@ pub fn sweep(
         validation: &validation,
         objective,
     };
-    let evaluated: Vec<Result<Evaluated, String>> = combos
+    let evaluated: Vec<Result<Evaluated, OptimizerError>> = combos
         .par_iter()
         .map(|combo| evaluate_combo(&spec.strategy, &ctx, combo))
         .collect();
     let mut evaluated: Vec<Evaluated> = evaluated.into_iter().collect::<Result<_, _>>()?;
 
+    // Stable sort keeps sweep deterministic.
     evaluated.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -1001,7 +1048,6 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backtest::backtest;
     use crate::strategy::{Condition, IndicatorKind, IndicatorRef, Op, Operand, Rules, Side};
 
     fn strat_rsi(threshold: f64, period: usize) -> Strategy {
@@ -1095,7 +1141,6 @@ mod tests {
         ];
         let combos = build_combos(&spec).unwrap();
         assert_eq!(combos.len(), 6);
-        // First param outermost.
         assert_eq!(combos[0], vec![25.0, 2.0]);
         assert_eq!(combos[1], vec![25.0, 3.0]);
         assert_eq!(combos[3], vec![30.0, 2.0]);
@@ -1138,7 +1183,6 @@ mod tests {
         spec.params = vec![param("entry.all.9.right", ParamKind::Float, vec![1.0])];
         assert!(build_combos(&spec).is_err());
 
-        // .period on a numeric literal.
         let mut spec = base_spec();
         spec.params = vec![param(
             "entry.all.0.right.period",
@@ -1147,12 +1191,10 @@ mod tests {
         )];
         assert!(build_combos(&spec).is_err());
 
-        // Value target on an indicator operand.
         let mut spec = base_spec();
         spec.params = vec![param("entry.all.0.left", ParamKind::Float, vec![14.0])];
         assert!(build_combos(&spec).is_err());
 
-        // Period below 1.
         let mut spec = base_spec();
         spec.params = vec![param("entry.all.0.left.period", ParamKind::Int, vec![0.0])];
         assert!(build_combos(&spec).is_err());
@@ -1161,16 +1203,18 @@ mod tests {
     #[test]
     fn grid_cap_suggests_random() {
         let mut spec = base_spec();
-        // 50 x 50 = 2500 > 2000.
         let v50: Vec<f64> = (1..=50).map(|v| v as f64).collect();
         spec.params = vec![
             param("entry.all.0.right", ParamKind::Float, v50.clone()),
             param("take_profit_pct", ParamKind::Float, v50),
         ];
         let err = build_combos(&spec).unwrap_err();
-        assert!(err.contains("2500"), "should mention size, got: {err}");
         assert!(
-            err.to_lowercase().contains("random"),
+            err.to_string().contains("2500"),
+            "should mention size, got: {err}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("random"),
             "should suggest random: {err}"
         );
     }
@@ -1194,7 +1238,6 @@ mod tests {
         for w in report.trials.windows(2) {
             assert!(w[0].score >= w[1].score, "scores must descend");
         }
-        // In-sample vs out-of-sample both populated via the default split.
         assert_eq!(report.validation, "split(0.7)");
         for t in &report.trials {
             assert!(t.in_sample.trades + t.out_of_sample.trades >= t.in_sample.trades);
@@ -1255,7 +1298,6 @@ mod tests {
         for t in &report.trials {
             let folds = t.folds.as_ref().expect("WF must include folds");
             assert_eq!(folds.len(), 3);
-            // Anchored: every train starts at 0, test follows train.
             for (i, f) in folds.iter().enumerate() {
                 assert_eq!(f.fold, i);
                 assert_eq!(f.train_start, 0);
@@ -1293,7 +1335,9 @@ mod tests {
     fn single_split_matches_split_stats() {
         let candles = wave_candles(100);
         let strategy = strat_rsi(30.0, 14);
-        let result = backtest(&strategy, &candles, &BacktestConfig::default()).unwrap();
+        let result =
+            crate::backtest::backtest_strategy(&strategy, &candles, &BacktestConfig::default())
+                .unwrap();
         let (is_a, oos_a) = stats::split_stats(&result, &candles, 70, 8760.0).unwrap();
         let is_b = window_stats(&result, &candles, 0, 70, 8760.0);
         let oos_b = window_stats(&result, &candles, 70, 100, 8760.0);
@@ -1377,46 +1421,126 @@ mod tests {
         let combos = build_combos(&spec).unwrap();
         assert_eq!(combos.len(), 6);
         assert_eq!(report.total_trials, combos.len());
-        let split_idx = (candles.len() as f64 * 0.7).floor() as usize;
-        let objective = spec.objective.unwrap_or_default();
-        let mut v1_ranked: Vec<(BTreeMap<String, f64>, f64)> = Vec::new();
-        for combo in &combos {
+        let frozen_counts: &[(f64, f64, usize)] = &[
+            (1.0, 2.0, 163),
+            (1.0, 4.0, 160),
+            (2.0, 2.0, 152),
+            (2.0, 4.0, 148),
+            (3.0, 2.0, 152),
+            (3.0, 4.0, 148),
+        ];
+        let frozen_first10: &[&[(usize, usize, f64)]] = &[
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 32, 1.85729989008),
+                (57, 57, -1.13850304787),
+                (60, 62, -0.596422628339),
+                (72, 79, 1.85729989008),
+                (100, 102, -1.13850304787),
+                (111, 112, -0.624996388311),
+                (115, 123, 1.85729989008),
+                (136, 137, -0.894993537614),
+            ],
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 43, 1.88843928444),
+                (57, 57, -1.13850304787),
+                (60, 62, -0.596422628339),
+                (72, 81, 3.85450184871),
+                (100, 102, -1.13850304787),
+                (111, 112, -0.624996388311),
+                (115, 132, 2.05385235154),
+                (136, 137, -0.894993537614),
+            ],
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 32, 1.85729989008),
+                (57, 58, -1.06232875268),
+                (60, 62, -0.596422628339),
+                (72, 79, 1.85729989008),
+                (100, 103, -1.10159430335),
+                (111, 112, -0.624996388311),
+                (115, 123, 1.85729989008),
+                (136, 137, -0.894993537614),
+            ],
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 43, 1.88843928444),
+                (57, 58, -1.06232875268),
+                (60, 62, -0.596422628339),
+                (72, 81, 3.85450184871),
+                (100, 103, -1.10159430335),
+                (111, 112, -0.624996388311),
+                (115, 132, 2.05385235154),
+                (136, 137, -0.894993537614),
+            ],
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 32, 1.85729989008),
+                (57, 58, -1.06232875268),
+                (60, 62, -0.596422628339),
+                (72, 79, 1.85729989008),
+                (100, 103, -1.10159430335),
+                (111, 112, -0.624996388311),
+                (115, 123, 1.85729989008),
+                (136, 137, -0.894993537614),
+            ],
+            &[
+                (11, 19, -0.401493474054),
+                (22, 25, -0.715596149886),
+                (30, 43, 1.88843928444),
+                (57, 58, -1.06232875268),
+                (60, 62, -0.596422628339),
+                (72, 81, 3.85450184871),
+                (100, 103, -1.10159430335),
+                (111, 112, -0.624996388311),
+                (115, 132, 2.05385235154),
+                (136, 137, -0.894993537614),
+            ],
+        ];
+        for (i, combo) in combos.iter().enumerate() {
             let mut s = spec.strategy.clone();
             s.stop_loss_pct = Some(combo[0]);
             s.take_profit_pct = Some(combo[1]);
-            let v1 = backtest(&s, &candles, &cfg).unwrap();
-            let v2 = crate::backtest_v2::backtest_strategy(&s, &candles, &cfg).unwrap();
+            let v2 = crate::backtest::backtest_strategy(&s, &candles, &cfg).unwrap();
+            let (esl, etp, ecount) = frozen_counts[i];
+            assert!((combo[0] - esl).abs() <= 1e-12);
+            assert!((combo[1] - etp).abs() <= 1e-12);
             assert!(
-                v1.trades.len() >= 10,
+                v2.trades.len() >= 10,
                 "need >=10 trades, got {} for {combo:?}",
-                v1.trades.len()
+                v2.trades.len()
             );
-            assert_eq!(v1.trades.len(), v2.trades.len(), "trade count {combo:?}");
-            for (a, b) in v1.trades.iter().zip(v2.trades.iter()) {
+            assert_eq!(v2.trades.len(), ecount, "frozen count {combo:?}");
+            assert_eq!(v2.equity_curve.len(), 2000);
+            for (got, exp) in v2.trades.iter().take(10).zip(frozen_first10[i].iter()) {
+                assert_eq!(got.entry_idx, exp.0, "entry {combo:?}");
+                assert_eq!(got.exit_idx, exp.1, "exit {combo:?}");
                 assert!(
-                    (a.return_pct - b.return_pct).abs() <= 0.05 + 1e-9,
+                    (got.return_pct - exp.2).abs() <= 0.05 + 1e-9,
                     "return {} vs {} for {combo:?}",
-                    a.return_pct,
-                    b.return_pct
+                    got.return_pct,
+                    exp.2
                 );
             }
-            let (_, oos) = stats::split_stats(&v1, &candles, split_idx, 8760.0).unwrap();
-            let params: BTreeMap<String, f64> = [
-                ("stop_loss_pct".to_string(), combo[0]),
-                ("take_profit_pct".to_string(), combo[1]),
-            ]
-            .into_iter()
-            .collect();
-            v1_ranked.push((params, objective.score(&oos)));
         }
-        v1_ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
-        });
-        assert_eq!(report.trials.len(), v1_ranked.len());
-        for (trial, (params, _)) in report.trials.iter().zip(v1_ranked.iter()) {
-            assert_eq!(&trial.params, params);
+        let frozen_rank: &[(f64, f64)] = &[
+            (2.0, 4.0),
+            (3.0, 4.0),
+            (1.0, 4.0),
+            (2.0, 2.0),
+            (3.0, 2.0),
+            (1.0, 2.0),
+        ];
+        assert_eq!(report.trials.len(), frozen_rank.len());
+        for (trial, exp) in report.trials.iter().zip(frozen_rank.iter()) {
+            assert!((trial.params["stop_loss_pct"] - exp.0).abs() <= 1e-12);
+            assert!((trial.params["take_profit_pct"] - exp.1).abs() <= 1e-12);
         }
     }
 }
