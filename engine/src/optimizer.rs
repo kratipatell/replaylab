@@ -5,7 +5,7 @@ use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::backtest::{backtest, BacktestConfig, BacktestResult};
+use crate::backtest::{BacktestConfig, BacktestResult};
 use crate::stats::{self, Stats};
 use crate::strategy::{Operand, Strategy};
 use crate::types::Candle;
@@ -789,7 +789,7 @@ struct EvalCtx<'a> {
 fn evaluate_combo(base: &Strategy, ctx: &EvalCtx<'_>, combo: &[f64]) -> Result<Evaluated, String> {
     let mut strategy = base.clone();
     apply_params(&mut strategy, ctx.targets, combo)?;
-    let result = backtest(&strategy, ctx.candles, ctx.cfg)?;
+    let result = crate::backtest_v2::backtest_strategy(&strategy, ctx.candles, ctx.cfg)?;
     let params: BTreeMap<String, f64> = ctx
         .param_names
         .iter()
@@ -1001,6 +1001,7 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backtest::backtest;
     use crate::strategy::{Condition, IndicatorKind, IndicatorRef, Op, Operand, Rules, Side};
 
     fn strat_rsi(threshold: f64, period: usize) -> Strategy {
@@ -1299,5 +1300,123 @@ mod tests {
         assert_eq!(is_a, is_b);
         assert_eq!(oos_a.trades, oos_b.trades);
         assert!((oos_a.total_return_pct - oos_b.total_return_pct).abs() < 1e-9);
+    }
+
+    fn seeded_walk(n: usize, seed: u64) -> Vec<Candle> {
+        let mut state = seed;
+        let mut next01 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        let start: i64 = 1_700_006_400_000;
+        let step: i64 = 3_600_000;
+        let mut out = Vec::with_capacity(n);
+        let mut prev = 100.0;
+        for i in 0..n {
+            let drift = (next01() - 0.5) * 0.02;
+            let close = prev * (1.0 + drift);
+            let open = prev;
+            let high = open.max(close) + next01() * 0.5;
+            let low = open.min(close) - next01() * 0.5;
+            out.push(Candle {
+                ts: start + i as i64 * step,
+                open,
+                high,
+                low,
+                close,
+            });
+            prev = close;
+        }
+        out
+    }
+
+    fn strat_cross() -> Strategy {
+        use crate::strategy::{IndicatorKind, IndicatorRef};
+        let sma10 = |side: Op| Condition {
+            left: Operand::Indicator(IndicatorRef {
+                ind: IndicatorKind::Close,
+                period: None,
+            }),
+            op: side,
+            right: Operand::Indicator(IndicatorRef {
+                ind: IndicatorKind::Sma,
+                period: Some(10),
+            }),
+        };
+        Strategy {
+            asset: "BTCUSDT".to_string(),
+            timeframe: "1h".to_string(),
+            side: Side::Long,
+            entry: Rules {
+                all: vec![sma10(Op::CrossesAbove)],
+                any: vec![],
+            },
+            exit: Some(Rules {
+                all: vec![sma10(Op::CrossesBelow)],
+                any: vec![],
+            }),
+            stop_loss_pct: Some(2.0),
+            take_profit_pct: Some(4.0),
+            claim: None,
+        }
+    }
+
+    #[test]
+    fn sweep_v2_matches_v1_trades_and_ranking() {
+        let candles = seeded_walk(2000, 42);
+        let mut spec = base_spec();
+        spec.strategy = strat_cross();
+        spec.params = vec![
+            param("stop_loss_pct", ParamKind::Float, vec![1.0, 2.0, 3.0]),
+            param("take_profit_pct", ParamKind::Float, vec![2.0, 4.0]),
+        ];
+        let cfg = BacktestConfig::default();
+        let report = sweep(&spec, &candles, &cfg, 8760.0).unwrap();
+        let combos = build_combos(&spec).unwrap();
+        assert_eq!(combos.len(), 6);
+        assert_eq!(report.total_trials, combos.len());
+        let split_idx = (candles.len() as f64 * 0.7).floor() as usize;
+        let objective = spec.objective.unwrap_or_default();
+        let mut v1_ranked: Vec<(BTreeMap<String, f64>, f64)> = Vec::new();
+        for combo in &combos {
+            let mut s = spec.strategy.clone();
+            s.stop_loss_pct = Some(combo[0]);
+            s.take_profit_pct = Some(combo[1]);
+            let v1 = backtest(&s, &candles, &cfg).unwrap();
+            let v2 = crate::backtest_v2::backtest_strategy(&s, &candles, &cfg).unwrap();
+            assert!(
+                v1.trades.len() >= 10,
+                "need >=10 trades, got {} for {combo:?}",
+                v1.trades.len()
+            );
+            assert_eq!(v1.trades.len(), v2.trades.len(), "trade count {combo:?}");
+            for (a, b) in v1.trades.iter().zip(v2.trades.iter()) {
+                assert!(
+                    (a.return_pct - b.return_pct).abs() <= 0.05 + 1e-9,
+                    "return {} vs {} for {combo:?}",
+                    a.return_pct,
+                    b.return_pct
+                );
+            }
+            let (_, oos) = stats::split_stats(&v1, &candles, split_idx, 8760.0).unwrap();
+            let params: BTreeMap<String, f64> = [
+                ("stop_loss_pct".to_string(), combo[0]),
+                ("take_profit_pct".to_string(), combo[1]),
+            ]
+            .into_iter()
+            .collect();
+            v1_ranked.push((params, objective.score(&oos)));
+        }
+        v1_ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+        });
+        assert_eq!(report.trials.len(), v1_ranked.len());
+        for (trial, (params, _)) in report.trials.iter().zip(v1_ranked.iter()) {
+            assert_eq!(&trial.params, params);
+        }
     }
 }
