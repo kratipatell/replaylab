@@ -421,6 +421,26 @@ pub fn run(
     })
 }
 
+pub fn backtest_strategy(
+    spec: &crate::strategy::Strategy,
+    candles: &[Candle],
+    cfg: &crate::backtest::BacktestConfig,
+) -> Result<BacktestResult, String> {
+    spec.validate()?;
+    let (instrument, sizing, bracket, session, run_cfg) =
+        crate::strategies::rules_v2_setup(spec, cfg)?;
+    let mut strategy = crate::strategies::RulesStrategy::new(spec);
+    run(
+        &mut strategy,
+        candles,
+        &instrument,
+        sizing,
+        &bracket,
+        &session,
+        &run_cfg,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

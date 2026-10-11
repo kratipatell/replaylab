@@ -341,7 +341,7 @@ async fn post_backtest(
         fee_bps,
         slippage_bps,
     };
-    let result = match crate::backtest::backtest(&req.strategy, &candles, &cfg) {
+    let result = match crate::backtest_v2::backtest_strategy(&req.strategy, &candles, &cfg) {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e).into_response(),
     };
@@ -1296,6 +1296,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct WalkSource {
+        data: Vec<crate::types::Candle>,
+    }
+
+    impl crate::feeds::KlineSource for WalkSource {
+        fn fetch(
+            &self,
+            _symbol: &str,
+            _interval: &str,
+            start_ms: i64,
+            end_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<crate::types::Candle>, String> {
+            Ok(self
+                .data
+                .iter()
+                .filter(|c| c.ts >= start_ms && c.ts <= end_ms)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn seeded_walk(n: usize, seed: u64) -> Vec<crate::types::Candle> {
+        let mut state = seed;
+        let mut next01 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        let start: i64 = 1_700_006_400_000;
+        let step: i64 = 3_600_000;
+        let mut out = Vec::with_capacity(n);
+        let mut prev = 100.0;
+        for i in 0..n {
+            let drift = (next01() - 0.5) * 0.02;
+            let close = prev * (1.0 + drift);
+            let open = prev;
+            let high = open.max(close) + next01() * 0.5;
+            let low = open.min(close) - next01() * 0.5;
+            out.push(crate::types::Candle {
+                ts: start + i as i64 * step,
+                open,
+                high,
+                low,
+                close,
+            });
+            prev = close;
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn backtest_v2_matches_v1_on_seeded_walk() {
+        let dir = temp_dir("bt_v2_parity");
+        let candles = seeded_walk(3000, 42);
+        let start = candles.first().map(|c| c.ts).unwrap_or(0);
+        let end = candles.last().map(|c| c.ts).unwrap_or(0);
+        let state = AppState {
+            source: Arc::new(WalkSource {
+                data: candles.clone(),
+            }),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            web_dir: PathBuf::from("web"),
+        };
+        let strategy = serde_json::json!({
+            "asset": "BTCUSDT",
+            "timeframe": "1h",
+            "side": "long",
+            "entry": {"all": [{"left": {"ind": "close"}, "op": "crosses_above", "right": {"ind": "sma", "period": 10}}]},
+            "exit": {"all": [{"left": {"ind": "close"}, "op": "crosses_below", "right": {"ind": "sma", "period": 10}}]},
+            "stop_loss_pct": 2.0,
+            "take_profit_pct": 4.0,
+        });
+        let body = serde_json::json!({
+            "strategy": strategy,
+            "start_ms": start,
+            "end_ms": end,
+        });
+        let res = app(state)
+            .oneshot(
+                Request::post("/backtest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let http_trades = v["trades"].as_array().expect("trades array").clone();
+        let spec: crate::strategy::Strategy =
+            serde_json::from_value(strategy).expect("strategy parses");
+        let cfg = crate::backtest::BacktestConfig::default();
+        let v1 = crate::backtest::backtest(&spec, &candles, &cfg).expect("v1 runs");
+        assert_eq!(
+            http_trades.len(),
+            v1.trades.len(),
+            "handler (v2) vs v1 trade count"
+        );
+        assert!(
+            v1.trades.len() >= 20,
+            "need >=20 trades, got {}",
+            v1.trades.len()
+        );
+        for (h, t) in http_trades.iter().zip(v1.trades.iter()) {
+            assert_eq!(h["entry_idx"].as_u64().unwrap(), t.entry_idx as u64);
+            assert_eq!(h["exit_idx"].as_u64().unwrap(), t.exit_idx as u64);
+            let side = if t.side == crate::strategy::Side::Long {
+                "long"
+            } else {
+                "short"
+            };
+            assert_eq!(h["side"].as_str().unwrap(), side);
+            assert_eq!(h["reason"].as_str().unwrap(), format!("{:?}", t.reason));
+            let hr = h["return_pct"].as_f64().unwrap();
+            assert!(
+                (hr - t.return_pct).abs() <= 0.05,
+                "return_pct {hr} vs {}",
+                t.return_pct
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
