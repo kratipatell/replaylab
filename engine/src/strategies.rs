@@ -14,6 +14,14 @@ pub trait Strategy {
     /// `candles[..=idx]` is visible; future bars must not be read.
     fn on_bar(&mut self, idx: usize, candles: &[Candle]) -> Option<Side>;
 
+    /// Return `true` to exit at the next open, `false` to hold.
+    ///
+    /// Called at the close of bar `idx` while a position is open, after that
+    /// bar's stop/target checks left the position open. Default never exits.
+    fn exit_on_bar(&mut self, _idx: usize, _candles: &[Candle]) -> bool {
+        false
+    }
+
     /// Called by the runner after a fill so one-trade-per-day strategies
     /// can suppress further signals. Default does nothing.
     fn on_fill(&mut self, _idx: usize) {}

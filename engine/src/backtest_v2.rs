@@ -129,6 +129,7 @@ pub fn run(
     let mut equity = cfg.initial_equity;
     let mut position: Option<OpenPos> = None;
     let mut pending: Option<(Side, usize)> = None;
+    let mut pending_exit = false;
 
     let close_position = |pos: &OpenPos,
                           exit_raw: f64,
@@ -160,6 +161,17 @@ pub fn run(
     };
 
     for i in 0..n {
+        // (1a) fill pending signal exit at this open, before stop/target checks.
+        if pending_exit {
+            if let Some(pos) = position.take() {
+                let raw_exit = candles[i].open;
+                let (after, trade) =
+                    close_position(&pos, raw_exit, candles[i].ts, i, ExitReason::Signal, equity);
+                equity = after;
+                trades.push(trade);
+            }
+            pending_exit = false;
+        }
         // (1) fill pending entry at this open.
         if position.is_none() {
             if let Some((side, sig_idx)) = pending.take() {
@@ -355,10 +367,17 @@ pub fn run(
             }
         }
 
-        // (3) at the close, ask the strategy and schedule for i+1.
-        if position.is_none() && pending.is_none() && session.contains(candles[i].ts) && i + 1 < n {
-            if let Some(side) = strategy.on_bar(i, candles) {
-                pending = Some((side, i));
+        // (3) at the close, schedule for i+1: signal exits while open,
+        // entries while flat.
+        if i + 1 < n {
+            if position.is_some() {
+                if strategy.exit_on_bar(i, candles) {
+                    pending_exit = true;
+                }
+            } else if pending.is_none() && session.contains(candles[i].ts) {
+                if let Some(side) = strategy.on_bar(i, candles) {
+                    pending = Some((side, i));
+                }
             }
         }
 
@@ -560,6 +579,139 @@ mod tests {
         )
         .unwrap();
         assert!(r.trades.is_empty());
+    }
+
+    struct SigExit {
+        entries: Vec<Option<Side>>,
+        exits: Vec<bool>,
+    }
+
+    impl Strategy for SigExit {
+        fn on_bar(&mut self, idx: usize, _candles: &[Candle]) -> Option<Side> {
+            self.entries.get(idx).copied().flatten()
+        }
+        fn exit_on_bar(&mut self, idx: usize, _candles: &[Candle]) -> bool {
+            self.exits.get(idx).copied().unwrap_or(false)
+        }
+    }
+
+    fn flat_bracket() -> Bracket {
+        Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: None,
+        }
+    }
+
+    #[test]
+    fn signal_exit_fills_next_open() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 105.0, 105.0, 105.0, 105.0),
+            c(3 * MS_PER_MIN, 105.0, 105.0, 105.0, 105.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None, None],
+            exits: vec![false, true, false, false],
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].entry_idx, 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert!((r.trades[0].exit_price - 105.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::Signal);
+    }
+
+    #[test]
+    fn signal_on_last_bar_is_end_of_data() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None],
+            exits: vec![false, false, true],
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert_eq!(r.trades[0].reason, ExitReason::EndOfData);
+    }
+
+    #[test]
+    fn pending_signal_exit_beats_gap_through_stop() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 90.0, 91.0, 89.0, 90.0),
+        ];
+        let mut s = SigExit {
+            entries: vec![Some(Side::Long), None, None],
+            exits: vec![false, true, false],
+        };
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].exit_idx, 2);
+        assert!((r.trades[0].exit_price - 90.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::Signal);
+    }
+
+    #[test]
+    fn default_strategy_never_exits() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None]);
+        assert!(!s.exit_on_bar(0, &candles));
+        assert!(!s.exit_on_bar(1, &candles));
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat_bracket(),
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].reason, ExitReason::EndOfData);
     }
 
     #[test]
