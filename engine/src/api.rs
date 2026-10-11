@@ -257,6 +257,7 @@ struct BacktestResponse {
     metrics: crate::stats::MetricsV2,
     in_sample: Option<crate::stats::Stats>,
     out_of_sample: Option<crate::stats::Stats>,
+    verdict: crate::verdict::Verdict,
     trades: Vec<crate::backtest::Trade>,
     equity_curve: Vec<f64>,
 }
@@ -361,16 +362,23 @@ async fn post_backtest(
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
     let stats = crate::stats::compute_stats(&result, &candles, bars_per_year);
-    let (in_sample, out_of_sample) = match req.split {
-        None => (None, None),
-        Some(split) => {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let split_idx = (candles.len() as f64 * split).floor() as usize;
-            match crate::stats::split_stats(&result, &candles, split_idx, bars_per_year) {
-                Ok((is, oos)) => (Some(is), Some(oos)),
-                Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-            }
+    let verdict_split = req.split.unwrap_or(crate::verdict::DEFAULT_VERDICT_SPLIT);
+    let split_idx = (candles.len() as f64 * verdict_split).floor() as usize;
+    let split_pieces = crate::stats::split_stats(&result, &candles, split_idx, bars_per_year);
+    let (in_sample, out_of_sample, verdict) = match (req.split, split_pieces) {
+        (Some(_), Ok((is, oos))) => {
+            let v = crate::verdict::assess(&is, &oos);
+            (Some(is), Some(oos), v)
         }
+        (None, Ok((is, oos))) => {
+            let v = crate::verdict::assess(&is, &oos);
+            (None, None, v)
+        }
+        (_, Err(_)) => (
+            None,
+            None,
+            crate::verdict::insufficient_split(candles.len(), verdict_split),
+        ),
     };
     let gaps = crate::feeds::find_gaps(&candles, step);
     let metrics = crate::stats::compute_v2(&result, &candles, bars_per_year);
@@ -404,6 +412,7 @@ async fn post_backtest(
         metrics,
         in_sample,
         out_of_sample,
+        verdict,
         trades: result.trades,
         equity_curve: result.equity_curve,
     };
@@ -1450,6 +1459,69 @@ mod tests {
         }
         let eq = v["equity_curve"].as_array().expect("equity array");
         assert_eq!(eq.len(), 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backtest_verdict_on_seeded_walk() {
+        let dir = temp_dir("bt_verdict_walk");
+        let candles = seeded_walk(3000, 42);
+        let start = candles.first().map(|c| c.ts).unwrap_or(0);
+        let end = candles.last().map(|c| c.ts).unwrap_or(0);
+        let state = AppState {
+            source: Arc::new(WalkSource {
+                data: candles.clone(),
+            }),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            web_dir: PathBuf::from("web"),
+        };
+        let strategy = serde_json::json!({
+            "asset": "BTCUSDT",
+            "timeframe": "1h",
+            "side": "long",
+            "entry": {"all": [{"left": {"ind": "close"}, "op": "crosses_above", "right": {"ind": "sma", "period": 10}}]},
+            "exit": {"all": [{"left": {"ind": "close"}, "op": "crosses_below", "right": {"ind": "sma", "period": 10}}]},
+            "stop_loss_pct": 2.0,
+            "take_profit_pct": 4.0,
+        });
+        for split in [None, Some(0.7)] {
+            let mut body = serde_json::json!({
+                "strategy": strategy,
+                "start_ms": start,
+                "end_ms": end,
+            });
+            if let Some(s) = split {
+                body["split"] = serde_json::json!(s);
+            }
+            let router = app(AppState {
+                source: state.source.clone(),
+                cache_dir: dir.clone(),
+                jobs: Arc::new(JobStore::default()),
+                db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+                web_dir: PathBuf::from("web"),
+            });
+            let res = router
+                .oneshot(
+                    Request::post("/backtest")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let v = body_json(res).await;
+            let grade = v["verdict"]["grade"].as_str().expect("verdict.grade");
+            assert!(
+                matches!(grade, "holds" | "fragile" | "fails" | "not_enough_data"),
+                "invalid grade: {grade}"
+            );
+            assert!(v["verdict"]["headline"].is_string());
+            assert!(v["verdict"]["reasons"].is_array());
+            assert!(v["verdict"]["oos_trades"].is_number());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
