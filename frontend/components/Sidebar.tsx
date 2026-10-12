@@ -10,6 +10,7 @@ import {
   FlaskConical,
   Home,
   Plus,
+  SearchCheck,
   type LucideIcon,
 } from "lucide-react";
 import { agents } from "@/lib/agents";
@@ -19,6 +20,7 @@ type NavItem = { label: string; href: string; icon: LucideIcon };
 const NAV: NavItem[] = [
   { label: "Home", href: "/", icon: Home },
   { label: "Test Lab", href: "/test-lab", icon: FlaskConical },
+  { label: "Check", href: "/check", icon: SearchCheck },
 ];
 
 export default function Sidebar() {
