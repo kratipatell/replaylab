@@ -2,8 +2,23 @@
 "use client";
 
 import { useState } from "react";
-import type { Trade } from "@/lib/api";
-import { exitReasonLabel, fmtDateTime, fmtNum, fmtPct } from "@/lib/testlab";
+import type { ExitReason, Trade } from "@/lib/api";
+import {
+  exitReasonHelp,
+  exitReasonLabel,
+  fmtDateTime,
+  fmtNum,
+  fmtPct,
+} from "@/lib/testlab";
+
+const EXIT_REASONS: ExitReason[] = [
+  "Signal",
+  "StopLoss",
+  "TakeProfit",
+  "Trailing",
+  "SessionEnd",
+  "EndOfData",
+];
 
 const PAGE = 50;
 
@@ -16,6 +31,7 @@ export default function TradesTable({ trades }: { trades: Trade[] }) {
   const remaining = trades.length - visible.length;
   return (
     <section aria-label="Trades" className="flex flex-col gap-2 overflow-x-auto">
+      <p className="text-xs text-[var(--muted)]">All times in UTC.</p>
       <table className="w-full border-collapse text-sm">
         <thead>
           <tr>
@@ -40,11 +56,19 @@ export default function TradesTable({ trades }: { trades: Trade[] }) {
               <td className="border border-[var(--border)] p-2">{fmtNum(t.entry_price)}</td>
               <td className="border border-[var(--border)] p-2">{fmtNum(t.exit_price)}</td>
               <td className="border border-[var(--border)] p-2">{fmtPct(t.return_pct)}</td>
-              <td className="border border-[var(--border)] p-2">{exitReasonLabel(t.reason)}</td>
+              <td
+                className="border border-[var(--border)] p-2"
+                title={exitReasonHelp(t.reason)}
+              >
+                {exitReasonLabel(t.reason)}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+      <p className="text-xs text-[var(--muted)]">
+        {EXIT_REASONS.map((r) => `${exitReasonLabel(r)}: ${exitReasonHelp(r)}`).join(" ")}
+      </p>
       {remaining > 0 && (
         <button
           type="button"

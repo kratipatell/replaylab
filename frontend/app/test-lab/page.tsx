@@ -14,12 +14,14 @@ import {
   buildRequest,
   defaultForm,
   fixHint,
+  holdBackToSplit,
   plural,
+  resolveRange,
   validateForm,
   type TestLabForm,
 } from "@/lib/testlab";
 import BacktestForm from "@/components/BacktestForm";
-import EquityCharts from "@/components/EquityCharts";
+import EquityCharts, { MonthlyTable } from "@/components/EquityCharts";
 import SavedRuns from "@/components/SavedRuns";
 import StatsTable from "@/components/StatsTable";
 import TradesTable from "@/components/TradesTable";
@@ -33,6 +35,8 @@ export default function TestLab() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<BacktestResponse | null>(null);
   const [submittedSplit, setSubmittedSplit] = useState<number | null>(null);
+  const [submittedStart, setSubmittedStart] = useState<number | null>(null);
+  const [submittedEnd, setSubmittedEnd] = useState<number | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runsLoading, setRunsLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -85,9 +89,12 @@ export default function TestLab() {
     }
     setLoading(true);
     try {
+      const range = resolveRange(form, now);
       const res = await postBacktest(buildRequest(form, now));
       setResult(res);
-      setSubmittedSplit(Number(form.split));
+      setSubmittedSplit(holdBackToSplit(Number(form.split)));
+      setSubmittedStart(range.startMs);
+      setSubmittedEnd(range.endMs);
       setSaved(null);
       setSelectedId(null);
       setSavedError(null);
@@ -177,7 +184,13 @@ export default function TestLab() {
             inSample={result.in_sample}
             outOfSample={result.out_of_sample}
           />
-          <EquityCharts equity={result.equity_curve} split={submittedSplit} />
+          <EquityCharts
+            equity={result.equity_curve}
+            split={submittedSplit}
+            startMs={submittedStart}
+            endMs={submittedEnd}
+          />
+          <MonthlyTable monthly={result.metrics.monthly} />
           <TradesTable trades={result.trades} />
           <p className="text-xs text-[var(--muted)]">
             These are simulated results on past data. Past results do not
@@ -210,7 +223,13 @@ export default function TestLab() {
             Verdict is not stored for older runs.
           </p>
           <StatsTable full={saved.stats} inSample={null} outOfSample={null} />
-          <EquityCharts equity={saved.equity_curve} split={null} />
+          <EquityCharts
+            equity={saved.equity_curve}
+            split={null}
+            startMs={saved.start_ms}
+            endMs={saved.end_ms}
+          />
+          <MonthlyTable monthly={saved.metrics.monthly} />
           <TradesTable trades={saved.trades} />
           <p className="text-xs text-[var(--muted)]">
             These are simulated results on past data. Past results do not

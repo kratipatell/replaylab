@@ -13,10 +13,19 @@ import type {
   Side,
 } from "./api";
 
-export const ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"] as const;
+export const ASSETS = [
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+  "BNBUSDT",
+  "XRPUSDT",
+  "DOGEUSDT",
+  "ADAUSDT",
+  "AVAXUSDT",
+] as const;
 export type Asset = (typeof ASSETS)[number];
 
-export const TIMEFRAMES = ["15m", "1h", "4h", "1d"] as const;
+export const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
 export const INDICATORS: IndicatorKind[] = [
@@ -33,16 +42,29 @@ export const OPS: Op[] = ["<", ">", "crosses_above", "crosses_below"];
 
 export const DEFAULT_FEE_BPS = 5;
 export const DEFAULT_SLIPPAGE_BPS = 2;
+export const DEFAULT_HOLD_BACK_PCT = 30;
+export const HOLD_BACK_MIN_PCT = 10;
+export const HOLD_BACK_MAX_PCT = 50;
 export const DEFAULT_SPLIT = 0.7;
 export const MAX_CHART_POINTS = 600;
 export const MAX_CANDLES = 100_000;
 
 const STEP_MS: Record<Timeframe, number> = {
+  "1m": 60_000,
+  "5m": 5 * 60_000,
   "15m": 15 * 60_000,
   "1h": 3_600_000,
   "4h": 4 * 3_600_000,
   "1d": 86_400_000,
 };
+
+export function holdBackToSplit(pct: number): number {
+  return 1 - pct / 100;
+}
+
+export function splitToHoldBack(split: number): number {
+  return (1 - split) * 100;
+}
 
 const YEAR_MS = 365 * 86_400_000;
 
@@ -107,10 +129,29 @@ export function defaultForm(): TestLabForm {
     preset: "1y",
     customStart: "",
     customEnd: "",
-    split: String(DEFAULT_SPLIT),
+    split: String(DEFAULT_HOLD_BACK_PCT),
     feeBps: String(DEFAULT_FEE_BPS),
     slippageBps: String(DEFAULT_SLIPPAGE_BPS),
   };
+}
+
+// A datetime-local value has no zone; treat it as UTC so everyone sees
+// the same range regardless of browser locale.
+export function parseCustomUtc(raw: string): number {
+  const s = raw.trim();
+  if (s === "") {
+    return NaN;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(s)) {
+    return Date.parse(`${s}:00Z`);
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(s)) {
+    return Date.parse(`${s}Z`);
+  }
+  if (/[Zz]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s)) {
+    return Date.parse(s);
+  }
+  return Date.parse(`${s}Z`);
 }
 
 export function resolveRange(
@@ -118,10 +159,69 @@ export function resolveRange(
   nowMs: number,
 ): { startMs: number; endMs: number } {
   if (form.preset === "custom") {
-    return { startMs: Date.parse(form.customStart), endMs: Date.parse(form.customEnd) };
+    return { startMs: parseCustomUtc(form.customStart), endMs: parseCustomUtc(form.customEnd) };
   }
   const years = form.preset === "1y" ? 1 : form.preset === "3y" ? 3 : 5;
   return { startMs: nowMs - years * YEAR_MS, endMs: nowMs };
+}
+
+export function candleCountFor(form: TestLabForm, nowMs: number): number | null {
+  const { startMs, endMs } = resolveRange(form, nowMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+    return null;
+  }
+  return Math.floor((endMs - startMs) / STEP_MS[form.timeframe]) + 1;
+}
+
+export function isOverCandleLimit(form: TestLabForm, nowMs: number): boolean {
+  const count = candleCountFor(form, nowMs);
+  return count !== null && count > MAX_CANDLES;
+}
+
+// Pure estimate for render: presets span an exact number of years, so no
+// clock read is needed to guess the candle count in the form.
+export function estimateCandles(form: TestLabForm): number | null {
+  if (form.preset === "custom") {
+    const startMs = parseCustomUtc(form.customStart);
+    const endMs = parseCustomUtc(form.customEnd);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+      return null;
+    }
+    return Math.floor((endMs - startMs) / STEP_MS[form.timeframe]) + 1;
+  }
+  const years = form.preset === "1y" ? 1 : form.preset === "3y" ? 3 : 5;
+  return Math.floor((years * YEAR_MS) / STEP_MS[form.timeframe]) + 1;
+}
+
+export function longestFittingPresetStatic(form: TestLabForm): DatePreset | null {
+  const presets: DatePreset[] = ["5y", "3y", "1y"];
+  for (const preset of presets) {
+    const count = estimateCandles({ ...form, preset });
+    if (count !== null && count <= MAX_CANDLES) {
+      return preset;
+    }
+  }
+  return null;
+}
+
+// Longest date preset that fits under the candle limit for this timeframe.
+export function longestFittingPreset(
+  form: TestLabForm,
+  nowMs: number,
+): DatePreset | null {
+  const presets: DatePreset[] = ["5y", "3y", "1y"];
+  for (const preset of presets) {
+    const probe: TestLabForm = { ...form, preset };
+    const count = candleCountFor(probe, nowMs);
+    if (count !== null && count <= MAX_CANDLES) {
+      return preset;
+    }
+  }
+  return null;
+}
+
+export function holdBackPct(form: TestLabForm): number {
+  return Number(form.split);
 }
 
 function needsPeriod(ind: IndicatorKind): boolean {
@@ -222,9 +322,11 @@ export function validateForm(form: TestLabForm, nowMs: number): string[] {
       );
     }
   }
-  const split = Number(form.split);
-  if (!Number.isFinite(split) || split <= 0 || split >= 1) {
-    errors.push("The out-of-sample split must be between 0 and 1 (0.7 means the last 30% of data is held back).");
+  const pct = Number(form.split);
+  if (!Number.isFinite(pct) || pct < HOLD_BACK_MIN_PCT || pct > HOLD_BACK_MAX_PCT) {
+    errors.push(
+      `Hold back the last ${HOLD_BACK_MIN_PCT} to ${HOLD_BACK_MAX_PCT}% to check the idea (30 means the last 30% of data is held back).`,
+    );
   }
   for (const [raw, name] of [
     [form.feeBps, "Fees"],
@@ -263,7 +365,7 @@ export function buildRequest(form: TestLabForm, nowMs: number): BacktestRequest 
     end_ms: Math.floor(endMs),
     fee_bps: Number(form.feeBps),
     slippage_bps: Number(form.slippageBps),
-    split: Number(form.split),
+    split: holdBackToSplit(Number(form.split)),
   };
   if (exitCount > 0) {
     body.strategy.exit = toRules(form.exit);
@@ -336,7 +438,7 @@ export function gradeColorVar(grade: Grade): string {
 export function exitReasonLabel(reason: ExitReason): string {
   switch (reason) {
     case "Signal":
-      return "Rule";
+      return "Exit rule";
     case "StopLoss":
       return "Stop loss";
     case "TakeProfit":
@@ -347,6 +449,23 @@ export function exitReasonLabel(reason: ExitReason): string {
       return "End of session";
     case "EndOfData":
       return "End of data";
+  }
+}
+
+export function exitReasonHelp(reason: ExitReason): string {
+  switch (reason) {
+    case "Signal":
+      return "An exit rule you wrote became true.";
+    case "StopLoss":
+      return "Price fell to the stop-loss percent you set.";
+    case "TakeProfit":
+      return "Price rose to the take-profit percent you set.";
+    case "Trailing":
+      return "A trailing stop followed the price and closed the trade.";
+    case "SessionEnd":
+      return "The holding window ended before any other exit fired.";
+    case "EndOfData":
+      return "The data ran out while the trade was still open.";
   }
 }
 
@@ -369,7 +488,57 @@ export function fmtDateTime(ms: number): string {
   if (Number.isNaN(d.getTime())) {
     return "—";
   }
-  return d.toLocaleString();
+  return `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+export function fmtDate(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) {
+    return "—";
+  }
+  return `${d.toISOString().slice(0, 10)}`;
+}
+
+export const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+export interface MonthlyGrid {
+  years: number[];
+  cells: Map<string, number>;
+}
+
+export function groupMonthly(monthly: Record<string, number>): MonthlyGrid {
+  const cells = new Map<string, number>();
+  const yearSet = new Set<number>();
+  for (const [key, value] of Object.entries(monthly)) {
+    const m = /^(\d{4})-(\d{2})$/.exec(key);
+    if (m === null) {
+      continue;
+    }
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      continue;
+    }
+    cells.set(key, value);
+    yearSet.add(year);
+  }
+  return { years: [...yearSet].sort((a, b) => a - b), cells };
 }
 
 // Points at the likely form field behind an engine rejection.
@@ -388,16 +557,16 @@ export function fixHint(message: string): string {
     return "Stop loss and take profit must be numbers above 0, or left empty.";
   }
   if (m.includes("split")) {
-    return "Set the held-back share between 0 and 1, for example 0.7.";
+    return "Set the held-back percent between 10 and 50, for example 30.";
   }
   if (m.includes("fee") || m.includes("slippage")) {
     return "Check Fees and Slippage under Advanced: both must be between 0 and 1000.";
   }
   if (m.includes("symbol")) {
-    return "Use one of the listed coins (BTCUSDT, ETHUSDT, SOLUSDT).";
+    return `Use one of the listed coins (${ASSETS.join(", ")}).`;
   }
   if (m.includes("interval") || m.includes("timeframe")) {
-    return "Use one of the listed bar sizes (15m, 1h, 4h, 1d).";
+    return `Use one of the listed bar sizes (${TIMEFRAMES.join(", ")}).`;
   }
   if (
     m.includes("start") ||

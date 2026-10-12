@@ -2,7 +2,7 @@
 "use client";
 
 import type { RunSummary } from "@/lib/api";
-import { fmtDateTime, fmtPct, plural } from "@/lib/testlab";
+import { fmtDateTime, fmtNum, fmtPct, plural } from "@/lib/testlab";
 
 export default function SavedRuns({
   runs,
@@ -39,7 +39,8 @@ export default function SavedRuns({
                 </span>
                 <span className="text-[var(--muted)]">{fmtDateTime(r.created_at * 1000)}</span>
                 <span>
-                  {plural(r.trades, "trade")}, {fmtPct(r.total_return_pct)} return
+                  {plural(r.trades, "trade")}, {fmtPct(r.total_return_pct)} return, Sharpe{" "}
+                  {fmtNum(r.sharpe)}, max drawdown {fmtPct(r.max_drawdown_pct)}
                 </span>
               </button>
             </li>

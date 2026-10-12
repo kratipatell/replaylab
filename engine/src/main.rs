@@ -35,13 +35,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let web_dir = std::env::var("WEB_DIR").unwrap_or_else(|_| "web".to_string());
     let state = AppState {
         source,
         cache_dir: cfg.cache_dir,
         jobs: std::sync::Arc::new(crate::api::JobStore::default()),
         db: std::sync::Arc::new(db),
-        web_dir: std::path::PathBuf::from(web_dir),
     };
     let router = match app_with_origin(state, &cfg.origin) {
         Ok(router) => router,

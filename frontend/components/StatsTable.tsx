@@ -50,6 +50,11 @@ export default function StatsTable({
       sub: "worst losing stretch",
       text: (s) => fmtPct(s.max_drawdown_pct),
     },
+    {
+      name: "Sharpe",
+      sub: "Return compared with how bumpy the ride was (Sharpe)",
+      text: (s) => fmtNum(s.sharpe),
+    },
   ];
 
   return (

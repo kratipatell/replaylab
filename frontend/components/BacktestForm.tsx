@@ -5,8 +5,14 @@
 import type { Side } from "@/lib/api";
 import {
   ASSETS,
+  HOLD_BACK_MAX_PCT,
+  HOLD_BACK_MIN_PCT,
+  MAX_CANDLES,
   TIMEFRAMES,
+  estimateCandles,
   hasValidEntryRule,
+  longestFittingPresetStatic,
+  plural,
   type Asset,
   type DatePreset,
   type TestLabForm,
@@ -32,6 +38,16 @@ export default function BacktestForm({
 }) {
   const set = <K extends keyof TestLabForm>(key: K, value: TestLabForm[K]): void =>
     onChange({ ...form, [key]: value });
+
+  const candleCount = estimateCandles(form);
+  const overLimit = candleCount !== null && candleCount > MAX_CANDLES;
+  const fitting = overLimit ? longestFittingPresetStatic(form) : null;
+  const canRun = hasValidEntryRule(form) && !overLimit;
+  const runTitle = overLimit
+    ? `That range holds about ${candleCount === null ? "?" : plural(candleCount, "candle")}, over the ${MAX_CANDLES.toLocaleString()} limit`
+    : hasValidEntryRule(form)
+      ? undefined
+      : "Add at least one valid entry rule first";
 
   return (
     <form
@@ -153,7 +169,7 @@ export default function BacktestForm({
         {form.preset === "custom" ? (
           <div className="flex flex-wrap gap-3">
             <label className={labelClass}>
-              From
+              From (UTC)
               <input
                 className={inputClass}
                 type="datetime-local"
@@ -162,7 +178,7 @@ export default function BacktestForm({
               />
             </label>
             <label className={labelClass}>
-              To
+              To (UTC)
               <input
                 className={inputClass}
                 type="datetime-local"
@@ -174,21 +190,43 @@ export default function BacktestForm({
         ) : (
           <p className="text-xs text-[var(--muted)]">Ends now.</p>
         )}
+        <p className="text-xs text-[var(--muted)]">
+          Dates are in UTC.
+          {candleCount !== null &&
+            ` About ${plural(candleCount, "candle")} at this bar size (limit ${MAX_CANDLES.toLocaleString()}).`}
+        </p>
+        {overLimit && (
+          <p role="alert" className="text-sm text-[var(--verdict-fails)]">
+            That range is over the {MAX_CANDLES.toLocaleString()}-candle limit.{" "}
+            {fitting !== null ? (
+              <button
+                type="button"
+                className="underline"
+                onClick={() => set("preset", fitting)}
+              >
+                Use {fitting} instead
+              </button>
+            ) : (
+              "Shorten the range or use a longer bar size."
+            )}
+          </p>
+        )}
       </fieldset>
 
       <label className={labelClass}>
-        Held-back share for checking (0 to 1)
+        Hold back the last (%) to check the idea
         <input
           className={`${inputClass} w-32`}
           type="number"
-          step="any"
-          min={0}
-          max={1}
+          step={1}
+          min={HOLD_BACK_MIN_PCT}
+          max={HOLD_BACK_MAX_PCT}
           value={form.split}
           onChange={(e) => set("split", e.target.value)}
         />
         <span className="text-xs font-normal text-[var(--muted)]">
-          0.7 means the last 30% of data is held back to check the idea.
+          30 means the last 30% of data is held back to check the idea (allowed{" "}
+          {HOLD_BACK_MIN_PCT} to {HOLD_BACK_MAX_PCT}).
         </span>
       </label>
 
@@ -227,12 +265,8 @@ export default function BacktestForm({
 
       <button
         type="submit"
-        disabled={loading || !hasValidEntryRule(form)}
-        title={
-          hasValidEntryRule(form)
-            ? undefined
-            : "Add at least one valid entry rule first"
-        }
+        disabled={loading || !canRun}
+        title={runTitle}
         className="w-fit rounded bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--accent-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
       >
         {loading ? "Running test…" : "Run test"}

@@ -22,7 +22,6 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub jobs: Arc<JobStore>,
     pub db: Arc<crate::db::Db>,
-    pub web_dir: PathBuf,
 }
 
 pub struct JobStore {
@@ -147,9 +146,6 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, ApiError
         .route("/optimize/{job_id}", get(get_optimize))
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
-        .route("/", get(serve_index))
-        .route("/app.js", get(serve_app_js))
-        .route("/styles.css", get(serve_styles))
         .with_state(state)
         .layer(cors))
 }
@@ -595,35 +591,6 @@ async fn get_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response
     }
 }
 
-fn serve_file(dir: &std::path::Path, name: &str, content_type: &str) -> Response {
-    let path = dir.join(name);
-    match std::fs::read(&path) {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, content_type)],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => err_json(StatusCode::NOT_FOUND, format!("missing {name}")).into_response(),
-    }
-}
-
-async fn serve_index(State(state): State<AppState>) -> Response {
-    serve_file(&state.web_dir, "index.html", "text/html; charset=utf-8")
-}
-
-async fn serve_app_js(State(state): State<AppState>) -> Response {
-    serve_file(
-        &state.web_dir,
-        "app.js",
-        "application/javascript; charset=utf-8",
-    )
-}
-
-async fn serve_styles(State(state): State<AppState>) -> Response {
-    serve_file(&state.web_dir, "styles.css", "text/css; charset=utf-8")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,7 +678,6 @@ mod tests {
             cache_dir: dir,
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
-            web_dir: PathBuf::from("web"),
         }
     }
 
@@ -1082,7 +1048,6 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
-            web_dir: PathBuf::from("web"),
         };
         let uri = format!(
             "/candles?symbol=BTCUSDT&interval=1h&start={}&end={}",
@@ -1387,7 +1352,6 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
-            web_dir: PathBuf::from("web"),
         };
         let strategy = serde_json::json!({
             "asset": "BTCUSDT",
@@ -1475,7 +1439,6 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
-            web_dir: PathBuf::from("web"),
         };
         let strategy = serde_json::json!({
             "asset": "BTCUSDT",
@@ -1500,7 +1463,6 @@ mod tests {
                 cache_dir: dir.clone(),
                 jobs: Arc::new(JobStore::default()),
                 db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
-                web_dir: PathBuf::from("web"),
             });
             let res = router
                 .oneshot(
