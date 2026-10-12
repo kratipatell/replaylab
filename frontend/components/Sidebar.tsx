@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronsLeft,
   ChevronsRight,
+  FlaskConical,
   Home,
   Plus,
   type LucideIcon,
@@ -15,7 +16,10 @@ import { agents } from "@/lib/agents";
 
 type NavItem = { label: string; href: string; icon: LucideIcon };
 
-const NAV: NavItem[] = [{ label: "Home", href: "/", icon: Home }];
+const NAV: NavItem[] = [
+  { label: "Home", href: "/", icon: Home },
+  { label: "Test Lab", href: "/test-lab", icon: FlaskConical },
+];
 
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false);

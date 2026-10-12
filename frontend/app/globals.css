@@ -9,6 +9,10 @@
   --muted: #a1a1aa;
   --accent: #f59e0b;
   --accent-foreground: #09090b;
+  --verdict-holds: #3fb950;
+  --verdict-fragile: #d29922;
+  --verdict-fails: #f85149;
+  --verdict-not-enough-data: #8b949e;
 }
 
 html,
