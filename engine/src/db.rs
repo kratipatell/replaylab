@@ -54,8 +54,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS runs (
     stats TEXT NOT NULL,
     metrics TEXT NOT NULL,
     equity_curve TEXT NOT NULL,
-    trades TEXT NOT NULL
+    trades TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT 'local'
 )";
+
+const ADD_OWNER_ID: &str = "ALTER TABLE runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -82,6 +85,22 @@ impl Db {
     fn init(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(SCHEMA)
             .map_err(|e| DbError::Init(e.to_string()))?;
+        Self::migrate(conn)
+    }
+
+    fn migrate(conn: &Connection) -> Result<(), DbError> {
+        let has_owner_id = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'owner_id'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| DbError::Init(e.to_string()))?
+            > 0;
+        if !has_owner_id {
+            conn.execute_batch(ADD_OWNER_ID)
+                .map_err(|e| DbError::Init(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -122,8 +141,9 @@ impl Db {
     ) -> Result<i64, DbError> {
         let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         conn.execute(
-            "INSERT INTO runs (created_at, symbol, interval, start_ms, end_ms, strategy, stats, metrics, equity_curve, trades)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            // owner_id stays 'local' until accounts exist.
+            "INSERT INTO runs (created_at, symbol, interval, start_ms, end_ms, strategy, stats, metrics, equity_curve, trades, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'local')",
             params![
                 now_secs(),
                 symbol,
@@ -250,5 +270,83 @@ mod tests {
         let got = db.get_run(1).expect("get").expect("exists");
         assert_eq!(got.strategy, strat);
         assert!(db.get_run(999).expect("get").is_none());
+    }
+
+    const OLD_SCHEMA: &str = "CREATE TABLE runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        start_ms INTEGER NOT NULL,
+        end_ms INTEGER NOT NULL,
+        strategy TEXT NOT NULL,
+        stats TEXT NOT NULL,
+        metrics TEXT NOT NULL,
+        equity_curve TEXT NOT NULL,
+        trades TEXT NOT NULL
+    )";
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir()
+            .join(format!("db_test_{}_{}_{}", name, std::process::id(), nanos))
+            .join("runs.db")
+    }
+
+    #[test]
+    fn migration_adds_owner_id_and_keeps_existing_rows() {
+        let path = temp_db_path("migrate");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        {
+            let conn = Connection::open(&path).expect("open old");
+            conn.execute_batch(OLD_SCHEMA).expect("old schema");
+            conn.execute(
+                "INSERT INTO runs (created_at, symbol, interval, start_ms, end_ms, strategy, stats, metrics, equity_curve, trades)
+                 VALUES (1, 'BTCUSDT', '1h', 0, 1, '{}', '{}', '{}', '[]', '[]')",
+                [],
+            )
+            .expect("old row");
+        }
+        let db = Db::open(&path).expect("migrate");
+        {
+            let conn = db.conn.lock().expect("lock");
+            let owner: String = conn
+                .query_row("SELECT owner_id FROM runs WHERE id = 1", [], |r| r.get(0))
+                .expect("owner of old row");
+            assert_eq!(owner, "local");
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(count, 1);
+        }
+        let id = db
+            .save_run(
+                "BTCUSDT",
+                "1h",
+                0,
+                1,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                &serde_json::json!([]),
+            )
+            .expect("save");
+        {
+            let conn = db.conn.lock().expect("lock");
+            let owner: String = conn
+                .query_row("SELECT owner_id FROM runs WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .expect("owner of new row");
+            assert_eq!(owner, "local");
+        }
+        drop(db);
+        // Re-opening a migrated database must be a no-op.
+        let _ = Db::open(&path).expect("reopen");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

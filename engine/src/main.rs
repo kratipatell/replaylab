@@ -6,6 +6,7 @@ mod feeds;
 mod indicators;
 mod instrument;
 mod optimizer;
+mod ratelimit;
 mod session;
 mod sizing;
 mod stats;
@@ -15,20 +16,25 @@ mod verdict;
 
 use std::sync::Arc;
 
-use crate::api::{app_with_origin, AppState};
+use crate::api::{app_with_limits, AppState, JobStore, Limits};
 use crate::config::Config;
 
 #[tokio::main]
 async fn main() {
-    let cfg = Config::from_env();
-    let source: Arc<dyn feeds::KlineSource + Send + Sync> = match cfg.base_url {
-        Some(url) => Arc::new(feeds::BinanceSource { base_url: url }),
+    let cfg = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let source: Arc<dyn feeds::KlineSource + Send + Sync> = match &cfg.base_url {
+        Some(url) => Arc::new(feeds::BinanceSource {
+            base_url: url.clone(),
+        }),
         None => Arc::new(feeds::BinanceSource::new()),
     };
-    let db_path = std::env::var("RUNS_DB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| cfg.cache_dir.join("runs.db"));
-    let db = match crate::db::Db::open(&db_path) {
+    let db = match crate::db::Db::open(&cfg.db_path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("{e}");
@@ -37,20 +43,39 @@ async fn main() {
     };
     let state = AppState {
         source,
-        cache_dir: cfg.cache_dir,
-        jobs: std::sync::Arc::new(crate::api::JobStore::default()),
-        db: std::sync::Arc::new(db),
+        cache_dir: cfg.cache_dir.clone(),
+        jobs: Arc::new(JobStore::default()),
+        db: Arc::new(db),
     };
-    let router = match app_with_origin(state, &cfg.origin) {
+    let router = match app_with_limits(
+        state,
+        &cfg.origins,
+        Limits::new(
+            cfg.backtest_per_min,
+            cfg.optimize_per_min,
+            cfg.max_optimizer_jobs,
+        ),
+    ) {
         Ok(router) => router,
         Err(e) => {
-            eprintln!("invalid ALLOWED_ORIGIN: {e}");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cfg.port));
+    let addr: std::net::SocketAddr = match cfg.host.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, cfg.port),
+        Err(e) => {
+            eprintln!("invalid HOST (use an IP address): {e}");
+            std::process::exit(1);
+        }
+    };
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind failed");
-    axum::serve(listener, router).await.expect("serve failed");
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("serve failed");
 }

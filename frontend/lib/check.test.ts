@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type DailyHit,
   applyParamEdits,
   buildCheckBacktestRequest,
   buildSummary,
@@ -7,12 +8,14 @@ import {
   checkParameterSchema,
   checkRequestSchema,
   compareClaim,
+  forwardedIp,
   injectionNoRule,
   listNumericPaths,
   missingParameters,
   modelOutputSchema,
   provenanceLabel,
   strategySchema,
+  takeDailyHit,
 } from "./check";
 import type { Strategy } from "./api";
 
@@ -285,5 +288,63 @@ describe("numeric paths and edits", () => {
     const req = buildCheckBacktestRequest(rsiStrategy(), now);
     expect(req.split).toBeCloseTo(0.7);
     expect(req.end_ms - req.start_ms).toBe(5 * 365 * 86_400_000);
+  });
+});
+
+describe("daily extract limit", () => {
+  const LIMIT = 3;
+  const NOON = Date.UTC(2026, 0, 15, 12, 0, 0);
+  const NEXT_MIDNIGHT = Date.UTC(2026, 0, 16);
+
+  it("allows requests up to the limit", () => {
+    const hits = new Map<string, DailyHit>();
+    for (let i = 0; i < LIMIT; i += 1) {
+      const decision = takeDailyHit(NOON, hits, "1.2.3.4", LIMIT);
+      expect(decision.allowed).toBe(true);
+      expect(decision.retryAt).toBe(NEXT_MIDNIGHT);
+    }
+  });
+
+  it("denies requests after the limit and returns the retry time", () => {
+    const hits = new Map<string, DailyHit>();
+    for (let i = 0; i < LIMIT; i += 1) {
+      expect(takeDailyHit(NOON, hits, "1.2.3.4", LIMIT).allowed).toBe(true);
+    }
+    const denied = takeDailyHit(NOON, hits, "1.2.3.4", LIMIT);
+    expect(denied.allowed).toBe(false);
+    expect(denied.retryAt).toBe(NEXT_MIDNIGHT);
+    expect(takeDailyHit(NOON, hits, "1.2.3.4", LIMIT).allowed).toBe(false);
+  });
+
+  it("resets after midnight UTC", () => {
+    const hits = new Map<string, DailyHit>();
+    expect(takeDailyHit(NOON, hits, "1.2.3.4", 1).allowed).toBe(true);
+    const lastSecond = Date.UTC(2026, 0, 15, 23, 59, 59, 999);
+    expect(takeDailyHit(lastSecond, hits, "1.2.3.4", 1).allowed).toBe(false);
+    const midnight = Date.UTC(2026, 0, 16, 0, 0, 0);
+    const fresh = takeDailyHit(midnight, hits, "1.2.3.4", 1);
+    expect(fresh.allowed).toBe(true);
+    expect(fresh.retryAt).toBe(Date.UTC(2026, 0, 17));
+  });
+
+  it("tracks IPs separately", () => {
+    const hits = new Map<string, DailyHit>();
+    expect(takeDailyHit(NOON, hits, "1.1.1.1", 1).allowed).toBe(true);
+    expect(takeDailyHit(NOON, hits, "2.2.2.2", 1).allowed).toBe(true);
+    expect(takeDailyHit(NOON, hits, "1.1.1.1", 1).allowed).toBe(false);
+    expect(takeDailyHit(NOON, hits, "2.2.2.2", 1).allowed).toBe(false);
+  });
+
+  it("uses one shared bucket when the IP header is missing", () => {
+    const hits = new Map<string, DailyHit>();
+    expect(forwardedIp(null)).toBe("unknown");
+    expect(forwardedIp("")).toBe("unknown");
+    expect(takeDailyHit(NOON, hits, forwardedIp(null), 1).allowed).toBe(true);
+    expect(takeDailyHit(NOON, hits, forwardedIp(""), 1).allowed).toBe(false);
+  });
+
+  it("keys on the first forwarded hop", () => {
+    expect(forwardedIp("203.0.113.7, 10.0.0.1")).toBe("203.0.113.7");
+    expect(forwardedIp(" 203.0.113.7 ")).toBe("203.0.113.7");
   });
 });

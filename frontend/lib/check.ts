@@ -465,3 +465,44 @@ export function buildCheckBacktestRequest(
     split: CHECK_HOLD_BACK_SPLIT,
   };
 }
+
+export interface DailyHit {
+  count: number;
+  resetAt: number;
+}
+
+export interface DailyLimitDecision {
+  allowed: boolean;
+  retryAt: number;
+}
+
+function nextUtcMidnight(nowMs: number): number {
+  const now = new Date(nowMs);
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+}
+
+// Counts one hit against the key's UTC day and reports when the cap lifts.
+export function takeDailyHit(
+  nowMs: number,
+  hits: Map<string, DailyHit>,
+  key: string,
+  limit: number,
+): DailyLimitDecision {
+  const entry = hits.get(key);
+  if (!entry || nowMs >= entry.resetAt) {
+    const resetAt = nextUtcMidnight(nowMs);
+    hits.set(key, { count: 1, resetAt });
+    return { allowed: true, retryAt: resetAt };
+  }
+  if (entry.count >= limit) {
+    return { allowed: false, retryAt: entry.resetAt };
+  }
+  entry.count += 1;
+  return { allowed: true, retryAt: entry.resetAt };
+}
+
+// First hop of x-forwarded-for; requests without one share the "unknown" bucket.
+export function forwardedIp(header: string | null): string {
+  const first = (header ?? "").split(",")[0].trim();
+  return first === "" ? "unknown" : first;
+}

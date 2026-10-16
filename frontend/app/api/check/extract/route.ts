@@ -1,36 +1,22 @@
 import {
+  type DailyHit,
   checkRequestSchema,
+  forwardedIp,
   injectionNoRule,
   listNumericPaths,
   modelOutputSchema,
+  takeDailyHit,
 } from "@/lib/check";
 import { LlmError, generateJson, providerLogLine } from "@/lib/llm";
 
-const WINDOW_MS = 10 * 60 * 1000;
-const MAX_HITS = 20;
-const hits = new Map<string, { count: number; reset: number }>();
+const DEFAULT_DAILY_LIMIT = 20;
 
-function clientIp(req: Request): string {
-  const forwarded = req.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0].trim();
-    if (first !== "") {
-      return first;
-    }
-  }
-  return "unknown";
+function dailyLimit(): number {
+  const parsed = Number(process.env.CHECK_DAILY_LIMIT);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_DAILY_LIMIT;
 }
 
-function rateLimited(ip: string): boolean {
-  const now = Date.now();
-  const entry = hits.get(ip);
-  if (!entry || now >= entry.reset) {
-    hits.set(ip, { count: 1, reset: now + WINDOW_MS });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > MAX_HITS;
-}
+const hits = new Map<string, DailyHit>();
 
 function error(message: string, status: number): Response {
   return Response.json({ status: "error", message }, { status });
@@ -80,9 +66,10 @@ function stripFences(raw: string): string {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const ip = clientIp(req);
-  if (rateLimited(ip)) {
-    return error("Too many reads. Wait a few minutes and try again.", 429);
+  const ip = forwardedIp(req.headers.get("x-forwarded-for"));
+  const decision = takeDailyHit(Date.now(), hits, ip, dailyLimit());
+  if (!decision.allowed) {
+    return error("Daily limit reached; try again tomorrow.", 429);
   }
 
   let body: unknown;

@@ -1,6 +1,9 @@
 use axum::{
-    extract::{rejection::JsonRejection, rejection::QueryRejection, Path, Query, State},
-    http::{HeaderValue, Method, StatusCode},
+    extract::{
+        rejection::JsonRejection, rejection::QueryRejection, ConnectInfo, DefaultBodyLimit,
+        Extension, Path, Query, State,
+    },
+    http::{request::Parts, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -8,13 +11,81 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
+    time::Duration,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+use crate::ratelimit::RateLimiter;
+
+const BACKTEST_TIMEOUT_SECS: u64 = 60;
+const BACKTEST_TIMEOUT: Duration = Duration::from_secs(BACKTEST_TIMEOUT_SECS);
+const BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct Limits {
+    pub backtest: Arc<RateLimiter>,
+    pub optimize: Arc<RateLimiter>,
+    pub max_optimizer_jobs: usize,
+}
+
+impl Limits {
+    pub fn new(backtest_per_min: u32, optimize_per_min: u32, max_optimizer_jobs: usize) -> Self {
+        Self {
+            backtest: Arc::new(RateLimiter::per_minute(backtest_per_min)),
+            optimize: Arc::new(RateLimiter::per_minute(optimize_per_min)),
+            max_optimizer_jobs,
+        }
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::new(30, 5, 2)
+    }
+}
+
+// A reverse proxy makes the peer address the proxy, so the forwarded address
+// comes first; the peer address covers direct connections.
+struct ClientIp(String);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let forwarded = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip().to_string());
+        Ok(ClientIp(
+            forwarded
+                .map(str::to_string)
+                .or(peer)
+                .unwrap_or_else(|| "unknown".to_string()),
+        ))
+    }
+}
+
+fn rate_limited(retry_after_secs: u64, msg: &str) -> Response {
+    let mut res = err_json(StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        res.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    res
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,10 +110,22 @@ impl Default for JobStore {
 }
 
 impl JobStore {
-    fn insert(&self, job: Job) {
-        if let Ok(mut map) = self.inner.write() {
-            map.insert(job.job_id.clone(), job);
+    // Admits at most `max_running` jobs that are still running, so the check
+    // and the insert cannot race.
+    fn try_insert_running(&self, max_running: usize, job: Job) -> bool {
+        let mut map = match self.inner.write() {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        let running = map
+            .values()
+            .filter(|j| j.status == JobStatus::Running)
+            .count();
+        if running >= max_running {
+            return false;
         }
+        map.insert(job.job_id.clone(), job);
+        true
     }
 
     fn update(&self, job_id: &str, f: impl FnOnce(&mut Job)) {
@@ -127,18 +210,23 @@ pub fn app(state: AppState) -> Router {
     })
 }
 
+#[cfg(test)]
 pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, ApiError> {
-    let origin_header: HeaderValue =
-        origin
-            .parse()
-            .map_err(|e: axum::http::header::InvalidHeaderValue| {
-                ApiError::BadOrigin(origin.to_string(), e.to_string())
-            })?;
+    app_with_limits(state, origin, Limits::default())
+}
+
+pub fn app_with_limits(state: AppState, origins: &str, limits: Limits) -> Result<Router, ApiError> {
+    let headers = crate::config::parse_origins(origins)
+        .map_err(|msg| ApiError::BadOrigin(origins.to_string(), msg))?;
+    Ok(router(state, headers, limits))
+}
+
+fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list([origin_header]))
+        .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
-    Ok(Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
@@ -147,7 +235,9 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, ApiError
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
         .with_state(state)
-        .layer(cors))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
+        .layer(Extension(Arc::new(limits)))
+        .layer(cors)
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
@@ -258,13 +348,118 @@ struct BacktestResponse {
     equity_curve: Vec<f64>,
 }
 
+struct SimRequest {
+    symbol: String,
+    interval: String,
+    step: i64,
+    start: i64,
+    end: i64,
+    split: Option<f64>,
+    fee_bps: f64,
+    slippage_bps: f64,
+    bars_per_year: f64,
+}
+
+struct BacktestParts {
+    candle_count: usize,
+    gaps: Vec<(i64, i64)>,
+    stats: crate::stats::Stats,
+    metrics: crate::stats::MetricsV2,
+    in_sample: Option<crate::stats::Stats>,
+    out_of_sample: Option<crate::stats::Stats>,
+    verdict: crate::verdict::Verdict,
+    trades: Vec<crate::backtest::Trade>,
+    equity_curve: Vec<f64>,
+}
+
+enum BacktestFailure {
+    Upstream(String),
+    BadRequest(String),
+}
+
+impl BacktestFailure {
+    fn into_error_response(self) -> Response {
+        match self {
+            BacktestFailure::Upstream(msg) => {
+                err_json(StatusCode::BAD_GATEWAY, msg).into_response()
+            }
+            BacktestFailure::BadRequest(msg) => {
+                err_json(StatusCode::BAD_REQUEST, msg).into_response()
+            }
+        }
+    }
+}
+
+fn run_backtest(
+    cache_dir: &std::path::Path,
+    source: &dyn crate::feeds::KlineSource,
+    strategy: &crate::strategy::Strategy,
+    req: &SimRequest,
+) -> Result<BacktestParts, BacktestFailure> {
+    let candles = crate::feeds::load_or_fetch(
+        cache_dir,
+        source,
+        &req.symbol,
+        &req.interval,
+        req.start,
+        req.end,
+    )
+    .map_err(|e| BacktestFailure::Upstream(e.to_string()))?;
+    if candles.is_empty() {
+        return Err(BacktestFailure::BadRequest(
+            "no candles in range".to_string(),
+        ));
+    }
+    let cfg = crate::backtest::BacktestConfig {
+        fee_bps: req.fee_bps,
+        slippage_bps: req.slippage_bps,
+    };
+    let result = crate::backtest::backtest_strategy(strategy, &candles, &cfg)
+        .map_err(|e| BacktestFailure::BadRequest(e.to_string()))?;
+    let stats = crate::stats::compute_stats(&result, &candles, req.bars_per_year);
+    let verdict_split = req.split.unwrap_or(crate::verdict::DEFAULT_VERDICT_SPLIT);
+    let split_idx = (candles.len() as f64 * verdict_split).floor() as usize;
+    let split_pieces = crate::stats::split_stats(&result, &candles, split_idx, req.bars_per_year);
+    let (in_sample, out_of_sample, verdict) = match (req.split, split_pieces) {
+        (Some(_), Ok((is, oos))) => {
+            let v = crate::verdict::assess(&is, &oos);
+            (Some(is), Some(oos), v)
+        }
+        (None, Ok((is, oos))) => {
+            let v = crate::verdict::assess(&is, &oos);
+            (None, None, v)
+        }
+        (_, Err(_)) => (
+            None,
+            None,
+            crate::verdict::insufficient_split(candles.len(), verdict_split),
+        ),
+    };
+    Ok(BacktestParts {
+        candle_count: candles.len(),
+        gaps: crate::feeds::find_gaps(&candles, req.step),
+        stats,
+        metrics: crate::stats::compute_v2(&result, &candles, req.bars_per_year),
+        in_sample,
+        out_of_sample,
+        verdict,
+        trades: result.trades,
+        equity_curve: result.equity_curve,
+    })
+}
+
 async fn post_backtest(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    ClientIp(ip): ClientIp,
     body: Result<Json<BacktestBody>, JsonRejection>,
 ) -> Response {
+    if let Err(retry_after) = limits.backtest.check(&ip) {
+        return rate_limited(retry_after, "too many backtest requests; try again shortly");
+    }
     let req = match body {
         Ok(Json(b)) => b,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
     };
     if let Err(e) = req.strategy.validate() {
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -330,58 +525,45 @@ async fn post_backtest(
             .into_response();
         }
     }
-    let source = state.source.clone();
-    let cache_dir = state.cache_dir.clone();
-    let start = req.start_ms;
-    let end = req.end_ms;
-    let loaded = tokio::task::spawn_blocking(move || {
-        crate::feeds::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
-    })
-    .await;
-    let candles = match loaded {
-        Err(e) => {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        Ok(Err(e)) => return err_json(StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-        Ok(Ok(c)) => c,
-    };
-    if candles.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "no candles in range".to_string())
-            .into_response();
-    }
-    let cfg = crate::backtest::BacktestConfig {
+    let sim = SimRequest {
+        symbol,
+        interval,
+        step,
+        start: req.start_ms,
+        end: req.end_ms,
+        split: req.split,
         fee_bps,
         slippage_bps,
+        bars_per_year,
     };
-    let result = match crate::backtest::backtest_strategy(&req.strategy, &candles, &cfg) {
-        Ok(r) => r,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-    let stats = crate::stats::compute_stats(&result, &candles, bars_per_year);
-    let verdict_split = req.split.unwrap_or(crate::verdict::DEFAULT_VERDICT_SPLIT);
-    let split_idx = (candles.len() as f64 * verdict_split).floor() as usize;
-    let split_pieces = crate::stats::split_stats(&result, &candles, split_idx, bars_per_year);
-    let (in_sample, out_of_sample, verdict) = match (req.split, split_pieces) {
-        (Some(_), Ok((is, oos))) => {
-            let v = crate::verdict::assess(&is, &oos);
-            (Some(is), Some(oos), v)
+    let source = state.source.clone();
+    let cache_dir = state.cache_dir.clone();
+    let strategy = req.strategy.clone();
+    let computed = tokio::time::timeout(
+        BACKTEST_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            run_backtest(&cache_dir, source.as_ref(), &strategy, &sim)
+        }),
+    )
+    .await;
+    let parts = match computed {
+        Err(_) => {
+            return err_json(
+                StatusCode::REQUEST_TIMEOUT,
+                format!("backtest timed out after {BACKTEST_TIMEOUT_SECS}s"),
+            )
+            .into_response();
         }
-        (None, Ok((is, oos))) => {
-            let v = crate::verdict::assess(&is, &oos);
-            (None, None, v)
+        Ok(Err(join)) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, join.to_string()).into_response();
         }
-        (_, Err(_)) => (
-            None,
-            None,
-            crate::verdict::insufficient_split(candles.len(), verdict_split),
-        ),
+        Ok(Ok(Err(failure))) => return failure.into_error_response(),
+        Ok(Ok(Ok(parts))) => parts,
     };
-    let gaps = crate::feeds::find_gaps(&candles, step);
-    let metrics = crate::stats::compute_v2(&result, &candles, bars_per_year);
-    let stats_v = serde_json::to_value(&stats).unwrap_or_default();
-    let metrics_v = serde_json::to_value(&metrics).unwrap_or_default();
-    let equity_v = serde_json::to_value(&result.equity_curve).unwrap_or_default();
-    let trades_v = serde_json::to_value(&result.trades).unwrap_or_default();
+    let stats_v = serde_json::to_value(&parts.stats).unwrap_or_default();
+    let metrics_v = serde_json::to_value(&parts.metrics).unwrap_or_default();
+    let equity_v = serde_json::to_value(&parts.equity_curve).unwrap_or_default();
+    let trades_v = serde_json::to_value(&parts.trades).unwrap_or_default();
     let strategy_v = serde_json::to_value(&req.strategy).unwrap_or_default();
     let run_id = match state.db.save_run(
         &req.strategy.asset,
@@ -402,15 +584,15 @@ async fn post_backtest(
     };
     let resp = BacktestResponse {
         run_id,
-        candle_count: candles.len(),
-        gaps,
-        stats,
-        metrics,
-        in_sample,
-        out_of_sample,
-        verdict,
-        trades: result.trades,
-        equity_curve: result.equity_curve,
+        candle_count: parts.candle_count,
+        gaps: parts.gaps,
+        stats: parts.stats,
+        metrics: parts.metrics,
+        in_sample: parts.in_sample,
+        out_of_sample: parts.out_of_sample,
+        verdict: parts.verdict,
+        trades: parts.trades,
+        equity_curve: parts.equity_curve,
     };
     (
         StatusCode::OK,
@@ -421,11 +603,16 @@ async fn post_backtest(
 
 async fn post_optimize(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    ClientIp(ip): ClientIp,
     body: Result<Json<crate::optimizer::OptimizeSpec>, JsonRejection>,
 ) -> Response {
+    if let Err(retry_after) = limits.optimize.check(&ip) {
+        return rate_limited(retry_after, "too many optimize requests; try again shortly");
+    }
     let req = match body {
         Ok(Json(b)) => b,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
     };
     if let Err(e) = req.strategy.validate() {
         return err_json(
@@ -512,7 +699,7 @@ async fn post_optimize(
 
     let objective = req.objective.unwrap_or_default().as_str().to_string();
     let job_id = format!("opt-{}", state.jobs.next_id.fetch_add(1, Ordering::SeqCst));
-    state.jobs.insert(Job {
+    let job = Job {
         job_id: job_id.clone(),
         status: JobStatus::Running,
         total_trials: combos_len,
@@ -522,7 +709,17 @@ async fn post_optimize(
         results: None,
         warnings: Vec::new(),
         error: None,
-    });
+    };
+    if !state
+        .jobs
+        .try_insert_running(limits.max_optimizer_jobs, job)
+    {
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many optimizer jobs running",
+        )
+        .into_response();
+    }
 
     let jobs = state.jobs.clone();
     let reply_id = job_id.clone();
@@ -1113,6 +1310,119 @@ mod tests {
         let state = test_state(dir.clone());
         let res = app_with_origin(state, "bad\norigin");
         assert!(res.is_err(), "expected Err for bad origin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backtest_rate_limit_blocks_over_limit_with_retry_after() {
+        let dir = temp_dir("bt_rate_limit");
+        let fake = FakeSource::new();
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::new(1, 5, 2),
+        )
+        .expect("router");
+        let body = serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": fake.start(),
+            "end_ms": fake.end(),
+        });
+        let request = || {
+            Request::post("/backtest")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let res = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = router.oneshot(request()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("retry-after header");
+        assert!(
+            (1..=60).contains(&retry_after),
+            "retry-after: {retry_after}"
+        );
+        let v = body_json(res).await;
+        assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn backtest_body_over_1mb_is_413() {
+        let dir = temp_dir("bt_body_limit");
+        let body = vec![b'a'; BODY_LIMIT_BYTES + 1];
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::post("/backtest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_store_admits_until_cap_then_frees_slots() {
+        fn job(id: &str) -> Job {
+            Job {
+                job_id: id.to_string(),
+                status: JobStatus::Running,
+                total_trials: 1,
+                completed_trials: 0,
+                objective: "score".to_string(),
+                validation: String::new(),
+                results: None,
+                warnings: Vec::new(),
+                error: None,
+            }
+        }
+        let store = JobStore::default();
+        assert!(store.try_insert_running(2, job("a")));
+        assert!(store.try_insert_running(2, job("b")));
+        assert!(!store.try_insert_running(2, job("c")));
+        store.update("a", |j| j.status = JobStatus::Failed);
+        assert!(store.try_insert_running(2, job("c")));
+        assert!(!store.try_insert_running(2, job("d")));
+    }
+
+    #[tokio::test]
+    async fn optimize_cap_rejects_when_no_job_slots() {
+        let dir = temp_dir("opt_no_slots");
+        let fake = FakeSource::new();
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::new(30, 5, 0),
+        )
+        .expect("router");
+        let res = router
+            .clone()
+            .oneshot(
+                Request::post("/optimize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(optimize_body(&fake, 4).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "too many optimizer jobs running");
+        let res = router
+            .oneshot(Request::get("/optimize").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        assert_eq!(v["jobs"].as_array().expect("jobs").len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
