@@ -189,7 +189,7 @@ export function MonthlyTable({ monthly }: { monthly: Record<string, number> }) {
                 {MONTH_NAMES.map((_, idx) => {
                   const key = `${year}-${String(idx + 1).padStart(2, "0")}`;
                   const v = cells.get(key);
-                  if (v === undefined) {
+                  if (v === undefined || v === 0) {
                     return (
                       <td
                         key={key}
@@ -199,14 +199,22 @@ export function MonthlyTable({ monthly }: { monthly: Record<string, number> }) {
                       </td>
                     );
                   }
+                  const text = fmtPct(v, 1);
+                  const neutral = text === "-0.0%" || text === "0.0%";
                   const positive = v >= 0;
                   return (
                     <td
                       key={key}
                       className="border border-[var(--border)] p-2 text-right"
-                      style={{ color: positive ? "var(--verdict-holds)" : "var(--verdict-fails)" }}
+                      style={{
+                        color: neutral
+                          ? "var(--muted)"
+                          : positive
+                            ? "var(--verdict-holds)"
+                            : "var(--verdict-fails)",
+                      }}
                     >
-                      {fmtPct(v, 1)}
+                      {neutral ? "0.0%" : text}
                     </td>
                   );
                 })}
@@ -216,7 +224,7 @@ export function MonthlyTable({ monthly }: { monthly: Record<string, number> }) {
         </table>
       </div>
       <p className="text-xs text-[var(--muted)]">
-        Months with no trades show a dash. Months in UTC.
+        A dash means a month with no trades or a single candle. Months in UTC.
       </p>
     </div>
   );

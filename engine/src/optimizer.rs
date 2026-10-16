@@ -769,6 +769,7 @@ fn mean_stats(all: &[Stats]) -> Stats {
             Some(pf_vals.iter().sum::<f64>() / pf_vals.len() as f64)
         },
         expectancy_pct: mean(|s| s.expectancy_pct),
+        expectancy_stdev_pct: mean(|s| s.expectancy_stdev_pct),
         total_return_pct: mean(|s| s.total_return_pct),
         buy_and_hold_pct: mean(|s| s.buy_and_hold_pct),
         max_drawdown_pct: mean(|s| s.max_drawdown_pct),
@@ -1318,6 +1319,7 @@ mod tests {
             avg_loss_pct: -1.0,
             profit_factor: Some(1.0),
             expectancy_pct: 0.0,
+            expectancy_stdev_pct: 0.0,
             total_return_pct: ret,
             buy_and_hold_pct: 0.0,
             max_drawdown_pct: 5.0,

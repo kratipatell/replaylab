@@ -3,18 +3,78 @@
 // No network or model calls here, so vitest can cover it all.
 
 import { z } from "zod";
+import { ApiError } from "./api";
 import type {
   BacktestRequest,
+  BacktestResponse,
   Condition,
+  Grade,
   Operand,
   Op,
   Rules,
+  Side,
+  Stats,
   Strategy,
 } from "./api";
 
 export const MAX_CHECK_CHARS = 8000;
 export const CHECK_HOLD_BACK_SPLIT = 0.7;
 const CHECK_YEARS_MS = 5 * 365 * 86_400_000;
+
+export const MULTI_TIMEFRAMES = ["15m", "1h", "4h", "1d"] as const;
+export type MultiTimeframe = (typeof MULTI_TIMEFRAMES)[number];
+
+const TIMEFRAME_STEP_MS: Record<string, number> = {
+  "1m": 60_000,
+  "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "1h": 3_600_000,
+  "4h": 4 * 3_600_000,
+  "1d": 86_400_000,
+};
+const DEFAULT_STEP_MS = 86_400_000;
+
+export const MAX_CANDLES = 100_000;
+
+export interface CandleRange {
+  startMs: number;
+  endMs: number;
+  candles: number;
+}
+
+// Longest range ending now, up to five years, that stays under the candle cap.
+export function rangeFit(timeframe: string, nowMs: number): CandleRange {
+  const stepMs = TIMEFRAME_STEP_MS[timeframe] ?? DEFAULT_STEP_MS;
+  const maxSpan = (MAX_CANDLES - 1) * stepMs;
+  const span = Math.min(CHECK_YEARS_MS, maxSpan);
+  const endMs = Math.floor(nowMs);
+  const startMs = Math.floor(endMs - span);
+  const candles = Math.floor((endMs - startMs) / stepMs) + 1;
+  return { startMs, endMs, candles };
+}
+
+export const MULTI_TIMEFRAME_NOTE =
+  "The video did not say which timeframe, so every one is shown, not only the best.";
+
+export const RATE_LIMIT_MESSAGE = "Too many requests; try again in a minute";
+
+const COUNT_WORDS = [
+  "zero",
+  "one",
+  "two",
+  "three",
+  "four",
+  "five",
+  "six",
+  "seven",
+  "eight",
+  "nine",
+  "ten",
+];
+
+function countWord(n: number): string {
+  return COUNT_WORDS[n] ?? String(n);
+}
 
 const sideSchema = z.enum(["long", "short"]);
 const indicatorSchema = z.enum([
@@ -155,11 +215,44 @@ export const checkClaimSchema = z.strictObject({
   quote: z.string().max(500).nullable(),
 });
 
+export const contextSourceSchema = z.enum(["stated", "assumed"]);
+
+export const contextFieldSchema = z
+  .strictObject({
+    value: z.string().min(1).max(32).nullable(),
+    source: contextSourceSchema,
+    quote: z.string().max(500).nullable().optional(),
+    reason: z.string().max(500).nullable().optional(),
+  })
+  .superRefine((f, ctx) => {
+    if (f.source === "stated") {
+      if (f.value === null) {
+        ctx.addIssue({ code: "custom", message: "stated needs a value" });
+      }
+      if (!f.quote || f.quote.trim() === "") {
+        ctx.addIssue({
+          code: "custom",
+          message: "stated needs the exact quote",
+        });
+      }
+    }
+    if (f.source === "assumed" && (!f.reason || f.reason.trim() === "")) {
+      ctx.addIssue({ code: "custom", message: "assumed needs a reason" });
+    }
+  });
+
+export const checkContextSchema = z.strictObject({
+  asset: contextFieldSchema,
+  timeframe: contextFieldSchema,
+  side: contextFieldSchema,
+});
+
 const foundSchema = z.strictObject({
   status: z.literal("found"),
   strategy: strategySchema,
   parameters: z.array(checkParameterSchema).min(1),
   claim: checkClaimSchema,
+  context: checkContextSchema,
 });
 
 const noRuleSchema = z.strictObject({
@@ -179,6 +272,9 @@ export const checkRequestSchema = z.strictObject({
 export type ParamSource = z.infer<typeof paramSourceSchema>;
 export type CheckParameter = z.infer<typeof checkParameterSchema>;
 export type CheckClaim = z.infer<typeof checkClaimSchema>;
+export type ContextSource = z.infer<typeof contextSourceSchema>;
+export type ContextField = z.infer<typeof contextFieldSchema>;
+export type CheckContext = z.infer<typeof checkContextSchema>;
 export type ModelOutput = z.infer<typeof modelOutputSchema>;
 export type FoundOutput = z.infer<typeof foundSchema>;
 
@@ -186,6 +282,7 @@ export interface NeedsInputView {
   strategy: Strategy;
   parameters: CheckParameter[];
   claim: CheckClaim;
+  context: CheckContext;
   missing: CheckParameter[];
 }
 
@@ -275,6 +372,39 @@ export function provenanceLabel(
     return "Assumed default";
   }
   return "Needs your input";
+}
+
+export function contextLabel(source: ContextSource, overridden: boolean): string {
+  if (overridden) {
+    return "You chose";
+  }
+  return source === "stated" ? "Stated in the video" : "Assumed default";
+}
+
+export interface ContextEdits {
+  asset?: string;
+  timeframe?: string;
+  side?: Side;
+}
+
+// The video is silent on the timeframe only when it is assumed with no value.
+export function timeframeNotStated(context: CheckContext): boolean {
+  return context.timeframe.source === "assumed" && context.timeframe.value === null;
+}
+
+// Context values (and any user picks) win over the reader's strategy defaults.
+export function applyContextEdits(
+  strategy: Strategy,
+  context: CheckContext,
+  edits: ContextEdits,
+): Strategy {
+  const asset = edits.asset ?? context.asset.value ?? strategy.asset;
+  const rawSide = edits.side ?? context.side.value;
+  const side: Side =
+    rawSide === "short" || rawSide === "long" ? rawSide : strategy.side;
+  const timeframe =
+    edits.timeframe ?? context.timeframe.value ?? strategy.timeframe;
+  return { ...strategy, asset, side, timeframe };
 }
 
 export interface ClaimComparison {
@@ -458,12 +588,151 @@ export function buildCheckBacktestRequest(
   strategy: Strategy,
   nowMs: number,
 ): BacktestRequest {
+  const range = rangeFit(strategy.timeframe, nowMs);
   return {
     strategy,
-    start_ms: Math.floor(nowMs - CHECK_YEARS_MS),
-    end_ms: Math.floor(nowMs),
+    start_ms: range.startMs,
+    end_ms: range.endMs,
     split: CHECK_HOLD_BACK_SPLIT,
   };
+}
+
+export function buildTimeframeRequest(
+  strategy: Strategy,
+  timeframe: MultiTimeframe,
+  nowMs: number,
+): BacktestRequest {
+  const range = rangeFit(timeframe, nowMs);
+  return {
+    strategy: { ...strategy, timeframe },
+    start_ms: range.startMs,
+    end_ms: range.endMs,
+    split: CHECK_HOLD_BACK_SPLIT,
+  };
+}
+
+export interface TimeframeRun {
+  timeframe: string;
+  range: CandleRange;
+  outOfSample: Stats | null;
+  grade: Grade;
+}
+
+export interface TimeframeRow {
+  timeframe: string;
+  rangeStart: number;
+  rangeEnd: number;
+  trades: number | null;
+  winRatePct: number | null;
+  profitFactor: number | null;
+  expectancyPct: number | null;
+  grade: Grade;
+}
+
+export function timeframeRow(run: TimeframeRun): TimeframeRow {
+  return {
+    timeframe: run.timeframe,
+    rangeStart: run.range.startMs,
+    rangeEnd: run.range.endMs,
+    trades: run.outOfSample?.trades ?? null,
+    winRatePct: run.outOfSample?.win_rate_pct ?? null,
+    profitFactor: run.outOfSample?.profit_factor ?? null,
+    expectancyPct: run.outOfSample?.expectancy_pct ?? null,
+    grade: run.grade,
+  };
+}
+
+export function timeframeRows(runs: TimeframeRun[]): TimeframeRow[] {
+  return runs.map(timeframeRow);
+}
+
+export interface MultiTimeframeRun {
+  timeframe: MultiTimeframe;
+  range: CandleRange;
+  response: BacktestResponse;
+}
+
+export type TimeframeOutcome =
+  | ({ status: "ok" } & MultiTimeframeRun)
+  | { status: "failed"; timeframe: MultiTimeframe; error: string };
+
+export type MultiTimeframeRow =
+  | { status: "ok"; timeframe: MultiTimeframe; row: TimeframeRow }
+  | { status: "failed"; timeframe: MultiTimeframe; error: string };
+
+export function errorMessage(e: unknown): string {
+  if (e instanceof ApiError && e.status === 429) {
+    return RATE_LIMIT_MESSAGE;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
+export function timeframeOutcome(
+  timeframe: MultiTimeframe,
+  result: PromiseSettledResult<{ range: CandleRange; response: BacktestResponse }>,
+): TimeframeOutcome {
+  if (result.status === "fulfilled") {
+    return {
+      status: "ok",
+      timeframe,
+      range: result.value.range,
+      response: result.value.response,
+    };
+  }
+  return { status: "failed", timeframe, error: errorMessage(result.reason) };
+}
+
+// One settled result per timeframe, in MULTI_TIMEFRAMES order.
+export function multiTimeframeOutcomes(
+  results: PromiseSettledResult<{
+    range: CandleRange;
+    response: BacktestResponse;
+  }>[],
+): TimeframeOutcome[] {
+  return results.map((result, index) =>
+    timeframeOutcome(MULTI_TIMEFRAMES[index], result),
+  );
+}
+
+export function multiTimeframeRows(
+  outcomes: TimeframeOutcome[],
+): MultiTimeframeRow[] {
+  return outcomes.map((outcome) => {
+    if (outcome.status === "failed") {
+      return {
+        status: "failed",
+        timeframe: outcome.timeframe,
+        error: outcome.error,
+      };
+    }
+    return {
+      status: "ok",
+      timeframe: outcome.timeframe,
+      row: timeframeRow({
+        timeframe: outcome.timeframe,
+        range: outcome.range,
+        outOfSample: outcome.response.out_of_sample,
+        grade: outcome.response.verdict.grade,
+      }),
+    };
+  });
+}
+
+// Only a timeframe that produced a result may count toward the verdict.
+export function successfulRows(rows: MultiTimeframeRow[]): TimeframeRow[] {
+  return rows.flatMap((row) => (row.status === "ok" ? [row.row] : []));
+}
+
+// One pass out of several is the kind of luck that a wider search produces.
+export function weakEvidence(rows: TimeframeRow[]): string | null {
+  if (rows.length < 2) {
+    return null;
+  }
+  const holds = rows.filter((row) => row.grade === "holds").length;
+  if (holds !== 1) {
+    return null;
+  }
+  return `Only one of ${countWord(rows.length)} timeframes passed. Testing several variations makes a lucky result more likely, so treat this as weak evidence.`;
 }
 
 export interface DailyHit {

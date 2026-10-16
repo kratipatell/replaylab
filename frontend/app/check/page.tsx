@@ -8,14 +8,38 @@ import {
   type Strategy,
 } from "@/lib/api";
 import {
+  MULTI_TIMEFRAMES,
+  MULTI_TIMEFRAME_NOTE,
+  applyContextEdits,
   applyParamEdits,
   buildCheckBacktestRequest,
   buildSummary,
+  buildTimeframeRequest,
   missingParameters,
+  multiTimeframeOutcomes,
+  multiTimeframeRows,
+  rangeFit,
+  successfulRows,
+  timeframeNotStated,
+  timeframeOutcome,
+  weakEvidence,
   type CheckClaim,
+  type CheckContext,
   type CheckParameter,
+  type ContextEdits,
+  type MultiTimeframe,
+  type MultiTimeframeRun,
+  type TimeframeOutcome,
 } from "@/lib/check";
-import { fixHint, plural } from "@/lib/testlab";
+import {
+  fixHint,
+  fmtDate,
+  fmtNum,
+  fmtPct,
+  gradeColorVar,
+  gradeLabel,
+  plural,
+} from "@/lib/testlab";
 import CheckParamsTable from "@/components/CheckParamsTable";
 import ClaimCard from "@/components/ClaimCard";
 import EquityCharts, { MonthlyTable } from "@/components/EquityCharts";
@@ -29,12 +53,14 @@ type ExtractResult =
       strategy: Strategy;
       parameters: CheckParameter[];
       claim: CheckClaim;
+      context: CheckContext;
     }
   | {
       status: "needs_input";
       strategy: Strategy;
       parameters: CheckParameter[];
       claim: CheckClaim;
+      context: CheckContext;
       missing: { name: string; path: string }[];
       reason: string;
     }
@@ -43,6 +69,12 @@ type ExtractResult =
 interface ErrorShape {
   status: "error";
   message: string;
+}
+
+interface MultiState {
+  strategy: Strategy;
+  nowMs: number;
+  outcomes: TimeframeOutcome[];
 }
 
 async function postExtract(text: string): Promise<ExtractResult> {
@@ -92,8 +124,13 @@ export default function Check() {
   const [extract, setExtract] = useState<ExtractResult | null>(null);
   const [extractError, setExtractError] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<string, string>>({});
+  const [contextEdits, setContextEdits] = useState<ContextEdits>({});
+  const [everyTimeframe, setEveryTimeframe] = useState(false);
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<BacktestResponse | null>(null);
+  const [multi, setMulti] = useState<MultiState | null>(null);
+  const [retrying, setRetrying] = useState<MultiTimeframe | null>(null);
+  const [selected, setSelected] = useState<MultiTimeframe | null>(null);
   const [engineError, setEngineError] = useState<string | null>(null);
   const [range, setRange] = useState<{ start: number; end: number } | null>(
     null,
@@ -104,11 +141,17 @@ export default function Check() {
     setExtractError(null);
     setEngineError(null);
     setResult(null);
+    setMulti(null);
+    setSelected(null);
     setRange(null);
     try {
       const out = await postExtract(text);
       setExtract(out);
       setOverrides({});
+      setContextEdits({});
+      setEveryTimeframe(
+        out.status !== "no_rule_found" && timeframeNotStated(out.context),
+      );
     } catch (e) {
       setExtract(null);
       setExtractError(e instanceof Error ? e.message : String(e));
@@ -132,14 +175,43 @@ export default function Check() {
   const canRun =
     editable !== null && !reading && !testing && unfilled.length === 0;
 
+  const setContextEdit = useCallback(
+    (key: keyof ContextEdits, value: string) => {
+      setContextEdits((prev) => ({ ...prev, [key]: value }) as ContextEdits);
+    },
+    [],
+  );
+
   let summary: string | null = null;
   if (editable !== null) {
     try {
-      summary = buildSummary(applyParamEdits(editable.strategy, edits));
+      summary = buildSummary(
+        applyContextEdits(
+          applyParamEdits(editable.strategy, edits),
+          editable.context,
+          contextEdits,
+        ),
+      );
     } catch {
       summary = buildSummary(editable.strategy);
     }
   }
+
+  const openTimeframe = useCallback((run: MultiTimeframeRun): void => {
+    setSelected(run.timeframe);
+    setResult(run.response);
+    setRange({ start: run.range.startMs, end: run.range.endMs });
+  }, []);
+
+  const openOutcome = useCallback(
+    (timeframe: MultiTimeframe): void => {
+      const outcome = multi?.outcomes.find((o) => o.timeframe === timeframe);
+      if (outcome?.status === "ok") {
+        openTimeframe(outcome);
+      }
+    },
+    [multi, openTimeframe],
+  );
 
   const runTest = useCallback(async (): Promise<void> => {
     if (editable === null || bad.length > 0 || unfilled.length > 0) {
@@ -147,22 +219,86 @@ export default function Check() {
     }
     setTesting(true);
     setEngineError(null);
+    setResult(null);
+    setMulti(null);
+    setSelected(null);
+    setRange(null);
     try {
-      const strategy = applyParamEdits(editable.strategy, edits);
+      const strategy = applyContextEdits(
+        applyParamEdits(editable.strategy, edits),
+        editable.context,
+        contextEdits,
+      );
       const now = Date.now();
-      const res = await postBacktest(buildCheckBacktestRequest(strategy, now));
-      setResult(res);
-      setRange({
-        start: Math.floor(now - 5 * 365 * 86_400_000),
-        end: Math.floor(now),
-      });
+      if (everyTimeframe) {
+        const settled = await Promise.allSettled(
+          MULTI_TIMEFRAMES.map(async (timeframe) => {
+            const fit = rangeFit(timeframe, now);
+            const response = await postBacktest(
+              buildTimeframeRequest(strategy, timeframe, now),
+            );
+            return { range: fit, response };
+          }),
+        );
+        setMulti({
+          strategy,
+          nowMs: now,
+          outcomes: multiTimeframeOutcomes(settled),
+        });
+      } else {
+        const request = buildCheckBacktestRequest(strategy, now);
+        const response = await postBacktest(request);
+        setResult(response);
+        setRange({ start: request.start_ms, end: request.end_ms });
+      }
     } catch (e) {
       setResult(null);
+      setMulti(null);
       setEngineError(e instanceof Error ? e.message : String(e));
     } finally {
       setTesting(false);
     }
-  }, [editable, edits, bad, unfilled]);
+  }, [editable, edits, contextEdits, everyTimeframe, bad, unfilled]);
+
+  const retryTimeframe = useCallback(
+    async (timeframe: MultiTimeframe): Promise<void> => {
+      if (multi === null) {
+        return;
+      }
+      setRetrying(timeframe);
+      const fit = rangeFit(timeframe, multi.nowMs);
+      const [settled] = await Promise.allSettled([
+        postBacktest(
+          buildTimeframeRequest(multi.strategy, timeframe, multi.nowMs),
+        ).then((response) => ({ range: fit, response })),
+      ]);
+      const outcome = timeframeOutcome(timeframe, settled);
+      setMulti((prev) =>
+        prev === null
+          ? prev
+          : {
+              ...prev,
+              outcomes: prev.outcomes.map((o) =>
+                o.timeframe === timeframe ? outcome : o,
+              ),
+            },
+      );
+      setRetrying(null);
+    },
+    [multi],
+  );
+
+  const rowStates = useMemo(
+    () => (multi === null ? [] : multiTimeframeRows(multi.outcomes)),
+    [multi],
+  );
+  const weak = useMemo(
+    () => weakEvidence(successfulRows(rowStates)),
+    [rowStates],
+  );
+
+  const claimed =
+    editable !== null && editable.claim.win_rate_pct !== null;
 
   return (
     <div className="flex max-w-4xl flex-col gap-6">
@@ -249,8 +385,13 @@ export default function Check() {
             onEdit={(path, raw) =>
               setOverrides((prev) => ({ ...prev, [path]: raw }))
             }
+            context={editable.context}
+            contextEdits={contextEdits}
+            onContextEdit={setContextEdit}
+            everyTimeframe={everyTimeframe}
+            onEveryTimeframeChange={setEveryTimeframe}
           />
-          {editable.claim.win_rate_pct !== null && (
+          {claimed && (
             <p className="text-sm text-[var(--muted)]">
               The video claims a {editable.claim.win_rate_pct}% win rate
               {editable.claim.quote ? (
@@ -297,12 +438,144 @@ export default function Check() {
         </div>
       )}
 
+      {multi !== null && editable !== null && !testing && (
+        <div className="flex flex-col gap-3">
+          <p className="text-sm">
+            Claimed win rate:{" "}
+            {editable.claim.win_rate_pct === null ? (
+              "none stated"
+            ) : (
+              <strong>{fmtPct(editable.claim.win_rate_pct)}</strong>
+            )}
+            {editable.claim.quote !== null && editable.claim.quote !== "" && (
+              <span className="text-[var(--muted)]">
+                {" "}
+                (“{editable.claim.quote}”)
+              </span>
+            )}
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr>
+                  {[
+                    "Timeframe",
+                    "Range used",
+                    "Trades (held back)",
+                    "Win rate (held back)",
+                    "Profit factor",
+                    "Avg result per trade",
+                    "Verdict",
+                  ].map((h) => (
+                    <th
+                      key={h}
+                      className="border border-[var(--border)] bg-[var(--surface)] p-2 text-left font-medium"
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rowStates.map((state) =>
+                  state.status === "ok" ? (
+                    <tr
+                      key={state.timeframe}
+                      onClick={() => openOutcome(state.timeframe)}
+                      className="cursor-pointer"
+                    >
+                      <td className="border border-[var(--border)] p-2">
+                        <button
+                          type="button"
+                          className="font-medium underline"
+                          onClick={() => openOutcome(state.timeframe)}
+                        >
+                          {state.timeframe}
+                        </button>
+                      </td>
+                      <td className="border border-[var(--border)] p-2">
+                        {fmtDate(state.row.rangeStart)} to{" "}
+                        {fmtDate(state.row.rangeEnd)}
+                      </td>
+                      <td className="border border-[var(--border)] p-2">
+                        {state.row.trades === null ? "—" : state.row.trades}
+                      </td>
+                      <td className="border border-[var(--border)] p-2">
+                        {state.row.winRatePct === null
+                          ? "—"
+                          : fmtPct(state.row.winRatePct)}
+                      </td>
+                      <td className="border border-[var(--border)] p-2">
+                        {state.row.profitFactor === null
+                          ? "—"
+                          : fmtNum(state.row.profitFactor)}
+                      </td>
+                      <td className="border border-[var(--border)] p-2">
+                        {state.row.expectancyPct === null
+                          ? "—"
+                          : fmtPct(state.row.expectancyPct)}
+                      </td>
+                      <td
+                        className="border border-[var(--border)] p-2 font-medium"
+                        style={{ color: gradeColorVar(state.row.grade) }}
+                      >
+                        {gradeLabel(state.row.grade)}
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={state.timeframe} className="align-top">
+                      <td className="border border-[var(--border)] p-2 font-medium">
+                        {state.timeframe}
+                      </td>
+                      <td
+                        colSpan={6}
+                        className="border border-[var(--border)] p-2"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[var(--verdict-fails)]">
+                            {state.error}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void retryTimeframe(state.timeframe)}
+                            disabled={retrying !== null}
+                            className="shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {retrying === state.timeframe
+                              ? "Trying…"
+                              : "Try again"}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ),
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[var(--muted)]">
+            {MULTI_TIMEFRAME_NOTE}
+          </p>
+          {weak !== null && (
+            <p className="text-sm text-[var(--verdict-fragile)]">{weak}</p>
+          )}
+        </div>
+      )}
+
       {result !== null && editable !== null && !testing && (
         <div className="flex flex-col gap-4">
+          {selected !== null && (
+            <p className="text-sm font-medium">
+              Timeframe {selected} full result
+            </p>
+          )}
           <p className="text-xs text-[var(--muted)]">
             Run {result.run_id === null ? "" : `#${result.run_id} · `}
-            {plural(result.candle_count, "candle")} · 5-year range, last 30%
-            held back
+            {plural(result.candle_count, "candle")} ·{" "}
+            {range === null
+              ? "range"
+              : `${fmtDate(range.start)} to ${fmtDate(range.end)}`}{" "}
+            · last 30% held back
           </p>
           <ClaimCard
             claim={editable.claim}

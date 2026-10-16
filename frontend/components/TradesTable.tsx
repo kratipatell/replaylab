@@ -29,6 +29,9 @@ export default function TradesTable({ trades }: { trades: Trade[] }) {
   }
   const visible = trades.slice(0, shown);
   const remaining = trades.length - visible.length;
+  const reasonsPresent = EXIT_REASONS.filter((r) =>
+    trades.some((t) => t.reason === r),
+  );
   return (
     <section aria-label="Trades" className="flex flex-col gap-2 overflow-x-auto">
       <p className="text-xs text-[var(--muted)]">All times in UTC.</p>
@@ -67,7 +70,7 @@ export default function TradesTable({ trades }: { trades: Trade[] }) {
         </tbody>
       </table>
       <p className="text-xs text-[var(--muted)]">
-        {EXIT_REASONS.map((r) => `${exitReasonLabel(r)}: ${exitReasonHelp(r)}`).join(" ")}
+        {reasonsPresent.map((r) => `${exitReasonLabel(r)}: ${exitReasonHelp(r)}`).join(" ")}
       </p>
       {remaining > 0 && (
         <button

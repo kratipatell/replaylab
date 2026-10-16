@@ -1,27 +1,70 @@
-// Each number in the extracted strategy with where it came from.
-// Stated values are read-only; assumed and missing values are editable.
+// Context rows and each number in the extracted strategy, with where each
+// came from. Stated values are read-only; assumed and missing values are editable.
 "use client";
 
-import { provenanceLabel, type CheckParameter } from "@/lib/check";
+import {
+  contextLabel,
+  provenanceLabel,
+  timeframeNotStated,
+  type CheckContext,
+  type CheckParameter,
+  type ContextEdits,
+} from "@/lib/check";
+import { ASSETS, TIMEFRAMES } from "@/lib/testlab";
 
 const inputClass =
   "rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm w-36";
+
+function optionsWith(current: string, known: readonly string[]): string[] {
+  return known.includes(current) ? [...known] : [current, ...known];
+}
 
 export default function CheckParamsTable({
   params,
   overrides,
   onEdit,
+  context,
+  contextEdits,
+  onContextEdit,
+  everyTimeframe,
+  onEveryTimeframeChange,
 }: {
   params: CheckParameter[];
   overrides: Record<string, string>;
   onEdit: (path: string, raw: string) => void;
+  context: CheckContext;
+  contextEdits: ContextEdits;
+  onContextEdit: (key: keyof ContextEdits, value: string) => void;
+  everyTimeframe: boolean;
+  onEveryTimeframeChange: (value: boolean) => void;
 }) {
+  const asset = contextEdits.asset ?? context.asset.value ?? "BTCUSDT";
+  const side = contextEdits.side ?? (context.side.value === "short" ? "short" : "long");
+  const timeframe = contextEdits.timeframe ?? context.timeframe.value ?? "1h";
+  const noTimeframe = timeframeNotStated(context);
+
+  const contextRows: {
+    key: keyof ContextEdits;
+    name: string;
+    field: CheckContext[keyof CheckContext];
+    overridden: boolean;
+  }[] = [
+    { key: "asset", name: "Asset", field: context.asset, overridden: contextEdits.asset !== undefined },
+    {
+      key: "timeframe",
+      name: "Timeframe",
+      field: context.timeframe,
+      overridden: contextEdits.timeframe !== undefined,
+    },
+    { key: "side", name: "Side", field: context.side, overridden: contextEdits.side !== undefined },
+  ];
+
   return (
     <div className="overflow-x-auto">
       <table className="w-full border-collapse text-sm">
         <thead>
           <tr>
-            {["Number", "Source", "Value"].map((h) => (
+            {["Parameter", "Source", "Value"].map((h) => (
               <th
                 key={h}
                 className="border border-[var(--border)] bg-[var(--surface)] p-2 text-left font-medium"
@@ -32,6 +75,77 @@ export default function CheckParamsTable({
           </tr>
         </thead>
         <tbody>
+          {contextRows.map((row) => (
+            <tr key={`context-${row.key}`}>
+              <td className="border border-[var(--border)] p-2 font-medium">{row.name}</td>
+              <td className="border border-[var(--border)] p-2">
+                <span className="rounded border border-[var(--border)] px-1.5 py-0.5 text-xs font-medium">
+                  {contextLabel(row.field.source, row.overridden)}
+                </span>
+                <br />
+                {row.field.source === "stated" && row.field.quote && (
+                  <span className="text-xs text-[var(--muted)]">“{row.field.quote}”</span>
+                )}
+                {row.field.source === "assumed" && row.field.reason && (
+                  <span className="text-xs text-[var(--muted)]">{row.field.reason}</span>
+                )}
+              </td>
+              <td className="border border-[var(--border)] p-2">
+                {row.key === "asset" && (
+                  <select
+                    className={inputClass}
+                    aria-label="Asset"
+                    value={asset}
+                    onChange={(e) => onContextEdit("asset", e.target.value)}
+                  >
+                    {optionsWith(asset, ASSETS).map((a) => (
+                      <option key={a} value={a}>
+                        {a}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {row.key === "side" && (
+                  <select
+                    className={inputClass}
+                    aria-label="Side"
+                    value={side}
+                    onChange={(e) => onContextEdit("side", e.target.value)}
+                  >
+                    <option value="long">long</option>
+                    <option value="short">short</option>
+                  </select>
+                )}
+                {row.key === "timeframe" &&
+                  (noTimeframe ? (
+                    <div className="flex flex-col gap-1">
+                      <span className="text-[var(--muted)]">Not stated in the video</span>
+                      <label className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={everyTimeframe}
+                          onChange={(e) => onEveryTimeframeChange(e.target.checked)}
+                        />
+                        Test on every timeframe
+                      </label>
+                    </div>
+                  ) : (
+                    <select
+                      className={inputClass}
+                      aria-label="Timeframe"
+                      value={timeframe}
+                      onChange={(e) => onContextEdit("timeframe", e.target.value)}
+                    >
+                      {optionsWith(timeframe, TIMEFRAMES).map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                  ))}
+              </td>
+            </tr>
+          ))}
           {params.map((p) => {
             const raw = overrides[p.path];
             const overridden = raw !== undefined;
@@ -49,14 +163,10 @@ export default function CheckParamsTable({
                   </span>
                   <br />
                   {p.source === "stated" && p.quote && (
-                    <span className="text-xs text-[var(--muted)]">
-                      “{p.quote}”
-                    </span>
+                    <span className="text-xs text-[var(--muted)]">“{p.quote}”</span>
                   )}
                   {p.source === "assumed" && p.reason && (
-                    <span className="text-xs text-[var(--muted)]">
-                      {p.reason}
-                    </span>
+                    <span className="text-xs text-[var(--muted)]">{p.reason}</span>
                   )}
                   {p.source === "missing" && !overridden && (
                     <span className="text-xs text-[var(--muted)]">

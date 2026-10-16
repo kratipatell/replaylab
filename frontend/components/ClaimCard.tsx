@@ -20,7 +20,7 @@ export default function ClaimCard({
     full.win_rate_pct,
   );
   const basis = outOfSample ?? full;
-  const basisLabel = outOfSample === null ? "full period" : "held-back data";
+  const basisLabel = outOfSample === null ? "Full period" : "Held-back data";
   return (
     <section
       aria-label="Claim versus reality"

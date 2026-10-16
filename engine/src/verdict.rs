@@ -2,6 +2,7 @@ use crate::stats::Stats;
 use serde::Serialize;
 
 pub const MIN_OOS_TRADES: usize = 30;
+pub const MIN_NOISE_TRADES: usize = 10;
 pub const PROFIT_FACTOR_MIN: f64 = 1.2;
 pub const RETENTION_RATIO: f64 = 0.5;
 pub const SMALL_SAMPLE_TOTAL: usize = 100;
@@ -38,6 +39,24 @@ fn summary_reason(oos: &Stats) -> String {
         oos.expectancy_pct,
         profit_factor_text(oos.profit_factor)
     )
+}
+
+// How far the average trade sits from zero, measured in standard errors.
+fn noise_reason(oos: &Stats) -> Option<String> {
+    if oos.trades < MIN_NOISE_TRADES {
+        return None;
+    }
+    let stderr = oos.expectancy_stdev_pct / (oos.trades as f64).sqrt();
+    let avg = oos.expectancy_pct;
+    if avg.abs() > 2.0 * stderr {
+        return Some(format!(
+            "The average of {avg:.2}% per trade is well outside normal noise."
+        ));
+    }
+    Some(format!(
+        "With {} trades, the average of {avg:.2}% per trade is within normal noise (about plus or minus {stderr:.2}%).",
+        oos.trades
+    ))
 }
 
 // Small samples can look profitable by chance, so flags stay advisory only.
@@ -87,6 +106,9 @@ fn holds(oos: &Stats, in_sample: &Stats) -> bool {
 pub fn assess(in_sample: &Stats, out_of_sample: &Stats) -> Verdict {
     let oos_trades = out_of_sample.trades;
     let mut reasons = vec![summary_reason(out_of_sample)];
+    if let Some(noise) = noise_reason(out_of_sample) {
+        reasons.push(noise);
+    }
     reasons.extend(flag_reasons(in_sample, out_of_sample));
     if oos_trades < MIN_OOS_TRADES {
         return Verdict {
@@ -159,6 +181,7 @@ mod tests {
             avg_loss_pct: 0.0,
             profit_factor,
             expectancy_pct,
+            expectancy_stdev_pct: 0.0,
             total_return_pct,
             buy_and_hold_pct,
             max_drawdown_pct,
@@ -307,5 +330,114 @@ mod tests {
         );
         let json = serde_json::to_value(&holds).expect("serialize");
         assert_eq!(json["grade"], "holds");
+    }
+
+    fn oos_with_noise(trades: usize, expectancy_pct: f64, expectancy_stdev_pct: f64) -> Stats {
+        Stats {
+            trades,
+            wins: 0,
+            losses: 0,
+            win_rate_pct: 0.0,
+            avg_win_pct: 0.0,
+            avg_loss_pct: 0.0,
+            profit_factor: Some(1.5),
+            expectancy_pct,
+            expectancy_stdev_pct,
+            total_return_pct: 5.0,
+            buy_and_hold_pct: 5.0,
+            max_drawdown_pct: 1.0,
+            sharpe: 0.0,
+        }
+    }
+
+    #[test]
+    fn noise_sentence_table() {
+        let cases: Vec<(&str, Stats, Option<&str>)> = vec![
+            (
+                "average within two standard errors",
+                oos_with_noise(100, 0.5, 4.0),
+                Some("within normal noise"),
+            ),
+            (
+                "average outside two standard errors",
+                oos_with_noise(100, 2.0, 4.0),
+                Some("well outside normal noise"),
+            ),
+            (
+                "fewer than ten trades has no sentence",
+                oos_with_noise(9, 5.0, 1.0),
+                None,
+            ),
+            (
+                "zero variance and zero average stays within",
+                oos_with_noise(100, 0.0, 0.0),
+                Some("within normal noise"),
+            ),
+            (
+                "zero variance constant gain is outside",
+                oos_with_noise(100, 1.0, 0.0),
+                Some("well outside normal noise"),
+            ),
+        ];
+        for (name, oos, want) in cases {
+            let v = assess(&neutral_is(), &oos);
+            let noise: Vec<&String> = v.reasons.iter().filter(|r| r.contains("noise")).collect();
+            match want {
+                None => assert!(noise.is_empty(), "case {name}: {:?}", v.reasons),
+                Some(text) => {
+                    assert_eq!(noise.len(), 1, "case {name}: {:?}", v.reasons);
+                    assert!(noise[0].contains(text), "case {name}: {}", noise[0]);
+                    assert!(!noise[0].contains("NaN"), "case {name}: {}", noise[0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn noise_sentence_matches_examples() {
+        let within = assess(&neutral_is(), &oos_with_noise(100, -0.05, 4.0));
+        assert!(within.reasons.iter().any(|r| r
+            == "With 100 trades, the average of -0.05% per trade is within normal noise (about plus or minus 0.40%)."));
+        let outside = assess(&neutral_is(), &oos_with_noise(100, -0.60, 2.0));
+        assert!(outside
+            .reasons
+            .iter()
+            .any(|r| r == "The average of -0.60% per trade is well outside normal noise."));
+    }
+
+    #[test]
+    fn noise_sentence_appears_before_a_verdict_exists() {
+        let v = assess(&neutral_is(), &oos_with_noise(12, 0.0, 1.0));
+        assert_eq!(v.grade, Grade::NotEnoughData);
+        assert!(
+            v.reasons.iter().any(|r| r.contains("within normal noise")),
+            "reasons: {:?}",
+            v.reasons
+        );
+    }
+
+    #[test]
+    fn noise_sentence_never_changes_grade() {
+        let quiet = assess(&neutral_is(), &oos_with_noise(60, 0.5, 10.0));
+        let loud = assess(&neutral_is(), &oos_with_noise(60, 0.5, 0.1));
+        assert_eq!(quiet.grade, Grade::Holds);
+        assert_eq!(loud.grade, Grade::Holds);
+        assert!(quiet
+            .reasons
+            .iter()
+            .any(|r| r.contains("within normal noise")));
+        assert!(loud
+            .reasons
+            .iter()
+            .any(|r| r.contains("well outside normal noise")));
+    }
+
+    #[test]
+    fn stats_serialise_expectancy_stdev_pct() {
+        let oos = oos_with_noise(100, 0.5, 4.0);
+        let json = serde_json::to_value(&oos).expect("serialize");
+        assert_eq!(json["expectancy_stdev_pct"].as_f64(), Some(4.0));
+        assert_eq!(json["expectancy_pct"].as_f64(), Some(0.5));
+        assert_eq!(json["trades"].as_u64(), Some(100));
     }
 }

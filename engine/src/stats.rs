@@ -12,6 +12,7 @@ pub struct Stats {
     pub avg_loss_pct: f64,
     pub profit_factor: Option<f64>,
     pub expectancy_pct: f64,
+    pub expectancy_stdev_pct: f64,
     pub total_return_pct: f64,
     pub buy_and_hold_pct: f64,
     pub max_drawdown_pct: f64,
@@ -131,6 +132,21 @@ pub fn compute_stats(result: &BacktestResult, candles: &[Candle], bars_per_year:
         result.trades.iter().map(|t| t.return_pct).sum::<f64>() / trades as f64
     };
 
+    let expectancy_stdev_pct = if trades == 0 {
+        0.0
+    } else {
+        let variance = result
+            .trades
+            .iter()
+            .map(|t| {
+                let d = t.return_pct - expectancy_pct;
+                d * d
+            })
+            .sum::<f64>()
+            / trades as f64;
+        variance.sqrt()
+    };
+
     let total_return_pct = if result.equity_curve.is_empty() {
         0.0
     } else {
@@ -189,6 +205,7 @@ pub fn compute_stats(result: &BacktestResult, candles: &[Candle], bars_per_year:
         avg_loss_pct,
         profit_factor,
         expectancy_pct,
+        expectancy_stdev_pct,
         total_return_pct,
         buy_and_hold_pct,
         max_drawdown_pct,
@@ -570,6 +587,23 @@ mod tests {
         assert_approx(stats.expectancy_pct, 2.666_666_666_666_666_5, 1e-9);
         let pf = stats.profit_factor.expect("profit_factor should be Some");
         assert_approx(pf, 5.0, 1e-12);
+    }
+
+    #[test]
+    fn expectancy_stdev_from_trade_returns() {
+        let result = BacktestResult {
+            trades: vec![mk_trade(2.0, 0), mk_trade(4.0, 1), mk_trade(6.0, 2)],
+            equity_curve: Vec::new(),
+        };
+        let stats = compute_stats(&result, &[], 252.0);
+        assert_approx(stats.expectancy_stdev_pct, (8.0_f64 / 3.0).sqrt(), 1e-12);
+
+        let empty = BacktestResult {
+            trades: Vec::new(),
+            equity_curve: Vec::new(),
+        };
+        let stats = compute_stats(&empty, &[], 252.0);
+        assert_approx(stats.expectancy_stdev_pct, 0.0, 1e-12);
     }
 
     #[test]

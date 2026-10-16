@@ -64,6 +64,7 @@ export interface Stats {
   avg_loss_pct: number;
   profit_factor: number | null;
   expectancy_pct: number;
+  expectancy_stdev_pct: number;
   total_return_pct: number;
   buy_and_hold_pct: number;
   max_drawdown_pct: number;
@@ -161,6 +162,17 @@ interface ErrorBody {
   error?: string;
 }
 
+// Carries the HTTP status so callers can tell a rate limit from a bad request.
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const body = (await res.json()) as ErrorBody;
@@ -184,7 +196,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
   if (!res.ok) {
-    throw new Error(await readError(res));
+    throw new ApiError(res.status, await readError(res));
   }
   return (await res.json()) as T;
 }
