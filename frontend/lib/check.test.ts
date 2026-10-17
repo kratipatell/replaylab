@@ -4,24 +4,36 @@ import {
   ASSET_OPTIONS,
   EVERY_TIMEFRAME_NOTE,
   type DailyHit,
+  CANCELLED_MESSAGE,
+  CHECK_CONCURRENCY,
+  CHECK_MAX_CANDLES,
+  DEFAULT_TIMEFRAME,
   MAX_CANDLES,
   MULTI_TIMEFRAMES,
+  MIN_OOS_TRADES,
   RATE_LIMIT_MESSAGE,
   SUPPORTED_ASSETS,
+  TIMEOUT_MESSAGE,
+  anyRunning,
   applyContextEdits,
+  applyOutcomeToRows,
   applyParamEdits,
   buildCheckBacktestRequest,
   buildSummary,
   buildTimeframeRequest,
+  cancelRows,
   canRunBacktest,
   checkContextSchema,
   checkParameterSchema,
+  checkRangeFit,
   checkRequestSchema,
   compareClaim,
+  completedRows,
   contextFieldSchema,
   errorMessage,
   forwardedIp,
   injectionNoRule,
+  isAbortError,
   listNumericPaths,
   missingParameters,
   modelOutputSchema,
@@ -31,17 +43,24 @@ import {
   provenanceLabel,
   providerErrorMessage,
   rangeFit,
+  runLimited,
+  runningRow,
+  showAssumedTimeframeSelect,
+  startRowStates,
   strategySchema,
   successfulRows,
   takeDailyHit,
+  timeframeCells,
   timeframeNotStated,
   timeframeOutcome,
   timeframeRows,
   weakEvidence,
   type CheckContext,
   type MultiTimeframe,
+  type TimeframeOutcome,
+  type TimeframeRow,
 } from "./check";
-import { ASSETS } from "./testlab";
+import { ASSETS, TIMEFRAMES } from "./testlab";
 import { ApiError, type BacktestResponse, type Grade, type Stats, type Strategy } from "./api";
 
 function rsiStrategy(): Strategy {
@@ -670,7 +689,7 @@ describe("range fit", () => {
     const req = buildTimeframeRequest(rsiStrategy(), "15m", now);
     expect(req.strategy.timeframe).toBe("15m");
     expect(req.split).toBeCloseTo(0.7);
-    const fit = rangeFit("15m", now);
+    const fit = checkRangeFit("15m", now);
     expect(req.start_ms).toBe(fit.startMs);
     expect(req.end_ms).toBe(fit.endMs);
   });
@@ -735,6 +754,52 @@ describe("multi-timeframe rows", () => {
     ]);
     expect(weakEvidence(several)).toBeNull();
     expect(weakEvidence(timeframeRows([run("1h", sampleStats(), "holds")]))).toBeNull();
+  });
+});
+
+describe("timeframe cells", () => {
+  function row(trades: number | null, grade: Grade = "fails"): TimeframeRow {
+    return {
+      timeframe: "1h",
+      rangeStart: 0,
+      rangeEnd: 1,
+      trades,
+      winRatePct: 61,
+      profitFactor: 1.4,
+      expectancyPct: 0.5,
+      grade,
+    };
+  }
+
+  it("uses the engine's minimum of thirty held-back trades", () => {
+    expect(MIN_OOS_TRADES).toBe(30);
+  });
+
+  it("dashes the figures and names the count below the minimum", () => {
+    const cells = timeframeCells(row(MIN_OOS_TRADES - 1));
+    expect(cells.winRatePct).toBeNull();
+    expect(cells.profitFactor).toBeNull();
+    expect(cells.expectancyPct).toBeNull();
+    expect(cells.verdictLabel).toBe(`Too few trades (${MIN_OOS_TRADES - 1})`);
+  });
+
+  it("shows the figures and the grade at the minimum", () => {
+    const cells = timeframeCells(row(MIN_OOS_TRADES));
+    expect(cells.winRatePct).toBe(61);
+    expect(cells.profitFactor).toBe(1.4);
+    expect(cells.expectancyPct).toBe(0.5);
+    expect(cells.verdictLabel).toBe("Fails");
+  });
+
+  it("keeps the grade label when there is no held-back sample", () => {
+    const cells = timeframeCells({
+      ...row(null, "not_enough_data"),
+      winRatePct: null,
+      profitFactor: null,
+      expectancyPct: null,
+    });
+    expect(cells.winRatePct).toBeNull();
+    expect(cells.verdictLabel).toBe("Not enough data");
   });
 });
 
@@ -856,5 +921,269 @@ describe("multi-timeframe partial failure", () => {
     expect(
       timeframeOutcome("4h", { status: "rejected", reason: new Error("nope") }),
     ).toEqual({ status: "failed", timeframe: "4h", error: "nope" });
+  });
+});
+
+describe("check range cap", () => {
+  const now = Date.UTC(2026, 9, 16);
+  const fiveYears = 5 * 365 * 86_400_000;
+
+  it("caps the shortest timeframe at 50,000 candles", () => {
+    const fit = checkRangeFit("15m", now);
+    expect(fit.candles).toBe(CHECK_MAX_CANDLES);
+    expect(fit.endMs - fit.startMs).toBe((CHECK_MAX_CANDLES - 1) * 15 * 60_000);
+    expect(fit.endMs).toBe(now);
+  });
+
+  it("uses five years when that fits under the cap", () => {
+    for (const timeframe of ["1h", "4h", "1d"]) {
+      const fit = checkRangeFit(timeframe, now);
+      expect(fit.endMs - fit.startMs).toBe(fiveYears);
+    }
+  });
+
+  it("never exceeds the cap for any offered timeframe", () => {
+    for (const timeframe of TIMEFRAMES) {
+      expect(checkRangeFit(timeframe, now).candles).toBeLessThanOrEqual(
+        CHECK_MAX_CANDLES,
+      );
+    }
+  });
+
+  it("leaves rangeFit on the engine's 100,000-candle limit", () => {
+    expect(rangeFit("15m", now).candles).toBe(MAX_CANDLES);
+    expect(rangeFit("15m", now).candles).toBeGreaterThan(CHECK_MAX_CANDLES);
+  });
+});
+
+describe("backtest error messages", () => {
+  it("maps a 408 to the slow-download sentence", () => {
+    expect(errorMessage(new ApiError(408, "backtest timed out after 60s"))).toBe(
+      TIMEOUT_MESSAGE,
+    );
+  });
+
+  it("maps an abort to the slow-download sentence", () => {
+    const aborted = Object.assign(new Error("aborted"), {
+      name: "AbortError",
+    });
+    expect(isAbortError(aborted)).toBe(true);
+    expect(errorMessage(aborted)).toBe(TIMEOUT_MESSAGE);
+  });
+
+  it("maps a 429 to the rate-limit sentence", () => {
+    expect(errorMessage(new ApiError(429, "slow down"))).toBe(
+      RATE_LIMIT_MESSAGE,
+    );
+  });
+
+  it("keeps the network-failure sentence", () => {
+    const offline = new Error(
+      "Could not reach the test engine at http://127.0.0.1:8080. Is it running?",
+    );
+    expect(errorMessage(offline)).toBe(offline.message);
+    expect(errorMessage(offline)).toContain("Could not reach the test engine");
+  });
+});
+
+describe("timeframe rows", () => {
+  const now = Date.UTC(2026, 9, 16);
+
+  function okOutcome(
+    timeframe: MultiTimeframe,
+    grade: Grade = "holds",
+  ): TimeframeOutcome {
+    return {
+      status: "ok",
+      timeframe,
+      range: checkRangeFit(timeframe, now),
+      response: {
+        run_id: null,
+        candle_count: 100,
+        gaps: [],
+        stats: sampleStats(),
+        metrics: {
+          sortino: 1,
+          calmar: 1,
+          max_win_streak: 2,
+          max_loss_streak: 1,
+          drawdown_periods: [],
+          monthly: {},
+          by_weekday: {},
+        },
+        in_sample: sampleStats(),
+        out_of_sample: sampleStats(),
+        verdict: { grade, headline: "test", reasons: [], oos_trades: 5 },
+        trades: [],
+        equity_curve: [1, 2, 3],
+      },
+    };
+  }
+
+  it("starts every timeframe running with its capped range", () => {
+    const states = startRowStates(now);
+    expect(states.map((s) => s.timeframe)).toEqual([...MULTI_TIMEFRAMES]);
+    expect(states.every((s) => s.status === "running")).toBe(true);
+    expect(states.every((s) => s.row === null && s.error === null)).toBe(true);
+    const short = states.find((s) => s.timeframe === "15m");
+    expect(short?.range.candles).toBe(CHECK_MAX_CANDLES);
+  });
+
+  it("replaces a running row with its result", () => {
+    const states = applyOutcomeToRows(startRowStates(now), okOutcome("1h"));
+    const one = states.find((s) => s.timeframe === "1h");
+    expect(one?.status).toBe("done");
+    expect(one?.row?.grade).toBe("holds");
+    expect(one?.error).toBeNull();
+  });
+
+  it("replaces a running row with its error", () => {
+    const states = applyOutcomeToRows(startRowStates(now), {
+      status: "failed",
+      timeframe: "4h",
+      error: TIMEOUT_MESSAGE,
+    });
+    const four = states.find((s) => s.timeframe === "4h");
+    expect(four?.status).toBe("failed");
+    expect(four?.error).toBe(TIMEOUT_MESSAGE);
+    expect(four?.row).toBeNull();
+  });
+
+  it("cancels only the rows still running", () => {
+    const done = applyOutcomeToRows(startRowStates(now), okOutcome("1d"));
+    const states = cancelRows(done);
+    expect(states.find((s) => s.timeframe === "1d")?.status).toBe("done");
+    const stopped = states.find((s) => s.timeframe === "15m");
+    expect(stopped?.status).toBe("cancelled");
+    expect(stopped?.error).toBe(CANCELLED_MESSAGE);
+  });
+
+  it("sends a failed row back to running for its retry", () => {
+    const failed = applyOutcomeToRows(startRowStates(now), {
+      status: "failed",
+      timeframe: "1h",
+      error: "down",
+    });
+    const states = runningRow(failed, "1h", now + 5000);
+    const one = states.find((s) => s.timeframe === "1h");
+    expect(one?.status).toBe("running");
+    expect(one?.error).toBeNull();
+    expect(one?.startedAt).toBe(now + 5000);
+  });
+
+  it("collects only finished rows for the verdict", () => {
+    let states = applyOutcomeToRows(startRowStates(now), okOutcome("1h"));
+    states = applyOutcomeToRows(states, {
+      status: "failed",
+      timeframe: "1d",
+      error: "down",
+    });
+    expect(completedRows(states).map((row) => row.timeframe)).toEqual(["1h"]);
+  });
+
+  it("clears the running flag after every row settles or is cancelled", () => {
+    let states = startRowStates(now);
+    expect(anyRunning(states)).toBe(true);
+    states = applyOutcomeToRows(states, okOutcome("15m"));
+    states = applyOutcomeToRows(states, okOutcome("1h"));
+    states = applyOutcomeToRows(states, {
+      status: "failed",
+      timeframe: "4h",
+      error: "down",
+    });
+    states = applyOutcomeToRows(states, okOutcome("1d"));
+    expect(anyRunning(states)).toBe(false);
+    expect(anyRunning(cancelRows(startRowStates(now)))).toBe(false);
+  });
+});
+
+describe("concurrency limiter", () => {
+  const flush = (): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("never runs more than the limit at once", async () => {
+    let active = 0;
+    let peak = 0;
+    const release: (() => void)[] = [];
+    const run = runLimited([1, 2, 3, 4], CHECK_CONCURRENCY, async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise<void>((resolve) => release.push(resolve));
+      active -= 1;
+    });
+    expect(active).toBe(CHECK_CONCURRENCY);
+    while (release.length > 0) {
+      release.shift()?.();
+      await flush();
+    }
+    await run.done;
+    expect(peak).toBe(CHECK_CONCURRENCY);
+    expect(peak).toBe(2);
+  });
+
+  it("keeps the queue moving after one times out", async () => {
+    const started: number[] = [];
+    const run = runLimited([1, 2, 3, 4], CHECK_CONCURRENCY, async (n) => {
+      started.push(n);
+      if (n === 1) {
+        throw new Error("timeout");
+      }
+    });
+    await run.done;
+    expect([...started].sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("stops launching on cancel and settles its done promise", async () => {
+    let started = 0;
+    const release: (() => void)[] = [];
+    const run = runLimited([1, 2, 3, 4], 1, async () => {
+      started += 1;
+      await new Promise<void>((resolve) => release.push(resolve));
+    });
+    expect(started).toBe(1);
+    run.cancel();
+    await run.done;
+    release.shift()?.();
+    await flush();
+    expect(started).toBe(1);
+  });
+});
+
+describe("unstated-timeframe select", () => {
+  const context: CheckContext = {
+    asset: { value: "BTCUSDT", source: "stated", quote: "on Bitcoin" },
+    timeframe: {
+      value: null,
+      source: "assumed",
+      reason: "the video never says which timeframe",
+    },
+    side: { value: "long", source: "assumed", reason: "default direction" },
+  };
+
+  it("appears only while every-timeframe is off", () => {
+    expect(showAssumedTimeframeSelect(context, false)).toBe(true);
+    expect(showAssumedTimeframeSelect(context, true)).toBe(false);
+  });
+
+  it("disappears when the video states a timeframe", () => {
+    const stated: CheckContext = {
+      ...context,
+      timeframe: { value: "1h", source: "stated", quote: "on the hourly" },
+    };
+    expect(showAssumedTimeframeSelect(stated, false)).toBe(false);
+  });
+
+  it("offers one hour as the default choice", () => {
+    expect(DEFAULT_TIMEFRAME).toBe("1h");
+    expect(TIMEFRAMES).toContain(DEFAULT_TIMEFRAME);
+  });
+
+  it("uses the chosen value and defaults to one hour", () => {
+    expect(
+      applyContextEdits(rsiStrategy(), context, { timeframe: "5m" }).timeframe,
+    ).toBe("5m");
+    expect(applyContextEdits(rsiStrategy(), context, {}).timeframe).toBe(
+      DEFAULT_TIMEFRAME,
+    );
   });
 });

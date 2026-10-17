@@ -190,6 +190,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${BASE_URL}${path}`, init);
   } catch (e) {
+    // An aborted request is ours to explain, not a network failure.
+    if (init?.signal?.aborted === true) {
+      throw e;
+    }
     const detail = e instanceof Error ? e.message : String(e);
     throw new Error(
       `Could not reach the test engine at ${BASE_URL}. Is it running? (${detail})`,
@@ -203,11 +207,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function postBacktest(
   body: BacktestRequest,
+  signal?: AbortSignal,
 ): Promise<BacktestResponse> {
   return request<BacktestResponse>("/backtest", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
 }
 

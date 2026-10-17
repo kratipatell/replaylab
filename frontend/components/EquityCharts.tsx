@@ -4,12 +4,14 @@
 import {
   MAX_CHART_POINTS,
   MONTH_NAMES,
+  type SeriesPoint,
   downsample,
   drawdownPct,
   fmtDate,
   fmtNum,
   fmtPct,
   groupMonthly,
+  seriesX,
 } from "@/lib/testlab";
 
 const W = 640;
@@ -19,15 +21,17 @@ const PAD_R = 12;
 const PAD_T = 30;
 const PAD_B = 44;
 
-function points(values: number[], min: number, max: number): string {
+// Plot path for points already carrying their original index, so irregular
+// spacing from downsampling still lands on the true time axis.
+function points(points: SeriesPoint[], total: number, min: number, max: number): string {
   const span = max - min || 1;
   const plotW = W - PAD_L - PAD_R;
   const plotH = H - PAD_T - PAD_B;
-  return values
-    .map((v, i) => {
-      const x = values.length === 1 ? PAD_L : (i / (values.length - 1)) * plotW + PAD_L;
-      const y = PAD_T + plotH - ((v - min) / span) * plotH;
-      return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  return points
+    .map((p, k) => {
+      const x = PAD_L + seriesX(p.i, total) * plotW;
+      const y = PAD_T + plotH - ((p.v - min) / span) * plotH;
+      return `${k === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
 }
@@ -36,7 +40,8 @@ function LineChart({
   title,
   sub,
   yLabel,
-  values,
+  points: pts,
+  total,
   split,
   splitMs,
   startMs,
@@ -47,7 +52,8 @@ function LineChart({
   title: string;
   sub: string;
   yLabel: string;
-  values: number[];
+  points: SeriesPoint[];
+  total: number;
   split: number | null;
   splitMs: number | null;
   startMs: number | null;
@@ -55,7 +61,7 @@ function LineChart({
   color: string;
   fill: boolean;
 }) {
-  if (values.length === 0) {
+  if (pts.length === 0) {
     return (
       <div className="flex flex-col gap-1">
         <p className="text-sm font-medium">{title}</p>
@@ -63,13 +69,14 @@ function LineChart({
       </div>
     );
   }
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const d = points(values, min, max);
+  const min = Math.min(...pts.map((p) => p.v));
+  const max = Math.max(...pts.map((p) => p.v));
+  const d = points(pts, total, min, max);
   const plotW = W - PAD_L - PAD_R;
   const plotH = H - PAD_T - PAD_B;
   const baseY = PAD_T + plotH;
-  const splitX = split === null ? null : PAD_L + split * plotW;
+  const splitX =
+    split === null ? null : PAD_L + seriesX(Math.round(split * (total - 1)), total) * plotW;
   const lastX = W - PAD_R;
   const area = `${d} L${lastX.toFixed(1)},${baseY.toFixed(1)} L${PAD_L.toFixed(1)},${baseY.toFixed(1)} Z`;
 
@@ -241,8 +248,9 @@ export default function EquityCharts({
   startMs: number | null;
   endMs: number | null;
 }) {
+  const total = equity.length;
   const curve = downsample(equity, MAX_CHART_POINTS);
-  const dd = drawdownPct(curve);
+  const dd = downsample(drawdownPct(equity), MAX_CHART_POINTS);
   const splitMs =
     split === null || startMs === null || endMs === null
       ? null
@@ -253,7 +261,8 @@ export default function EquityCharts({
         title="Account growth"
         sub="Test account value over time; the dashed line marks where held-back checking data starts."
         yLabel="account value, 1.00 = starting value"
-        values={curve}
+        points={curve}
+        total={total}
         split={split}
         splitMs={splitMs}
         startMs={startMs}
@@ -265,7 +274,8 @@ export default function EquityCharts({
         title="Losing stretches"
         sub="How far the account fell from its last peak, in percent."
         yLabel="percent below peak"
-        values={dd}
+        points={dd}
+        total={total}
         split={split}
         splitMs={splitMs}
         startMs={startMs}

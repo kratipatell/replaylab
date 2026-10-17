@@ -379,20 +379,59 @@ export function buildRequest(form: TestLabForm, nowMs: number): BacktestRequest 
   return body;
 }
 
-// Even stride, always keeping the last point so the curve ends on time.
-export function downsample(values: number[], max: number): number[] {
-  if (values.length <= max) {
-    return values;
+export interface SeriesPoint {
+  i: number;
+  v: number;
+}
+
+// X position of original index i in a series of the given length, as a
+// fraction of the plot width. Charts must use this, not the position within a
+// downsampled array, so irregularly spaced points stay on the true time axis.
+export function seriesX(i: number, length: number): number {
+  return length <= 1 ? 0 : i / (length - 1);
+}
+
+// Always keeps the first and last points, plus the low and high of each
+// interior bucket, so the drawn range and the axis labels still match the
+// series' true extremes even when a peak or trough falls between evenly
+// spaced points. Every point keeps its original index; output stays within
+// the max point budget.
+export function downsample(values: number[], max: number): SeriesPoint[] {
+  const n = values.length;
+  if (n <= max) {
+    return values.map((v, i) => ({ i, v }));
   }
-  const stride = Math.ceil(values.length / max);
-  const out: number[] = [];
-  for (let i = 0; i < values.length; i += stride) {
-    out.push(values[i]);
+  const first: SeriesPoint = { i: 0, v: values[0] };
+  if (max <= 2) {
+    return max === 2 ? [first, { i: n - 1, v: values[n - 1] }] : [first];
   }
-  const last = values[values.length - 1];
-  if (out[out.length - 1] !== last) {
-    out.push(last);
+  const out: SeriesPoint[] = [first];
+  const interior = n - 2;
+  const buckets = Math.floor((max - 2) / 2);
+  for (let b = 0; b < buckets; b += 1) {
+    const start = 1 + Math.floor((b * interior) / buckets);
+    const end = 1 + Math.floor(((b + 1) * interior) / buckets);
+    if (start >= end) {
+      continue;
+    }
+    let lo = start;
+    let hi = start;
+    for (let i = start + 1; i < end; i += 1) {
+      if (values[i] < values[lo]) {
+        lo = i;
+      }
+      if (values[i] > values[hi]) {
+        hi = i;
+      }
+    }
+    const a = Math.min(lo, hi);
+    const c = Math.max(lo, hi);
+    out.push({ i: a, v: values[a] });
+    if (c !== a) {
+      out.push({ i: c, v: values[c] });
+    }
   }
+  out.push({ i: n - 1, v: values[n - 1] });
   return out;
 }
 

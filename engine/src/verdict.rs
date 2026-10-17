@@ -59,6 +59,23 @@ fn noise_reason(oos: &Stats) -> Option<String> {
     ))
 }
 
+// The grade still comes from expectancy alone; only the headline softens when
+// the average trade is smaller than one standard error from zero.
+fn noise_headline(oos: &Stats) -> Option<&'static str> {
+    if oos.trades < MIN_NOISE_TRADES {
+        return None;
+    }
+    let stderr = oos.expectancy_stdev_pct / (oos.trades as f64).sqrt();
+    if oos.expectancy_pct.abs() >= stderr {
+        return None;
+    }
+    Some(if oos.expectancy_pct > 0.0 {
+        "No edge shown out-of-sample; the small average gain is within normal noise."
+    } else {
+        "No edge shown out-of-sample; the small average loss is within normal noise."
+    })
+}
+
 // Small samples can look profitable by chance, so flags stay advisory only.
 fn flag_reasons(in_sample: &Stats, oos: &Stats) -> Vec<String> {
     let mut out = Vec::new();
@@ -120,10 +137,13 @@ pub fn assess(in_sample: &Stats, out_of_sample: &Stats) -> Verdict {
             oos_trades,
         };
     }
+    let no_edge = noise_headline(out_of_sample);
     if out_of_sample.expectancy_pct <= 0.0 {
         return Verdict {
             grade: Grade::Fails,
-            headline: "Lost money out-of-sample on average per trade.".to_string(),
+            headline: no_edge
+                .unwrap_or("Lost money out-of-sample on average per trade.")
+                .to_string(),
             reasons,
             oos_trades,
         };
@@ -140,7 +160,9 @@ pub fn assess(in_sample: &Stats, out_of_sample: &Stats) -> Verdict {
     }
     Verdict {
         grade: Grade::Fragile,
-        headline: "Profitable out-of-sample but too weak or inconsistent to trust.".to_string(),
+        headline: no_edge
+            .unwrap_or("Profitable out-of-sample but too weak or inconsistent to trust.")
+            .to_string(),
         reasons,
         oos_trades,
     }
@@ -430,6 +452,66 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("well outside normal noise")));
+    }
+
+    #[test]
+    fn noise_headline_table() {
+        let cases: Vec<(&str, Stats, Grade, Option<&str>)> = vec![
+            (
+                "negative average within one standard error reads as noise",
+                oos_with_noise(60, -0.1, 4.0),
+                Grade::Fails,
+                Some("No edge shown out-of-sample; the small average loss is within normal noise."),
+            ),
+            (
+                "positive average within one standard error reads as noise",
+                oos_with_noise(60, 0.1, 4.0),
+                Grade::Fragile,
+                Some("No edge shown out-of-sample; the small average gain is within normal noise."),
+            ),
+            (
+                "average outside one standard error keeps the default headline",
+                oos_with_noise(60, -0.9, 4.0),
+                Grade::Fails,
+                None,
+            ),
+            (
+                "fewer than ten trades keeps the count headline",
+                oos_with_noise(9, -0.1, 4.0),
+                Grade::NotEnoughData,
+                None,
+            ),
+            (
+                "zero variance never reads as noise",
+                oos_with_noise(60, -0.5, 0.0),
+                Grade::Fails,
+                None,
+            ),
+        ];
+        for (name, oos, want_grade, want_headline) in cases {
+            let v = assess(&neutral_is(), &oos);
+            assert_eq!(v.grade, want_grade, "case: {name}");
+            match want_headline {
+                Some(text) => assert_eq!(v.headline, text, "case: {name}"),
+                None => assert!(
+                    !v.headline.contains("No edge shown out-of-sample"),
+                    "case {name}: {}",
+                    v.headline
+                ),
+            }
+            assert!(!v.reasons.is_empty(), "case: {name}");
+        }
+    }
+
+    #[test]
+    fn noise_headline_leaves_reasons_untouched() {
+        let v = assess(&neutral_is(), &oos_with_noise(60, -0.1, 4.0));
+        assert!(v.reasons.iter().any(|r| r.contains("within normal noise")));
+        assert!(v
+            .reasons
+            .iter()
+            .any(|r| r
+                == "Out-of-sample: 60 trades, expectancy -0.10% per trade, profit factor 1.50."));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 import { z } from "zod";
 import { ApiError } from "./api";
-import { ASSETS, type Asset } from "./testlab";
+import { ASSETS, gradeLabel, type Asset } from "./testlab";
 import type {
   BacktestRequest,
   BacktestResponse,
@@ -20,10 +20,20 @@ import type {
 
 export const MAX_CHECK_CHARS = 8000;
 export const CHECK_HOLD_BACK_SPLIT = 0.7;
+
+// The engine needs this many held-back trades before it gives a verdict.
+export const MIN_OOS_TRADES = 30;
 const CHECK_YEARS_MS = 5 * 365 * 86_400_000;
 
 export const MULTI_TIMEFRAMES = ["15m", "1h", "4h", "1d"] as const;
 export type MultiTimeframe = (typeof MULTI_TIMEFRAMES)[number];
+
+// Slowest downloads first so the long history starts while the fast ones run.
+export const CHECK_RUN_ORDER: readonly MultiTimeframe[] = ["1d", "4h", "1h", "15m"];
+export const CHECK_CONCURRENCY = 2;
+export const DEFAULT_TIMEFRAME = "1h";
+export const ASSUMED_TIMEFRAME_NOTE = "Not stated; you choose";
+export const BACKTEST_TIMEOUT_MS = 120_000;
 
 const TIMEFRAME_STEP_MS: Record<string, number> = {
   "1m": 60_000,
@@ -37,16 +47,19 @@ const DEFAULT_STEP_MS = 86_400_000;
 
 export const MAX_CANDLES = 100_000;
 
+// The check flow trades some depth for a quicker first run; rangeFit keeps the
+// engine's full limit for the other flows.
+export const CHECK_MAX_CANDLES = 50_000;
+
 export interface CandleRange {
   startMs: number;
   endMs: number;
   candles: number;
 }
 
-// Longest range ending now, up to five years, that stays under the candle cap.
-export function rangeFit(timeframe: string, nowMs: number): CandleRange {
+function fitRange(timeframe: string, nowMs: number, cap: number): CandleRange {
   const stepMs = TIMEFRAME_STEP_MS[timeframe] ?? DEFAULT_STEP_MS;
-  const maxSpan = (MAX_CANDLES - 1) * stepMs;
+  const maxSpan = (cap - 1) * stepMs;
   const span = Math.min(CHECK_YEARS_MS, maxSpan);
   const endMs = Math.floor(nowMs);
   const startMs = Math.floor(endMs - span);
@@ -54,10 +67,22 @@ export function rangeFit(timeframe: string, nowMs: number): CandleRange {
   return { startMs, endMs, candles };
 }
 
+// Longest range ending now, up to five years, that stays under the candle cap.
+export function rangeFit(timeframe: string, nowMs: number): CandleRange {
+  return fitRange(timeframe, nowMs, MAX_CANDLES);
+}
+
+export function checkRangeFit(timeframe: string, nowMs: number): CandleRange {
+  return fitRange(timeframe, nowMs, CHECK_MAX_CANDLES);
+}
+
 export const MULTI_TIMEFRAME_NOTE =
   "The video did not say which timeframe, so every one is shown, not only the best.";
 
 export const RATE_LIMIT_MESSAGE = "Too many requests; try again in a minute";
+
+export const TIMEOUT_MESSAGE =
+  "Downloading price history took too long. It keeps downloading in the background, so try again in a minute.";
 
 export const AI_BUSY_MESSAGE =
   "The AI service is busy; try again in a minute.";
@@ -511,7 +536,7 @@ export function applyContextEdits(
   const side: Side =
     rawSide === "short" || rawSide === "long" ? rawSide : strategy.side;
   const timeframe =
-    edits.timeframe ?? context.timeframe.value ?? strategy.timeframe;
+    edits.timeframe ?? context.timeframe.value ?? DEFAULT_TIMEFRAME;
   return { ...strategy, asset, side, timeframe };
 }
 
@@ -703,7 +728,7 @@ export function buildCheckBacktestRequest(
   nowMs: number,
 ): BacktestRequest {
   assertSupportedAsset(strategy.asset);
-  const range = rangeFit(strategy.timeframe, nowMs);
+  const range = checkRangeFit(strategy.timeframe, nowMs);
   return {
     strategy,
     start_ms: range.startMs,
@@ -718,7 +743,7 @@ export function buildTimeframeRequest(
   nowMs: number,
 ): BacktestRequest {
   assertSupportedAsset(strategy.asset);
-  const range = rangeFit(timeframe, nowMs);
+  const range = checkRangeFit(timeframe, nowMs);
   return {
     strategy: { ...strategy, timeframe },
     start_ms: range.startMs,
@@ -762,6 +787,32 @@ export function timeframeRows(runs: TimeframeRun[]): TimeframeRow[] {
   return runs.map(timeframeRow);
 }
 
+export interface TimeframeCells {
+  winRatePct: number | null;
+  profitFactor: number | null;
+  expectancyPct: number | null;
+  verdictLabel: string;
+}
+
+// Below the engine's minimum there is no verdict, so per-trade figures are
+// noise and the table shows dashes instead of them.
+export function timeframeCells(row: TimeframeRow): TimeframeCells {
+  if (row.trades !== null && row.trades < MIN_OOS_TRADES) {
+    return {
+      winRatePct: null,
+      profitFactor: null,
+      expectancyPct: null,
+      verdictLabel: `Too few trades (${row.trades})`,
+    };
+  }
+  return {
+    winRatePct: row.winRatePct,
+    profitFactor: row.profitFactor,
+    expectancyPct: row.expectancyPct,
+    verdictLabel: gradeLabel(row.grade),
+  };
+}
+
 export interface MultiTimeframeRun {
   timeframe: MultiTimeframe;
   range: CandleRange;
@@ -776,9 +827,23 @@ export type MultiTimeframeRow =
   | { status: "ok"; timeframe: MultiTimeframe; row: TimeframeRow }
   | { status: "failed"; timeframe: MultiTimeframe; error: string };
 
+export function isAbortError(e: unknown): boolean {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    (e as { name?: unknown }).name === "AbortError"
+  );
+}
+
 export function errorMessage(e: unknown): string {
   if (e instanceof ApiError && e.status === 429) {
     return RATE_LIMIT_MESSAGE;
+  }
+  if (e instanceof ApiError && e.status === 408) {
+    return TIMEOUT_MESSAGE;
+  }
+  if (isAbortError(e)) {
+    return TIMEOUT_MESSAGE;
   }
   return e instanceof Error ? e.message : String(e);
 }
@@ -837,6 +902,155 @@ export function multiTimeframeRows(
 // Only a timeframe that produced a result may count toward the verdict.
 export function successfulRows(rows: MultiTimeframeRow[]): TimeframeRow[] {
   return rows.flatMap((row) => (row.status === "ok" ? [row.row] : []));
+}
+
+export type RowStatus = "running" | "done" | "failed" | "cancelled";
+
+export const CANCELLED_MESSAGE = "Cancelled. Run the test again when you are ready.";
+
+export interface TimeframeRowState {
+  timeframe: MultiTimeframe;
+  status: RowStatus;
+  range: CandleRange;
+  row: TimeframeRow | null;
+  error: string | null;
+  startedAt: number;
+}
+
+export function startRowStates(nowMs: number): TimeframeRowState[] {
+  return MULTI_TIMEFRAMES.map((timeframe) => ({
+    timeframe,
+    status: "running",
+    range: checkRangeFit(timeframe, nowMs),
+    row: null,
+    error: null,
+    startedAt: nowMs,
+  }));
+}
+
+export function runningRow(
+  states: TimeframeRowState[],
+  timeframe: MultiTimeframe,
+  startedAt: number,
+): TimeframeRowState[] {
+  return states.map((state) =>
+    state.timeframe === timeframe
+      ? {
+          ...state,
+          status: "running",
+          row: null,
+          error: null,
+          startedAt,
+        }
+      : state,
+  );
+}
+
+export function applyOutcomeToRows(
+  states: TimeframeRowState[],
+  outcome: TimeframeOutcome,
+): TimeframeRowState[] {
+  return states.map((state) => {
+    if (state.timeframe !== outcome.timeframe) {
+      return state;
+    }
+    if (outcome.status === "failed") {
+      return { ...state, status: "failed", row: null, error: outcome.error };
+    }
+    return {
+      ...state,
+      status: "done",
+      error: null,
+      range: outcome.range,
+      row: timeframeRow({
+        timeframe: outcome.timeframe,
+        range: outcome.range,
+        outOfSample: outcome.response.out_of_sample,
+        grade: outcome.response.verdict.grade,
+      }),
+    };
+  });
+}
+
+export function cancelRows(states: TimeframeRowState[]): TimeframeRowState[] {
+  return states.map((state) =>
+    state.status === "running"
+      ? { ...state, status: "cancelled", row: null, error: CANCELLED_MESSAGE }
+      : state,
+  );
+}
+
+export function completedRows(states: TimeframeRowState[]): TimeframeRow[] {
+  return states.flatMap((state) => (state.row === null ? [] : [state.row]));
+}
+
+export function anyRunning(states: TimeframeRowState[]): boolean {
+  return states.some((state) => state.status === "running");
+}
+
+export interface LimiterRun {
+  done: Promise<void>;
+  cancel: () => void;
+}
+
+// Runs at most `limit` tasks at once, in order; a rejected task never blocks
+// the queue. `cancel` stops new launches and settles `done`.
+export function runLimited<T>(
+  items: readonly T[],
+  limit: number,
+  start: (item: T) => Promise<void>,
+): LimiterRun {
+  let next = 0;
+  let active = 0;
+  let cancelled = false;
+  let finish = (): void => {};
+  const done = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+
+  const pump = (): void => {
+    if (cancelled) {
+      return;
+    }
+    while (active < limit && next < items.length) {
+      const item = items[next];
+      next += 1;
+      active += 1;
+      let task: Promise<void>;
+      try {
+        task = start(item);
+      } catch {
+        task = Promise.resolve();
+      }
+      const step = (): void => {
+        active -= 1;
+        pump();
+      };
+      task.then(step, step);
+    }
+    if (next >= items.length && active === 0) {
+      finish();
+    }
+  };
+
+  pump();
+
+  return {
+    done,
+    cancel: () => {
+      cancelled = true;
+      finish();
+    },
+  };
+}
+
+// The video is silent on the timeframe and the user is not testing all of them,
+// so a single choice is needed.
+export function showAssumedTimeframeSelect(
+  context: CheckContext,
+  everyTimeframe: boolean,
+): boolean {
+  return timeframeNotStated(context) && !everyTimeframe;
 }
 
 // One pass out of several is the kind of luck that a wider search produces.

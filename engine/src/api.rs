@@ -23,8 +23,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::ratelimit::RateLimiter;
 
-const BACKTEST_TIMEOUT_SECS: u64 = 60;
-const BACKTEST_TIMEOUT: Duration = Duration::from_secs(BACKTEST_TIMEOUT_SECS);
+const DEFAULT_BACKTEST_TIMEOUT_SECS: u64 = 60;
 const BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
@@ -32,6 +31,7 @@ pub struct Limits {
     pub backtest: Arc<RateLimiter>,
     pub optimize: Arc<RateLimiter>,
     pub max_optimizer_jobs: usize,
+    pub backtest_timeout: Duration,
 }
 
 impl Limits {
@@ -40,7 +40,13 @@ impl Limits {
             backtest: Arc::new(RateLimiter::per_minute(backtest_per_min)),
             optimize: Arc::new(RateLimiter::per_minute(optimize_per_min)),
             max_optimizer_jobs,
+            backtest_timeout: Duration::from_secs(DEFAULT_BACKTEST_TIMEOUT_SECS),
         }
+    }
+
+    pub fn with_backtest_timeout(mut self, secs: u64) -> Self {
+        self.backtest_timeout = Duration::from_secs(secs);
+        self
     }
 }
 
@@ -539,8 +545,9 @@ async fn post_backtest(
     let source = state.source.clone();
     let cache_dir = state.cache_dir.clone();
     let strategy = req.strategy.clone();
+    let timeout = limits.backtest_timeout;
     let computed = tokio::time::timeout(
-        BACKTEST_TIMEOUT,
+        timeout,
         tokio::task::spawn_blocking(move || {
             run_backtest(&cache_dir, source.as_ref(), &strategy, &sim)
         }),
@@ -550,7 +557,7 @@ async fn post_backtest(
         Err(_) => {
             return err_json(
                 StatusCode::REQUEST_TIMEOUT,
-                format!("backtest timed out after {BACKTEST_TIMEOUT_SECS}s"),
+                format!("backtest timed out after {}s", timeout.as_secs()),
             )
             .into_response();
         }

@@ -12,6 +12,7 @@ pub struct Config {
     pub backtest_per_min: u32,
     pub optimize_per_min: u32,
     pub max_optimizer_jobs: usize,
+    pub backtest_timeout_secs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,12 @@ pub fn parse_origins(raw: &str) -> Result<Vec<HeaderValue>, String> {
 
 fn parse_or<T: std::str::FromStr>(raw: Option<String>, default: T) -> T {
     raw.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+fn parse_u64_in(raw: Option<String>, default: u64, min: u64, max: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| (min..=max).contains(v))
+        .unwrap_or(default)
 }
 
 impl Config {
@@ -63,6 +70,7 @@ impl Config {
             backtest_per_min: parse_or(get("BACKTEST_RATE_PER_MIN"), 30),
             optimize_per_min: parse_or(get("OPTIMIZE_RATE_PER_MIN"), 5),
             max_optimizer_jobs: parse_or(get("MAX_OPTIMIZER_JOBS"), 2),
+            backtest_timeout_secs: parse_u64_in(get("BACKTEST_TIMEOUT_SECS"), 60, 5, 600),
         })
     }
 }
@@ -144,6 +152,23 @@ mod tests {
     fn empty_origin_is_rejected() {
         let cfg = Config::from_lookup(lookup(&[("ALLOWED_ORIGINS", "http://ok.example,")]));
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn backtest_timeout_defaults_valid_and_out_of_range() {
+        let default = Config::from_lookup(|_| None).expect("defaults");
+        assert_eq!(default.backtest_timeout_secs, 60);
+
+        for (raw, expected) in [("5", 5), ("120", 120), ("600", 600)] {
+            let cfg = Config::from_lookup(lookup(&[("BACKTEST_TIMEOUT_SECS", raw)])).expect("set");
+            assert_eq!(cfg.backtest_timeout_secs, expected, "raw = {raw:?}");
+        }
+
+        for raw in ["4", "601", "abc", ""] {
+            let cfg =
+                Config::from_lookup(lookup(&[("BACKTEST_TIMEOUT_SECS", raw)])).expect("fallback");
+            assert_eq!(cfg.backtest_timeout_secs, 60, "raw = {raw:?}");
+        }
     }
 
     #[test]

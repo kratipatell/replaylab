@@ -54,7 +54,8 @@ async fn main() {
             cfg.backtest_per_min,
             cfg.optimize_per_min,
             cfg.max_optimizer_jobs,
-        ),
+        )
+        .with_backtest_timeout(cfg.backtest_timeout_secs),
     ) {
         Ok(router) => router,
         Err(e) => {

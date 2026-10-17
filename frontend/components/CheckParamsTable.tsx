@@ -5,10 +5,13 @@
 import {
   ASSET_NOT_RECOGNISED,
   ASSET_OPTIONS,
+  ASSUMED_TIMEFRAME_NOTE,
+  DEFAULT_TIMEFRAME,
   EVERY_TIMEFRAME_NOTE,
   contextLabel,
   normaliseAsset,
   provenanceLabel,
+  showAssumedTimeframeSelect,
   timeframeNotStated,
   type CheckContext,
   type CheckParameter,
@@ -47,8 +50,9 @@ export default function CheckParamsTable({
   const asset = normaliseAsset(assetText);
   const assetValue = asset ?? "";
   const side = contextEdits.side ?? (context.side.value === "short" ? "short" : "long");
-  const timeframe = contextEdits.timeframe ?? context.timeframe.value ?? "1h";
-  const noTimeframe = timeframeNotStated(context);
+  const timeframe = contextEdits.timeframe ?? context.timeframe.value ?? DEFAULT_TIMEFRAME;
+  const notStated = timeframeNotStated(context);
+  const showTimeframeSelect = showAssumedTimeframeSelect(context, everyTimeframe);
 
   const contextRows: {
     key: keyof ContextEdits;
@@ -92,7 +96,7 @@ export default function CheckParamsTable({
                     : contextLabel(row.field.source, row.overridden)}
                 </span>
                 <br />
-                {row.key === "timeframe" && noTimeframe ? (
+                {row.key === "timeframe" && notStated ? (
                   <span className="text-xs text-[var(--muted)]">
                     {everyTimeframe ? EVERY_TIMEFRAME_NOTE : row.field.reason}
                   </span>
@@ -137,9 +141,28 @@ export default function CheckParamsTable({
                   </select>
                 )}
                 {row.key === "timeframe" &&
-                  (noTimeframe ? (
+                  (notStated ? (
                     <div className="flex flex-col gap-1">
                       <span className="text-[var(--muted)]">Not stated in the video</span>
+                      {showTimeframeSelect && (
+                        <>
+                          <select
+                            className={inputClass}
+                            aria-label="Timeframe"
+                            value={timeframe}
+                            onChange={(e) => onContextEdit("timeframe", e.target.value)}
+                          >
+                            {TIMEFRAMES.map((t) => (
+                              <option key={t} value={t}>
+                                {t}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="text-xs text-[var(--muted)]">
+                            {ASSUMED_TIMEFRAME_NOTE}
+                          </span>
+                        </>
+                      )}
                       <label className="flex items-center gap-2 text-sm">
                         <input
                           type="checkbox"
