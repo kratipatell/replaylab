@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  AI_BUSY_MESSAGE,
+  ASSET_OPTIONS,
+  EVERY_TIMEFRAME_NOTE,
   type DailyHit,
   MAX_CANDLES,
   MULTI_TIMEFRAMES,
   RATE_LIMIT_MESSAGE,
+  SUPPORTED_ASSETS,
   applyContextEdits,
   applyParamEdits,
   buildCheckBacktestRequest,
@@ -23,7 +27,9 @@ import {
   modelOutputSchema,
   multiTimeframeOutcomes,
   multiTimeframeRows,
+  normaliseAsset,
   provenanceLabel,
+  providerErrorMessage,
   rangeFit,
   strategySchema,
   successfulRows,
@@ -32,8 +38,10 @@ import {
   timeframeOutcome,
   timeframeRows,
   weakEvidence,
+  type CheckContext,
   type MultiTimeframe,
 } from "./check";
+import { ASSETS } from "./testlab";
 import { ApiError, type BacktestResponse, type Grade, type Stats, type Strategy } from "./api";
 
 function rsiStrategy(): Strategy {
@@ -50,6 +58,21 @@ function rsiStrategy(): Strategy {
       any: [{ left: { ind: "rsi", period: 14 }, op: ">", right: 55 }],
     },
     stop_loss_pct: 2,
+  };
+}
+
+function contextFor(assetValue: string | null): CheckContext {
+  return {
+    asset:
+      assetValue === null
+        ? { value: null, source: "assumed", reason: "the video never says" }
+        : { value: assetValue, source: "stated", quote: assetValue },
+    timeframe: {
+      value: "1h",
+      source: "stated",
+      quote: "on the hourly",
+    },
+    side: { value: "long", source: "assumed", reason: "default direction" },
   };
 }
 
@@ -194,6 +217,128 @@ describe("buildSummary", () => {
     expect(buildSummary(rsiStrategy())).toBe(
       "Buy BTC when RSI(14) < 30. Sell when RSI(14) > 55. Stop 2%.",
     );
+  });
+
+  it("names the chart when the timeframe is known", () => {
+    expect(buildSummary(rsiStrategy(), { timeframe: "4h" })).toBe(
+      "Buy BTC when RSI(14) < 30 on the 4-hour chart. Sell when RSI(14) > 55. Stop 2%.",
+    );
+  });
+
+  it("says every timeframe when the box is checked", () => {
+    expect(buildSummary(rsiStrategy(), { everyTimeframe: true })).toContain(
+      "on every timeframe.",
+    );
+  });
+
+  it("says nothing about the chart when the timeframe is unknown", () => {
+    const summary = buildSummary(rsiStrategy());
+    expect(summary).not.toContain("chart");
+    expect(summary).not.toContain("every timeframe");
+  });
+});
+
+describe("asset normalisation", () => {
+  it("maps each video word or ticker the spec lists", () => {
+    const cases: [string, string][] = [
+      ["bitcoin", "BTCUSDT"],
+      ["btc", "BTCUSDT"],
+      ["btcusdt", "BTCUSDT"],
+      ["ethereum", "ETHUSDT"],
+      ["ether", "ETHUSDT"],
+      ["eth", "ETHUSDT"],
+      ["solana", "SOLUSDT"],
+      ["sol", "SOLUSDT"],
+      ["bnb", "BNBUSDT"],
+      ["ripple", "XRPUSDT"],
+      ["xrp", "XRPUSDT"],
+      ["dogecoin", "DOGEUSDT"],
+      ["doge", "DOGEUSDT"],
+      ["cardano", "ADAUSDT"],
+      ["ada", "ADAUSDT"],
+      ["avalanche", "AVAXUSDT"],
+      ["avax", "AVAXUSDT"],
+    ];
+    for (const [raw, symbol] of cases) {
+      expect(normaliseAsset(raw)).toBe(symbol);
+    }
+  });
+
+  it("ignores case, spacing and a USDT or USD suffix", () => {
+    for (const raw of ["Bitcoin", " BITCOIN ", "btc/usdt", "BTC-USD", "eth usd"]) {
+      expect(normaliseAsset(raw)).not.toBeNull();
+    }
+    for (const raw of ["Bitcoin", "BITCOIN", " btc ", "BTCUSD", "btc/usdt"]) {
+      expect(normaliseAsset(raw)).toBe("BTCUSDT");
+    }
+  });
+
+  it("returns null for text that names no supported coin", () => {
+    for (const raw of ["gold", "the market", "stocks", "  ", ""]) {
+      expect(normaliseAsset(raw)).toBeNull();
+    }
+  });
+
+  it("offers select options only from the supported list", () => {
+    expect(ASSET_OPTIONS.map((o) => o.value)).toEqual([...SUPPORTED_ASSETS]);
+    expect(ASSET_OPTIONS.map((o) => o.value)).toEqual([...ASSETS]);
+    for (const option of ASSET_OPTIONS) {
+      expect(option.label).toContain(option.value);
+      expect(normaliseAsset(option.value)).toBe(option.value);
+    }
+  });
+});
+
+describe("requests use only supported symbols", () => {
+  const now = Date.UTC(2026, 9, 16);
+
+  it("normalises the asset in both flows", () => {
+    for (const raw of ["Bitcoin", "btc/usdt", "solana", "XRPUSD", "BTCUSDT"]) {
+      const strategy = applyContextEdits(rsiStrategy(), contextFor(raw), {});
+      const single = buildCheckBacktestRequest(strategy, now);
+      expect(single.strategy.asset).toMatch(/^[A-Z0-9]{2,20}$/);
+      expect(SUPPORTED_ASSETS).toContain(single.strategy.asset);
+      for (const timeframe of MULTI_TIMEFRAMES) {
+        const multi = buildTimeframeRequest(strategy, timeframe, now);
+        expect(multi.strategy.asset).toMatch(/^[A-Z0-9]{2,20}$/);
+        expect(SUPPORTED_ASSETS).toContain(multi.strategy.asset);
+      }
+    }
+  });
+
+  it("refuses to build a request when the coin cannot be mapped", () => {
+    for (const raw of ["gold", "the market", ""]) {
+      const strategy = applyContextEdits(rsiStrategy(), contextFor(raw), {});
+      expect(normaliseAsset(strategy.asset)).toBeNull();
+      expect(() => buildCheckBacktestRequest(strategy, now)).toThrow();
+      expect(() => buildTimeframeRequest(strategy, "1h", now)).toThrow();
+    }
+  });
+
+  it("cannot build a request from a null asset", () => {
+    const nullAsset = { ...rsiStrategy(), asset: "" };
+    expect(() => buildCheckBacktestRequest(nullAsset, now)).toThrow();
+    expect(() => buildTimeframeRequest(nullAsset, "1h", now)).toThrow();
+  });
+});
+
+describe("ai provider message", () => {
+  it("maps 429 and 503 to one busy sentence", () => {
+    expect(providerErrorMessage(429, "Daily limit reached.")).toBe(
+      AI_BUSY_MESSAGE,
+    );
+    expect(providerErrorMessage(503, "quota")).toBe(AI_BUSY_MESSAGE);
+  });
+
+  it("keeps other provider messages", () => {
+    expect(providerErrorMessage(400, "bad input")).toBe("bad input");
+    expect(providerErrorMessage(502, "reader failed")).toBe("reader failed");
+  });
+});
+
+describe("every-timeframe note", () => {
+  it("says the timeframe was not stated and all are tested", () => {
+    expect(EVERY_TIMEFRAME_NOTE).toBe("Not stated; every timeframe is tested");
   });
 });
 

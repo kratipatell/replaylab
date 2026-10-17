@@ -4,6 +4,7 @@
 
 import { z } from "zod";
 import { ApiError } from "./api";
+import { ASSETS, type Asset } from "./testlab";
 import type {
   BacktestRequest,
   BacktestResponse,
@@ -57,6 +58,86 @@ export const MULTI_TIMEFRAME_NOTE =
   "The video did not say which timeframe, so every one is shown, not only the best.";
 
 export const RATE_LIMIT_MESSAGE = "Too many requests; try again in a minute";
+
+export const AI_BUSY_MESSAGE =
+  "The AI service is busy; try again in a minute.";
+
+// Provider overload or quota both mean the same thing on the page.
+export function providerErrorMessage(status: number, message: string): string {
+  if (status === 429 || status === 503) {
+    return AI_BUSY_MESSAGE;
+  }
+  return message;
+}
+
+export const SUPPORTED_ASSETS: readonly Asset[] = ASSETS;
+
+export const ASSET_LABELS: Record<Asset, string> = {
+  BTCUSDT: "Bitcoin (BTCUSDT)",
+  ETHUSDT: "Ethereum (ETHUSDT)",
+  SOLUSDT: "Solana (SOLUSDT)",
+  BNBUSDT: "BNB (BNBUSDT)",
+  XRPUSDT: "XRP (XRPUSDT)",
+  DOGEUSDT: "Dogecoin (DOGEUSDT)",
+  ADAUSDT: "Cardano (ADAUSDT)",
+  AVAXUSDT: "Avalanche (AVAXUSDT)",
+};
+
+export interface AssetOption {
+  value: Asset;
+  label: string;
+}
+
+export const ASSET_OPTIONS: readonly AssetOption[] = ASSETS.map((value) => ({
+  value,
+  label: ASSET_LABELS[value],
+}));
+
+export const ASSET_NOT_RECOGNISED = "Not recognised in the video";
+
+export const SUPPORTED_ASSETS_NOTE = `Supported coins: ${ASSET_OPTIONS.map(
+  (o) => o.label,
+).join(", ")}.`;
+
+export const EVERY_TIMEFRAME_NOTE = "Not stated; every timeframe is tested";
+
+export function isSupportedAsset(symbol: string): symbol is Asset {
+  return (ASSETS as readonly string[]).includes(symbol);
+}
+
+const ASSET_ALIASES: Record<string, Asset> = {
+  bitcoin: "BTCUSDT",
+  btc: "BTCUSDT",
+  ethereum: "ETHUSDT",
+  ether: "ETHUSDT",
+  eth: "ETHUSDT",
+  solana: "SOLUSDT",
+  sol: "SOLUSDT",
+  bnb: "BNBUSDT",
+  ripple: "XRPUSDT",
+  xrp: "XRPUSDT",
+  dogecoin: "DOGEUSDT",
+  doge: "DOGEUSDT",
+  cardano: "ADAUSDT",
+  ada: "ADAUSDT",
+  avalanche: "AVAXUSDT",
+  avax: "AVAXUSDT",
+};
+
+// Free-text asset from the model to a supported symbol, or null when nothing
+// matches. Case, separators and a USDT/USD quote suffix are all ignored.
+export function normaliseAsset(raw: string): Asset | null {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s/_-]/g, "")
+    .replace(/usdt$/, "")
+    .replace(/usd$/, "");
+  if (cleaned === "") {
+    return null;
+  }
+  return ASSET_ALIASES[cleaned] ?? null;
+}
 
 const COUNT_WORDS = [
   "zero",
@@ -322,10 +403,36 @@ function displayAsset(asset: string): string {
   return asset.endsWith("USDT") ? asset.slice(0, -4) : asset;
 }
 
-export function buildSummary(strategy: Strategy): string {
+const TIMEFRAME_WORDS: Record<string, string> = {
+  "1m": "1-minute",
+  "5m": "5-minute",
+  "15m": "15-minute",
+  "1h": "1-hour",
+  "4h": "4-hour",
+  "1d": "daily",
+};
+
+export function timeframeLabel(timeframe: string): string {
+  return TIMEFRAME_WORDS[timeframe] ?? timeframe;
+}
+
+export interface SummaryOptions {
+  timeframe?: string | null;
+  everyTimeframe?: boolean;
+}
+
+export function buildSummary(
+  strategy: Strategy,
+  options: SummaryOptions = {},
+): string {
   const coin = displayAsset(strategy.asset);
   const entrySide = strategy.side === "long" ? "Buy" : "Sell";
-  const entry = `${entrySide} ${coin} when ${rulesText(strategy.entry)}.`;
+  const scope = options.everyTimeframe
+    ? " on every timeframe"
+    : options.timeframe != null
+      ? ` on the ${timeframeLabel(options.timeframe)} chart`
+      : "";
+  const entry = `${entrySide} ${coin} when ${rulesText(strategy.entry)}${scope}.`;
   const exitRules = strategy.exit;
   const hasExit =
     exitRules !== undefined &&
@@ -398,7 +505,8 @@ export function applyContextEdits(
   context: CheckContext,
   edits: ContextEdits,
 ): Strategy {
-  const asset = edits.asset ?? context.asset.value ?? strategy.asset;
+  const rawAsset = edits.asset ?? context.asset.value ?? strategy.asset;
+  const asset = normaliseAsset(rawAsset) ?? rawAsset;
   const rawSide = edits.side ?? context.side.value;
   const side: Side =
     rawSide === "short" || rawSide === "long" ? rawSide : strategy.side;
@@ -584,10 +692,17 @@ export function applyParamEdits(
   return next;
 }
 
+function assertSupportedAsset(asset: string): void {
+  if (!isSupportedAsset(asset)) {
+    throw new Error(`Unsupported symbol: ${asset}`);
+  }
+}
+
 export function buildCheckBacktestRequest(
   strategy: Strategy,
   nowMs: number,
 ): BacktestRequest {
+  assertSupportedAsset(strategy.asset);
   const range = rangeFit(strategy.timeframe, nowMs);
   return {
     strategy,
@@ -602,6 +717,7 @@ export function buildTimeframeRequest(
   timeframe: MultiTimeframe,
   nowMs: number,
 ): BacktestRequest {
+  assertSupportedAsset(strategy.asset);
   const range = rangeFit(timeframe, nowMs);
   return {
     strategy: { ...strategy, timeframe },

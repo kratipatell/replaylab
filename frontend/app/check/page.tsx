@@ -10,6 +10,7 @@ import {
 import {
   MULTI_TIMEFRAMES,
   MULTI_TIMEFRAME_NOTE,
+  SUPPORTED_ASSETS_NOTE,
   applyContextEdits,
   applyParamEdits,
   buildCheckBacktestRequest,
@@ -18,6 +19,8 @@ import {
   missingParameters,
   multiTimeframeOutcomes,
   multiTimeframeRows,
+  normaliseAsset,
+  providerErrorMessage,
   rangeFit,
   successfulRows,
   timeframeNotStated,
@@ -89,7 +92,7 @@ async function postExtract(text: string): Promise<ExtractResult> {
       body.status === "error" && body.message !== ""
         ? body.message
         : `Reader failed with status ${res.status}`;
-    throw new Error(message);
+    throw new Error(providerErrorMessage(res.status, message));
   }
   return body as ExtractResult;
 }
@@ -162,6 +165,13 @@ export default function Check() {
 
   const editable =
     extract !== null && extract.status !== "no_rule_found" ? extract : null;
+  const assetText =
+    editable === null
+      ? ""
+      : (contextEdits.asset ??
+        editable.context.asset.value ??
+        editable.strategy.asset);
+  const asset = editable === null ? null : normaliseAsset(assetText);
   const { edits, bad } = useMemo(() => numericEdits(overrides), [overrides]);
   const unfilled = useMemo(
     () =>
@@ -173,7 +183,11 @@ export default function Check() {
     [editable, edits],
   );
   const canRun =
-    editable !== null && !reading && !testing && unfilled.length === 0;
+    editable !== null &&
+    asset !== null &&
+    !reading &&
+    !testing &&
+    unfilled.length === 0;
 
   const setContextEdit = useCallback(
     (key: keyof ContextEdits, value: string) => {
@@ -182,8 +196,19 @@ export default function Check() {
     [],
   );
 
+  const timeframeKnown =
+    editable !== null &&
+    (contextEdits.timeframe !== undefined ||
+      editable.context.timeframe.value !== null);
+
   let summary: string | null = null;
   if (editable !== null) {
+    const options = {
+      timeframe: timeframeKnown
+        ? (contextEdits.timeframe ?? editable.context.timeframe.value)
+        : null,
+      everyTimeframe,
+    };
     try {
       summary = buildSummary(
         applyContextEdits(
@@ -191,9 +216,10 @@ export default function Check() {
           editable.context,
           contextEdits,
         ),
+        options,
       );
     } catch {
-      summary = buildSummary(editable.strategy);
+      summary = buildSummary(editable.strategy, options);
     }
   }
 
@@ -214,7 +240,12 @@ export default function Check() {
   );
 
   const runTest = useCallback(async (): Promise<void> => {
-    if (editable === null || bad.length > 0 || unfilled.length > 0) {
+    if (
+      editable === null ||
+      asset === null ||
+      bad.length > 0 ||
+      unfilled.length > 0
+    ) {
       return;
     }
     setTesting(true);
@@ -258,7 +289,7 @@ export default function Check() {
     } finally {
       setTesting(false);
     }
-  }, [editable, edits, contextEdits, everyTimeframe, bad, unfilled]);
+  }, [editable, asset, edits, contextEdits, everyTimeframe, bad, unfilled]);
 
   const retryTimeframe = useCallback(
     async (timeframe: MultiTimeframe): Promise<void> => {
@@ -379,6 +410,11 @@ export default function Check() {
               {summary}
             </p>
           )}
+          {asset === null && (
+            <p className="text-sm text-[var(--verdict-fails)]">
+              This video&apos;s coin is not one we test. {SUPPORTED_ASSETS_NOTE}
+            </p>
+          )}
           <CheckParamsTable
             params={editable.parameters}
             overrides={overrides}
@@ -390,6 +426,7 @@ export default function Check() {
             onContextEdit={setContextEdit}
             everyTimeframe={everyTimeframe}
             onEveryTimeframeChange={setEveryTimeframe}
+            assetText={assetText}
           />
           {claimed && (
             <p className="text-sm text-[var(--muted)]">

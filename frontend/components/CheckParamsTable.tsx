@@ -3,14 +3,18 @@
 "use client";
 
 import {
+  ASSET_NOT_RECOGNISED,
+  ASSET_OPTIONS,
+  EVERY_TIMEFRAME_NOTE,
   contextLabel,
+  normaliseAsset,
   provenanceLabel,
   timeframeNotStated,
   type CheckContext,
   type CheckParameter,
   type ContextEdits,
 } from "@/lib/check";
-import { ASSETS, TIMEFRAMES } from "@/lib/testlab";
+import { TIMEFRAMES } from "@/lib/testlab";
 
 const inputClass =
   "rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm w-36";
@@ -28,6 +32,7 @@ export default function CheckParamsTable({
   onContextEdit,
   everyTimeframe,
   onEveryTimeframeChange,
+  assetText,
 }: {
   params: CheckParameter[];
   overrides: Record<string, string>;
@@ -37,8 +42,10 @@ export default function CheckParamsTable({
   onContextEdit: (key: keyof ContextEdits, value: string) => void;
   everyTimeframe: boolean;
   onEveryTimeframeChange: (value: boolean) => void;
+  assetText: string;
 }) {
-  const asset = contextEdits.asset ?? context.asset.value ?? "BTCUSDT";
+  const asset = normaliseAsset(assetText);
+  const assetValue = asset ?? "";
   const side = contextEdits.side ?? (context.side.value === "short" ? "short" : "long");
   const timeframe = contextEdits.timeframe ?? context.timeframe.value ?? "1h";
   const noTimeframe = timeframeNotStated(context);
@@ -80,14 +87,24 @@ export default function CheckParamsTable({
               <td className="border border-[var(--border)] p-2 font-medium">{row.name}</td>
               <td className="border border-[var(--border)] p-2">
                 <span className="rounded border border-[var(--border)] px-1.5 py-0.5 text-xs font-medium">
-                  {contextLabel(row.field.source, row.overridden)}
+                  {row.key === "asset" && asset === null
+                    ? ASSET_NOT_RECOGNISED
+                    : contextLabel(row.field.source, row.overridden)}
                 </span>
                 <br />
-                {row.field.source === "stated" && row.field.quote && (
-                  <span className="text-xs text-[var(--muted)]">“{row.field.quote}”</span>
-                )}
-                {row.field.source === "assumed" && row.field.reason && (
-                  <span className="text-xs text-[var(--muted)]">{row.field.reason}</span>
+                {row.key === "timeframe" && noTimeframe ? (
+                  <span className="text-xs text-[var(--muted)]">
+                    {everyTimeframe ? EVERY_TIMEFRAME_NOTE : row.field.reason}
+                  </span>
+                ) : (
+                  <>
+                    {row.field.source === "stated" && row.field.quote && (
+                      <span className="text-xs text-[var(--muted)]">“{row.field.quote}”</span>
+                    )}
+                    {row.field.source === "assumed" && row.field.reason && (
+                      <span className="text-xs text-[var(--muted)]">{row.field.reason}</span>
+                    )}
+                  </>
                 )}
               </td>
               <td className="border border-[var(--border)] p-2">
@@ -95,12 +112,15 @@ export default function CheckParamsTable({
                   <select
                     className={inputClass}
                     aria-label="Asset"
-                    value={asset}
+                    value={assetValue}
                     onChange={(e) => onContextEdit("asset", e.target.value)}
                   >
-                    {optionsWith(asset, ASSETS).map((a) => (
-                      <option key={a} value={a}>
-                        {a}
+                    <option value="" disabled>
+                      Pick a coin
+                    </option>
+                    {ASSET_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
                       </option>
                     ))}
                   </select>
