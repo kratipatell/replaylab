@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_CANDLES,
   MAX_CHART_POINTS,
+  PARTIAL_LOAD_NOTE,
   type SeriesPoint,
   downsample,
   drawdownPct,
+  estimateCandles,
+  formToStrategy,
+  formatLoadNote,
   seriesX,
+  strategyToForm,
 } from "./testlab";
+import type { Strategy } from "./api";
 
 function maxDrawdown(values: number[]): number {
   return Math.max(...drawdownPct(values));
@@ -93,5 +100,142 @@ describe("seriesX", () => {
     const slot = out.findIndex((p) => p.i === splitIndex);
     expect(slot).not.toBe(splitIndex);
     expect(seriesX(splitIndex, length)).toBe(splitIndex / (length - 1));
+  });
+});
+
+function roundTrip(strategy: Strategy): Strategy {
+  return formToStrategy(strategyToForm(strategy).form);
+}
+
+describe("strategy to form mapping", () => {
+  it("round-trips a long entry with a number operand and a stop", () => {
+    const strategy: Strategy = {
+      asset: "BTCUSDT",
+      timeframe: "1h",
+      side: "long",
+      entry: {
+        all: [{ left: { ind: "rsi", period: 14 }, op: "<", right: 30 }],
+        any: [],
+      },
+      stop_loss_pct: 2,
+    };
+    const { form, notes } = strategyToForm(strategy);
+    expect(notes).toEqual([]);
+    expect(form.preset).toBe("5y");
+    expect(form.asset).toBe("BTCUSDT");
+    expect(form.timeframe).toBe("1h");
+    expect(form.side).toBe("long");
+    expect(form.stopLoss).toBe("2");
+    expect(form.takeProfit).toBe("");
+    expect(roundTrip(strategy)).toEqual(strategy);
+  });
+
+  it("round-trips a short idea with any rules and both stop and target", () => {
+    const strategy: Strategy = {
+      asset: "ETHUSDT",
+      timeframe: "4h",
+      side: "short",
+      entry: {
+        all: [],
+        any: [{ left: { ind: "close" }, op: "crosses_below", right: { ind: "sma", period: 50 } }],
+      },
+      exit: {
+        all: [{ left: { ind: "rsi", period: 14 }, op: ">", right: 55 }],
+        any: [],
+      },
+      stop_loss_pct: 3,
+      take_profit_pct: 6.5,
+    };
+    expect(strategyToForm(strategy).notes).toEqual([]);
+    expect(roundTrip(strategy)).toEqual(strategy);
+  });
+
+  it("covers every operator, indicator and operand kind", () => {
+    const strategy: Strategy = {
+      asset: "SOLUSDT",
+      timeframe: "1d",
+      side: "long",
+      entry: {
+        all: [
+          { left: { ind: "close" }, op: "crosses_above", right: { ind: "sma", period: 50 } },
+          { left: { ind: "rsi", period: 14 }, op: "<", right: 30 },
+          { left: { ind: "open" }, op: ">", right: 10 },
+        ],
+        any: [
+          { left: { ind: "ema", period: 9 }, op: ">", right: { ind: "ema", period: 21 } },
+          { left: { ind: "high" }, op: "crosses_below", right: 100 },
+        ],
+      },
+      exit: {
+        all: [{ left: { ind: "rsi", period: 14 }, op: ">", right: 55 }],
+        any: [{ left: { ind: "low" }, op: "<", right: { ind: "sma", period: 200 } }],
+      },
+      stop_loss_pct: 2,
+      take_profit_pct: 4,
+    };
+    expect(strategyToForm(strategy).notes).toEqual([]);
+    expect(roundTrip(strategy)).toEqual(strategy);
+  });
+
+  it("drops an unshowable left number and reports it", () => {
+    const strategy: Strategy = {
+      asset: "BTCUSDT",
+      timeframe: "1h",
+      side: "long",
+      entry: {
+        all: [{ left: 30, op: "<", right: { ind: "close" } }],
+        any: [],
+      },
+    };
+    const { form, notes } = strategyToForm(strategy);
+    expect(form.entry.all).toHaveLength(0);
+    expect(notes).toHaveLength(1);
+    const note = formatLoadNote(notes);
+    expect(note).not.toBeNull();
+    expect(note).toContain(PARTIAL_LOAD_NOTE);
+    expect(note).toContain("plain number on the left");
+  });
+
+  it("notes an unsupported coin and bar size, keeping a usable form", () => {
+    const { form, notes } = strategyToForm({
+      asset: "FOOUSDT",
+      timeframe: "2h",
+      side: "long",
+      entry: {
+        all: [{ left: { ind: "close" }, op: ">", right: 100 }],
+        any: [],
+      },
+    });
+    expect(notes).toHaveLength(2);
+    expect(form.asset).toBe("BTCUSDT");
+    expect(form.timeframe).toBe("1h");
+  });
+
+  it("has no note when everything maps", () => {
+    const { notes } = strategyToForm({
+      asset: "BTCUSDT",
+      timeframe: "1h",
+      side: "long",
+      entry: {
+        all: [{ left: { ind: "close" }, op: ">", right: 100 }],
+        any: [],
+      },
+    });
+    expect(formatLoadNote(notes)).toBeNull();
+  });
+
+  it("picks a range that fits the candle cap for a 15m idea", () => {
+    const { form } = strategyToForm({
+      asset: "BTCUSDT",
+      timeframe: "15m",
+      side: "long",
+      entry: {
+        all: [{ left: { ind: "close" }, op: ">", right: 100 }],
+        any: [],
+      },
+    });
+    expect(form.timeframe).toBe("15m");
+    expect(form.preset).toBe("1y");
+    expect(estimateCandles(form)).toBeLessThanOrEqual(MAX_CANDLES);
   });
 });

@@ -11,6 +11,7 @@ import type {
   Op,
   Rules,
   Side,
+  Strategy,
 } from "./api";
 
 export const ASSETS = [
@@ -377,6 +378,151 @@ export function buildRequest(form: TestLabForm, nowMs: number): BacktestRequest 
     body.strategy.take_profit_pct = Number(form.takeProfit);
   }
   return body;
+}
+
+export const PARTIAL_LOAD_NOTE = "Part of this idea could not be loaded:";
+
+export function formatLoadNote(notes: string[]): string | null {
+  if (notes.length === 0) {
+    return null;
+  }
+  return `${PARTIAL_LOAD_NOTE} ${notes.join("; ")}.`;
+}
+
+export interface FormMapping {
+  form: TestLabForm;
+  notes: string[];
+}
+
+function operandToState(o: Operand): RuleOperandState {
+  if (typeof o === "number") {
+    return { mode: "number", num: String(o), ind: "close", period: "" };
+  }
+  return {
+    mode: "indicator",
+    num: "",
+    ind: o.ind,
+    period: o.period === undefined ? "" : String(o.period),
+  };
+}
+
+// A plain number on the left cannot be shown: the builder's left side is
+// always a price line. Everything else round-trips.
+function ruleFromCondition(c: Condition, where: string, notes: string[]): RuleState | null {
+  if (typeof c.left === "number") {
+    notes.push(`${where}: a plain number on the left side cannot be shown`);
+    return null;
+  }
+  return {
+    ...createRule(),
+    left: operandToState(c.left),
+    op: c.op,
+    right: operandToState(c.right),
+  };
+}
+
+function groupFromRules(
+  rules: Rules | null | undefined,
+  section: string,
+  notes: string[],
+): RuleGroupState {
+  const group: RuleGroupState = { all: [], any: [] };
+  if (!rules) {
+    return group;
+  }
+  for (const list of ["all", "any"] as const) {
+    rules[list].forEach((c, i) => {
+      const rule = ruleFromCondition(
+        c,
+        `${section} ${list} rule ${i + 1}`,
+        notes,
+      );
+      if (rule !== null) {
+        group[list].push(rule);
+      }
+    });
+  }
+  return group;
+}
+
+export function strategyToForm(strategy: Strategy): FormMapping {
+  const notes: string[] = [];
+  const base = defaultForm();
+  const asset = (ASSETS as readonly string[]).includes(strategy.asset)
+    ? (strategy.asset as Asset)
+    : base.asset;
+  if (asset !== strategy.asset) {
+    notes.push(`the coin ${strategy.asset} is not supported, so ${base.asset} is shown`);
+  }
+  const timeframe = (TIMEFRAMES as readonly string[]).includes(strategy.timeframe)
+    ? (strategy.timeframe as Timeframe)
+    : base.timeframe;
+  if (timeframe !== strategy.timeframe) {
+    notes.push(
+      `the bar size ${strategy.timeframe} is not offered, so ${base.timeframe} is shown`,
+    );
+  }
+  // The longest range that still fits the candle cap, so a 15m idea does not
+  // land over the limit and refuse to run.
+  const preset: DatePreset =
+    longestFittingPresetStatic({ ...base, timeframe }) ?? "1y";
+  return {
+    form: {
+      ...base,
+      asset,
+      timeframe,
+      side: strategy.side,
+      entry: groupFromRules(strategy.entry, "Entry", notes),
+      exit: groupFromRules(strategy.exit, "Exit", notes),
+      stopLoss:
+        strategy.stop_loss_pct === undefined
+          ? ""
+          : String(strategy.stop_loss_pct),
+      takeProfit:
+        strategy.take_profit_pct === undefined
+          ? ""
+          : String(strategy.take_profit_pct),
+      preset,
+    },
+    notes,
+  };
+}
+
+function stateToOperand(o: RuleOperandState): Operand {
+  if (o.mode === "number") {
+    return Number(o.num);
+  }
+  return needsPeriod(o.ind) ? { ind: o.ind, period: Number(o.period) } : { ind: o.ind };
+}
+
+function groupToRules(group: RuleGroupState): Rules {
+  const map = (rules: RuleState[]): Condition[] =>
+    rules.map((r) => ({
+      left: stateToOperand(r.left),
+      op: r.op,
+      right: stateToOperand(r.right),
+    }));
+  return { all: map(group.all), any: map(group.any) };
+}
+
+export function formToStrategy(form: TestLabForm): Strategy {
+  const strategy: Strategy = {
+    asset: form.asset,
+    timeframe: form.timeframe,
+    side: form.side,
+    entry: groupToRules(form.entry),
+  };
+  const exit = groupToRules(form.exit);
+  if (exit.all.length + exit.any.length > 0) {
+    strategy.exit = exit;
+  }
+  if (form.stopLoss.trim() !== "") {
+    strategy.stop_loss_pct = Number(form.stopLoss);
+  }
+  if (form.takeProfit.trim() !== "") {
+    strategy.take_profit_pct = Number(form.takeProfit);
+  }
+  return strategy;
 }
 
 export interface SeriesPoint {

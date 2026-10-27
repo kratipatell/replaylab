@@ -14,12 +14,15 @@ import {
   buildRequest,
   defaultForm,
   fixHint,
+  formatLoadNote,
   holdBackToSplit,
   plural,
   resolveRange,
+  strategyToForm,
   validateForm,
   type TestLabForm,
 } from "@/lib/testlab";
+import { HANDOFF_KEY, parseHandoff } from "@/lib/check";
 import BacktestForm from "@/components/BacktestForm";
 import EquityCharts, { MonthlyTable } from "@/components/EquityCharts";
 import SavedRuns from "@/components/SavedRuns";
@@ -43,6 +46,7 @@ export default function TestLab() {
   const [saved, setSaved] = useState<SavedRun | null>(null);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedError, setSavedError] = useState<string | null>(null);
+  const [loadNote, setLoadNote] = useState<string | null>(null);
 
   const refreshRuns = useCallback(async (): Promise<void> => {
     setRunsLoading(true);
@@ -73,6 +77,30 @@ export default function TestLab() {
           setRunsLoading(false);
         }
       });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) {
+        return;
+      }
+      const raw = sessionStorage.getItem(HANDOFF_KEY);
+      if (raw === null) {
+        return;
+      }
+      sessionStorage.removeItem(HANDOFF_KEY);
+      const handoff = parseHandoff(raw);
+      if (handoff === null) {
+        return;
+      }
+      const { form: next, notes } = strategyToForm(handoff.strategy);
+      setForm(next);
+      setLoadNote(formatLoadNote(notes));
+    });
     return () => {
       cancelled = true;
     };
@@ -140,6 +168,15 @@ export default function TestLab() {
           held up on data it was not tuned for.
         </p>
       </div>
+
+      {loadNote !== null && (
+        <p
+          role="alert"
+          className="rounded border border-[var(--verdict-fragile)] p-3 text-sm"
+        >
+          {loadNote}
+        </p>
+      )}
 
       <BacktestForm
         form={form}

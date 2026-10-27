@@ -437,6 +437,40 @@ export const checkRequestSchema = z.strictObject({
   mode: z.enum(["video", "idea"]).default(DEFAULT_CHECK_MODE),
 });
 
+// The hand-off from Check to Test Lab is untrusted browser storage: only a
+// known version with a valid strategy is used, anything else is ignored.
+export const HANDOFF_KEY = "replaylab:test-lab:handoff";
+export const HANDOFF_VERSION = 1;
+
+export const handoffSchema = z.strictObject({
+  version: z.literal(HANDOFF_VERSION),
+  strategy: strategySchema,
+});
+
+export type Handoff = z.infer<typeof handoffSchema>;
+
+export function parseHandoff(raw: string | null): Handoff | null {
+  if (raw === null) {
+    return null;
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const parsed = handoffSchema.safeParse(json);
+  return parsed.success ? parsed.data : null;
+}
+
+export function buildHandoff(strategy: Strategy): string | null {
+  const parsed = strategySchema.safeParse(strategy);
+  if (!parsed.success) {
+    return null;
+  }
+  return JSON.stringify({ version: HANDOFF_VERSION, strategy: parsed.data });
+}
+
 export type ParamSource = z.infer<typeof paramSourceSchema>;
 export type CheckParameter = z.infer<typeof checkParameterSchema>;
 export type CheckClaim = z.infer<typeof checkClaimSchema>;

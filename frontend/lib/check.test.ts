@@ -10,6 +10,8 @@ import {
   CHECK_MODES,
   DEFAULT_CHECK_MODE,
   DEFAULT_TIMEFRAME,
+  HANDOFF_KEY,
+  HANDOFF_VERSION,
   MAX_CANDLES,
   MULTI_TIMEFRAMES,
   MIN_OOS_TRADES,
@@ -22,6 +24,7 @@ import {
   applyParamEdits,
   buildCheckBacktestRequest,
   buildExtractSystemPrompt,
+  buildHandoff,
   buildSummary,
   buildTimeframeRequest,
   cancelRows,
@@ -44,6 +47,7 @@ import {
   multiTimeframeOutcomes,
   multiTimeframeRows,
   normaliseAsset,
+  parseHandoff,
   provenanceLabel,
   providerErrorMessage,
   rangeFit,
@@ -1260,5 +1264,40 @@ describe("extract request mode", () => {
     expect(
       checkRequestSchema.safeParse({ text: "Buy low.", mode: "podcast" }).success,
     ).toBe(false);
+  });
+});
+
+describe("test lab handoff", () => {
+  it("uses one named versioned key", () => {
+    expect(HANDOFF_KEY).toBe("replaylab:test-lab:handoff");
+    expect(HANDOFF_VERSION).toBe(1);
+  });
+
+  it("round-trips a strategy through the stored object", () => {
+    const stored = buildHandoff(rsiStrategy());
+    expect(stored).not.toBeNull();
+    expect(parseHandoff(stored)?.strategy).toEqual(rsiStrategy());
+  });
+
+  it("ignores malformed storage", () => {
+    expect(parseHandoff(null)).toBeNull();
+    expect(parseHandoff("not json")).toBeNull();
+    expect(parseHandoff("{}")).toBeNull();
+  });
+
+  it("ignores a different version", () => {
+    const other = JSON.stringify({
+      version: HANDOFF_VERSION + 1,
+      strategy: rsiStrategy(),
+    });
+    expect(parseHandoff(other)).toBeNull();
+  });
+
+  it("refuses to build from an invalid strategy", () => {
+    const bad: Strategy = {
+      ...rsiStrategy(),
+      entry: { all: [], any: [] },
+    };
+    expect(buildHandoff(bad)).toBeNull();
   });
 });

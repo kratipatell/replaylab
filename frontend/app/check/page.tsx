@@ -2,6 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   postBacktest,
   type BacktestResponse,
@@ -13,6 +14,7 @@ import {
   CHECK_MODES,
   CHECK_RUN_ORDER,
   DEFAULT_CHECK_MODE,
+  HANDOFF_KEY,
   MULTI_TIMEFRAME_NOTE,
   SUPPORTED_ASSETS_NOTE,
   anyRunning,
@@ -20,6 +22,7 @@ import {
   applyOutcomeToRows,
   applyParamEdits,
   buildCheckBacktestRequest,
+  buildHandoff,
   buildSummary,
   buildTimeframeRequest,
   cancelRows,
@@ -137,11 +140,13 @@ function numericEdits(
 }
 
 export default function Check() {
+  const router = useRouter();
   const [mode, setMode] = useState<CheckMode>(DEFAULT_CHECK_MODE);
   const [text, setText] = useState("");
   const [reading, setReading] = useState(false);
   const [extract, setExtract] = useState<ExtractResult | null>(null);
   const [extractError, setExtractError] = useState<string | null>(null);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [contextEdits, setContextEdits] = useState<ContextEdits>({});
   const [everyTimeframe, setEveryTimeframe] = useState(false);
@@ -170,6 +175,7 @@ export default function Check() {
   const read = useCallback(async (): Promise<void> => {
     setReading(true);
     setExtractError(null);
+    setHandoffError(null);
     setEngineError(null);
     setResult(null);
     setMulti(null);
@@ -467,6 +473,30 @@ export default function Check() {
     [multi, timedController],
   );
 
+  const openInTestLab = useCallback((): void => {
+    if (
+      editable === null ||
+      asset === null ||
+      bad.length > 0 ||
+      unfilled.length > 0
+    ) {
+      return;
+    }
+    const strategy = applyContextEdits(
+      applyParamEdits(editable.strategy, edits),
+      editable.context,
+      contextEdits,
+    );
+    const stored = buildHandoff(strategy);
+    if (stored === null) {
+      setHandoffError("This idea is not ready to open in Test Lab.");
+      return;
+    }
+    setHandoffError(null);
+    sessionStorage.setItem(HANDOFF_KEY, stored);
+    router.push("/test-lab");
+  }, [editable, asset, edits, contextEdits, bad, unfilled, router]);
+
   const rows = useMemo(() => multi?.rows ?? [], [multi]);
   const completed = useMemo(() => completedRows(rows), [rows]);
   const weak = useMemo(() => weakEvidence(completed), [completed]);
@@ -648,6 +678,14 @@ export default function Check() {
             >
               {running ? "Running test…" : "Run test"}
             </button>
+            <button
+              type="button"
+              onClick={openInTestLab}
+              disabled={!canRun || bad.length > 0}
+              className="w-fit rounded border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Open in Test Lab
+            </button>
             {running && (
               <button
                 type="button"
@@ -658,6 +696,11 @@ export default function Check() {
               </button>
             )}
           </div>
+          {handoffError !== null && (
+            <p role="alert" className="text-sm text-[var(--verdict-fails)]">
+              {handoffError}
+            </p>
+          )}
         </div>
       )}
 
