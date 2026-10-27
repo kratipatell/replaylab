@@ -10,7 +10,9 @@ import {
 import {
   BACKTEST_TIMEOUT_MS,
   CHECK_CONCURRENCY,
+  CHECK_MODES,
   CHECK_RUN_ORDER,
+  DEFAULT_CHECK_MODE,
   MULTI_TIMEFRAME_NOTE,
   SUPPORTED_ASSETS_NOTE,
   anyRunning,
@@ -29,12 +31,14 @@ import {
   providerErrorMessage,
   runningRow,
   runLimited,
+  showsClaim,
   startRowStates,
   timeframeCells,
   timeframeNotStated,
   weakEvidence,
   type CheckClaim,
   type CheckContext,
+  type CheckMode,
   type CheckParameter,
   type ContextEdits,
   type MultiTimeframe,
@@ -88,11 +92,14 @@ interface MultiState {
   runs: Partial<Record<MultiTimeframe, MultiTimeframeRun>>;
 }
 
-async function postExtract(text: string): Promise<ExtractResult> {
+async function postExtract(
+  text: string,
+  mode: CheckMode,
+): Promise<ExtractResult> {
   const res = await fetch("/api/check/extract", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, mode }),
   });
   const body = (await res.json()) as unknown as ExtractResult | ErrorShape;
   if (!res.ok || body.status === "error") {
@@ -130,6 +137,7 @@ function numericEdits(
 }
 
 export default function Check() {
+  const [mode, setMode] = useState<CheckMode>(DEFAULT_CHECK_MODE);
   const [text, setText] = useState("");
   const [reading, setReading] = useState(false);
   const [extract, setExtract] = useState<ExtractResult | null>(null);
@@ -168,7 +176,7 @@ export default function Check() {
     setSelected(null);
     setRange(null);
     try {
-      const out = await postExtract(text);
+      const out = await postExtract(text, mode);
       setExtract(out);
       setOverrides({});
       setContextEdits({});
@@ -181,7 +189,7 @@ export default function Check() {
     } finally {
       setReading(false);
     }
-  }, [text]);
+  }, [text, mode]);
 
   const editable =
     extract !== null && extract.status !== "no_rule_found" ? extract : null;
@@ -472,9 +480,33 @@ export default function Check() {
       <div className="flex flex-col gap-1">
         <h1 className="text-xl font-bold">Check</h1>
         <p className="text-sm text-[var(--muted)]">
-          Paste a video&apos;s words, confirm the rule it claims, then test it
-          on past prices.
+          {mode === "idea"
+            ? "Describe your idea, confirm the rule, then test it on past prices."
+            : "Paste a video's words, confirm the rule it claims, then test it on past prices."}
         </p>
+      </div>
+
+      <div
+        className="flex flex-wrap gap-2"
+        role="radiogroup"
+        aria-label="Check mode"
+      >
+        {CHECK_MODES.map((value) => (
+          <button
+            key={value}
+            type="button"
+            role="radio"
+            aria-checked={mode === value}
+            onClick={() => setMode(value)}
+            className={`rounded border px-3 py-1.5 text-sm ${
+              mode === value
+                ? "border-[var(--accent)] text-[var(--accent)]"
+                : "border-[var(--border)]"
+            }`}
+          >
+            {value === "video" ? "Check a video's claim" : "Test my own idea"}
+          </button>
+        ))}
       </div>
 
       <div className="flex flex-col gap-2">
@@ -482,20 +514,39 @@ export default function Check() {
           htmlFor="check-text"
           className="flex flex-col gap-1 text-sm font-medium"
         >
-          Video words
+          {mode === "idea"
+            ? "Describe your idea in plain words"
+            : "Video words"}
           <textarea
             id="check-text"
             className="min-h-32 rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder="Paste the transcript or caption of the video."
+            placeholder={
+              mode === "idea"
+                ? "Describe the rule in plain words."
+                : "Paste the transcript or caption of the video."
+            }
           />
         </label>
+        {mode === "idea" ? (
+          <>
+            <p className="text-xs text-[var(--muted)]">
+              For example: “Buy BTC when RSI is below 30, sell when it is above
+              55, 2% stop loss.”
+            </p>
+            <p className="text-xs text-[var(--muted)]">
+              Or: “Sell ETH when the close crosses below the 50-bar average, 3%
+              stop loss.”
+            </p>
+          </>
+        ) : (
+          <p className="text-xs text-[var(--muted)]">
+            Paste the transcript or caption of the video.
+          </p>
+        )}
         <p className="text-xs text-[var(--muted)]">
-          Paste the transcript or caption of the video.
-        </p>
-        <p className="text-xs text-[var(--muted)]">
-          The text you paste is sent to an AI provider to read it.
+          The text you send is read by an AI provider.
         </p>
         <button
           type="button"
@@ -563,8 +614,9 @@ export default function Check() {
             everyTimeframe={everyTimeframe}
             onEveryTimeframeChange={setEveryTimeframe}
             assetText={assetText}
+            mode={mode}
           />
-          {claimed && (
+          {showsClaim(mode) && claimed && (
             <p className="text-sm text-[var(--muted)]">
               The video claims a {editable.claim.win_rate_pct}% win rate
               {editable.claim.quote ? (
@@ -622,20 +674,22 @@ export default function Check() {
 
       {multi !== null && editable !== null && (
         <div className="flex flex-col gap-3">
-          <p className="text-sm">
-            Claimed win rate:{" "}
-            {editable.claim.win_rate_pct === null ? (
-              "none stated"
-            ) : (
-              <strong>{fmtPct(editable.claim.win_rate_pct)}</strong>
-            )}
-            {editable.claim.quote !== null && editable.claim.quote !== "" && (
-              <span className="text-[var(--muted)]">
-                {" "}
-                (“{editable.claim.quote}”)
-              </span>
-            )}
-          </p>
+          {showsClaim(mode) && (
+            <p className="text-sm">
+              Claimed win rate:{" "}
+              {editable.claim.win_rate_pct === null ? (
+                "none stated"
+              ) : (
+                <strong>{fmtPct(editable.claim.win_rate_pct)}</strong>
+              )}
+              {editable.claim.quote !== null && editable.claim.quote !== "" && (
+                <span className="text-[var(--muted)]">
+                  {" "}
+                  (“{editable.claim.quote}”)
+                </span>
+              )}
+            </p>
+          )}
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-sm">
               <thead>
@@ -794,11 +848,13 @@ export default function Check() {
               : `${fmtDate(range.start)} to ${fmtDate(range.end)}`}{" "}
             · last 30% held back
           </p>
-          <ClaimCard
-            claim={editable.claim}
-            outOfSample={result.out_of_sample}
-            full={result.stats}
-          />
+          {showsClaim(mode) && (
+            <ClaimCard
+              claim={editable.claim}
+              outOfSample={result.out_of_sample}
+              full={result.stats}
+            />
+          )}
           <VerdictCard verdict={result.verdict} onUseLongRange={() => {}} />
           <StatsTable
             full={result.stats}

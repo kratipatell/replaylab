@@ -14,6 +14,7 @@ import {
   showAssumedTimeframeSelect,
   timeframeNotStated,
   type CheckContext,
+  type CheckMode,
   type CheckParameter,
   type ContextEdits,
 } from "@/lib/check";
@@ -21,6 +22,9 @@ import { TIMEFRAMES } from "@/lib/testlab";
 
 const inputClass =
   "rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm w-36";
+
+const wideInputClass =
+  "rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm w-56";
 
 function optionsWith(current: string, known: readonly string[]): string[] {
   return known.includes(current) ? [...known] : [current, ...known];
@@ -36,6 +40,7 @@ export default function CheckParamsTable({
   everyTimeframe,
   onEveryTimeframeChange,
   assetText,
+  mode,
 }: {
   params: CheckParameter[];
   overrides: Record<string, string>;
@@ -46,6 +51,7 @@ export default function CheckParamsTable({
   everyTimeframe: boolean;
   onEveryTimeframeChange: (value: boolean) => void;
   assetText: string;
+  mode: CheckMode;
 }) {
   const asset = normaliseAsset(assetText);
   const assetValue = asset ?? "";
@@ -93,7 +99,7 @@ export default function CheckParamsTable({
                 <span className="rounded border border-[var(--border)] px-1.5 py-0.5 text-xs font-medium">
                   {row.key === "asset" && asset === null
                     ? ASSET_NOT_RECOGNISED
-                    : contextLabel(row.field.source, row.overridden)}
+                    : contextLabel(row.field.source, row.overridden, mode)}
                 </span>
                 <br />
                 {row.key === "timeframe" && notStated ? (
@@ -114,7 +120,7 @@ export default function CheckParamsTable({
               <td className="border border-[var(--border)] p-2">
                 {row.key === "asset" && (
                   <select
-                    className={inputClass}
+                    className={wideInputClass}
                     aria-label="Asset"
                     value={assetValue}
                     onChange={(e) => onContextEdit("asset", e.target.value)}
@@ -202,7 +208,7 @@ export default function CheckParamsTable({
                 </td>
                 <td className="border border-[var(--border)] p-2">
                   <span className="rounded border border-[var(--border)] px-1.5 py-0.5 text-xs font-medium">
-                    {provenanceLabel(p, overridden)}
+                    {provenanceLabel(p, overridden, mode)}
                   </span>
                   <br />
                   {p.source === "stated" && p.quote && (
@@ -213,7 +219,8 @@ export default function CheckParamsTable({
                   )}
                   {p.source === "missing" && !overridden && (
                     <span className="text-xs text-[var(--muted)]">
-                      Not in the video. Type a number to test.
+                      {mode === "idea" ? "Not in your idea." : "Not in the video."}{" "}
+                      Type a number to test.
                     </span>
                   )}
                 </td>

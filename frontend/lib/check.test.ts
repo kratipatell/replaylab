@@ -7,6 +7,8 @@ import {
   CANCELLED_MESSAGE,
   CHECK_CONCURRENCY,
   CHECK_MAX_CANDLES,
+  CHECK_MODES,
+  DEFAULT_CHECK_MODE,
   DEFAULT_TIMEFRAME,
   MAX_CANDLES,
   MULTI_TIMEFRAMES,
@@ -19,6 +21,7 @@ import {
   applyOutcomeToRows,
   applyParamEdits,
   buildCheckBacktestRequest,
+  buildExtractSystemPrompt,
   buildSummary,
   buildTimeframeRequest,
   cancelRows,
@@ -30,6 +33,7 @@ import {
   compareClaim,
   completedRows,
   contextFieldSchema,
+  contextLabel,
   errorMessage,
   forwardedIp,
   injectionNoRule,
@@ -45,6 +49,7 @@ import {
   rangeFit,
   runLimited,
   runningRow,
+  showsClaim,
   showAssumedTimeframeSelect,
   startRowStates,
   strategySchema,
@@ -1185,5 +1190,75 @@ describe("unstated-timeframe select", () => {
     expect(applyContextEdits(rsiStrategy(), context, {}).timeframe).toBe(
       DEFAULT_TIMEFRAME,
     );
+  });
+});
+
+describe("check mode", () => {
+  it("lists both modes and defaults to video", () => {
+    expect([...CHECK_MODES]).toEqual(["video", "idea"]);
+    expect(DEFAULT_CHECK_MODE).toBe("video");
+  });
+
+  it("hides the claim card and claimed line in idea mode", () => {
+    expect(showsClaim("video")).toBe(true);
+    expect(showsClaim("idea")).toBe(false);
+  });
+
+  it("says stated by you in idea mode but stated in the video otherwise", () => {
+    const stated = {
+      name: "Entry level",
+      path: "entry.all.0.right",
+      value: 30,
+      source: "stated" as const,
+      quote: "below 30",
+      reason: null,
+    };
+    expect(provenanceLabel(stated, false, "video")).toBe("Stated in the video");
+    expect(provenanceLabel(stated, false, "idea")).toBe("Stated by you");
+    expect(provenanceLabel(stated, true, "idea")).toBe("You chose");
+    expect(contextLabel("stated", false, "idea")).toBe("Stated by you");
+    expect(contextLabel("assumed", false, "idea")).toBe("Assumed default");
+    expect(contextLabel("stated", false, "video")).toBe("Stated in the video");
+  });
+});
+
+describe("extract prompt builder", () => {
+  it("frames video mode and not the user's idea", () => {
+    const prompt = buildExtractSystemPrompt("video");
+    expect(prompt).toContain("video text");
+    expect(prompt).not.toContain("own idea");
+  });
+
+  it("frames idea mode as the user's own idea", () => {
+    expect(buildExtractSystemPrompt("idea")).toContain("own idea");
+  });
+
+  it("keeps the untrusted and no-invention rules in both modes", () => {
+    for (const mode of CHECK_MODES) {
+      const prompt = buildExtractSystemPrompt(mode);
+      expect(prompt).toContain("untrusted data");
+      expect(prompt).toContain("Never invent numbers");
+    }
+  });
+});
+
+describe("extract request mode", () => {
+  it("defaults to video and accepts idea", () => {
+    const def = checkRequestSchema.safeParse({ text: "Buy low." });
+    expect(def.success).toBe(true);
+    if (def.success) {
+      expect(def.data.mode).toBe("video");
+    }
+    const idea = checkRequestSchema.safeParse({ text: "Buy low.", mode: "idea" });
+    expect(idea.success).toBe(true);
+    if (idea.success) {
+      expect(idea.data.mode).toBe("idea");
+    }
+  });
+
+  it("rejects an unknown mode", () => {
+    expect(
+      checkRequestSchema.safeParse({ text: "Buy low.", mode: "podcast" }).success,
+    ).toBe(false);
   });
 });
