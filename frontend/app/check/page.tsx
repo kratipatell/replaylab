@@ -16,6 +16,7 @@ import {
   DEFAULT_CHECK_MODE,
   HANDOFF_KEY,
   MULTI_TIMEFRAME_NOTE,
+  RANGE_FIT_NOTE,
   SUPPORTED_ASSETS_NOTE,
   anyRunning,
   applyContextEdits,
@@ -870,6 +871,7 @@ export default function Check() {
           <p className="text-xs text-[var(--muted)]">
             {MULTI_TIMEFRAME_NOTE}
           </p>
+          <p className="text-xs text-[var(--muted)]">{RANGE_FIT_NOTE}</p>
           {weak !== null && (
             <p className="text-sm text-[var(--verdict-fragile)]">{weak}</p>
           )}

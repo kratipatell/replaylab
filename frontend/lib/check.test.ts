@@ -15,6 +15,7 @@ import {
   MAX_CANDLES,
   MULTI_TIMEFRAMES,
   MIN_OOS_TRADES,
+  RANGE_FIT_NOTE,
   RATE_LIMIT_MESSAGE,
   SUPPORTED_ASSETS,
   TIMEOUT_MESSAGE,
@@ -1299,5 +1300,11 @@ describe("test lab handoff", () => {
       entry: { all: [], any: [] },
     };
     expect(buildHandoff(bad)).toBeNull();
+  });
+});
+
+describe("range fit note", () => {
+  it("says rows across timeframes are not directly comparable", () => {
+    expect(RANGE_FIT_NOTE).toContain("not directly comparable");
   });
 });

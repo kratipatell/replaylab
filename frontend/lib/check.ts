@@ -156,6 +156,9 @@ export function buildExtractSystemPrompt(mode: CheckMode): string {
   return [...opening, ...PROMPT_RULES].join("\n");
 }
 
+export const RANGE_FIT_NOTE =
+  "Each timeframe uses the longest range that fits, so shorter timeframes cover fewer months and rows are not directly comparable.";
+
 export const SUPPORTED_ASSETS: readonly Asset[] = ASSETS;
 
 export const ASSET_LABELS: Record<Asset, string> = {
