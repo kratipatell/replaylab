@@ -1,9 +1,13 @@
 use crate::instrument::Instrument;
+use crate::orders;
+use crate::orders::Trail;
 use crate::session::SessionFilter;
 use crate::sizing::{quantity, Sizing};
 use crate::strategy::{BarStrategy, Side, Strategy};
 use crate::types::Candle;
 use serde::Serialize;
+
+pub use crate::orders::ExitReason;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BacktestConfig {
@@ -18,16 +22,6 @@ impl Default for BacktestConfig {
             slippage_bps: 2.0,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum ExitReason {
-    Signal,
-    StopLoss,
-    TakeProfit,
-    Trailing,
-    SessionEnd,
-    EndOfData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -116,6 +110,7 @@ struct OpenPos {
     equity_at_entry: f64,
     entry_cost: f64,
     peak: f64,
+    trail: Trail,
 }
 
 fn levels(side: Side, entry: f64, b: &Bracket) -> (Option<f64>, Option<f64>, Option<f64>) {
@@ -220,170 +215,40 @@ pub fn run(
                         equity_at_entry: equity,
                         entry_cost,
                         peak: entry_raw,
+                        trail: Trail::new(side, entry_raw, bracket.trailing_pct),
                     });
                     strategy.on_fill(i);
                 }
             }
         }
 
-        if let Some(pos) = position.take() {
-            let (fixed_stop, target, base_trail) = levels(pos.side, pos.entry_raw, bracket);
-            let incoming_trail = base_trail;
-            // Ratchet trailing on excursion so a new high cannot stop itself.
+        if let Some(mut pos) = position.take() {
+            let (fixed_stop, target, _base_trail) = levels(pos.side, pos.entry_raw, bracket);
             let mut peak = pos.peak;
-            let mut trail = incoming_trail;
-            if let Some(pct) = bracket.trailing_pct {
-                let t = pct / 100.0;
+            if bracket.trailing_pct.is_some() {
                 match pos.side {
                     Side::Long => {
                         if candles[i].high > peak {
                             peak = candles[i].high;
                         }
-                        let candidate = peak * (1.0 - t);
-                        trail = Some(trail.map_or(candidate, |old| old.max(candidate)));
                     }
                     Side::Short => {
                         if candles[i].low < peak {
                             peak = candles[i].low;
                         }
-                        let candidate = peak * (1.0 + t);
-                        trail = Some(trail.map_or(candidate, |old| old.min(candidate)));
                     }
                 }
             }
-            let o = candles[i].open;
-            let h = candles[i].high;
-            let l = candles[i].low;
-            let tighter = |f: Option<f64>, t: Option<f64>| -> (Option<f64>, bool) {
-                match (f, t) {
-                    (Some(f), Some(t)) => match pos.side {
-                        Side::Long => {
-                            if t >= f {
-                                (Some(t), true)
-                            } else {
-                                (Some(f), false)
-                            }
-                        }
-                        Side::Short => {
-                            if t <= f {
-                                (Some(t), true)
-                            } else {
-                                (Some(f), false)
-                            }
-                        }
-                    },
-                    (Some(f), None) => (Some(f), false),
-                    (None, Some(t)) => (Some(t), true),
-                    (None, None) => (None, false),
-                }
-            };
-            let (gap_stop, gap_is_trail) = tighter(fixed_stop, incoming_trail);
-            let (stop_level, stop_is_trail) = tighter(fixed_stop, trail);
-            let (sl_hit, tp_hit) = match pos.side {
-                Side::Long => (
-                    stop_level.map(|s| l <= s).unwrap_or(false)
-                        || gap_stop.map(|s| o <= s).unwrap_or(false),
-                    target.map(|t| h >= t || o >= t).unwrap_or(false),
-                ),
-                Side::Short => (
-                    stop_level.map(|s| h >= s).unwrap_or(false)
-                        || gap_stop.map(|s| o >= s).unwrap_or(false),
-                    target.map(|t| l <= t || o <= t).unwrap_or(false),
-                ),
-            };
-            // Both hit intrabar without gap: stop wins.
-            let exit: Option<(f64, ExitReason)> = if sl_hit && tp_hit {
-                let gap_up = match (pos.side, target) {
-                    (Side::Long, Some(t)) => o >= t,
-                    (Side::Short, Some(t)) => o <= t,
-                    _ => false,
-                };
-                if gap_up {
-                    Some((o, ExitReason::TakeProfit))
-                } else {
-                    let gap_hit = gap_stop.map(|g| match pos.side {
-                        Side::Long => o <= g,
-                        Side::Short => o >= g,
-                    });
-                    if gap_hit.unwrap_or(false) {
-                        let reason = if gap_is_trail {
-                            ExitReason::Trailing
-                        } else {
-                            ExitReason::StopLoss
-                        };
-                        Some((o, reason))
-                    } else {
-                        match stop_level {
-                            Some(s) => {
-                                let reason = if stop_is_trail {
-                                    ExitReason::Trailing
-                                } else {
-                                    ExitReason::StopLoss
-                                };
-                                Some((s, reason))
-                            }
-                            None => None,
-                        }
-                    }
-                }
-            } else if sl_hit {
-                let gap_hit = gap_stop.map(|g| match pos.side {
-                    Side::Long => o <= g,
-                    Side::Short => o >= g,
-                });
-                if gap_hit.unwrap_or(false) {
-                    let reason = if gap_is_trail {
-                        ExitReason::Trailing
-                    } else {
-                        ExitReason::StopLoss
-                    };
-                    Some((o, reason))
-                } else {
-                    match stop_level {
-                        Some(s) => {
-                            let reason = if stop_is_trail {
-                                ExitReason::Trailing
-                            } else {
-                                ExitReason::StopLoss
-                            };
-                            Some((s, reason))
-                        }
-                        None => None,
-                    }
-                }
-            } else if tp_hit {
-                match target {
-                    Some(t) => {
-                        let raw = match pos.side {
-                            Side::Long => {
-                                if o >= t {
-                                    o
-                                } else {
-                                    t
-                                }
-                            }
-                            Side::Short => {
-                                if o <= t {
-                                    o
-                                } else {
-                                    t
-                                }
-                            }
-                        };
-                        Some((raw, ExitReason::TakeProfit))
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
+            pos.peak = peak;
+            let _ = pos.trail.advance(pos.side, &candles[i]);
+            let exit = orders::resolve_exit(&candles[i], pos.side, fixed_stop, target, &pos.trail);
             if let Some((raw_exit, reason)) = exit {
                 let (after, trade) =
                     close_position(&pos, raw_exit, candles[i].ts, i, reason, equity);
                 equity = after;
                 trades.push(trade);
             } else {
-                position = Some(OpenPos { peak, ..pos });
+                position = Some(pos);
                 if cfg.exit_at_session_end
                     && session.contains(candles[i].ts)
                     && (i + 1 == n || !session.contains(candles[i + 1].ts))
@@ -1413,7 +1278,9 @@ mod orb_recon_tests {
         )
         .expect("run");
 
-        assert_eq!(orb.range(), Some((102.0, 99.0)));
+        let rng = orb.range().expect("range");
+        assert!((rng.0 - 102.0).abs() < 1e-9);
+        assert!((rng.1 - 99.0).abs() < 1e-9);
 
         assert_eq!(result.trades.len(), 1);
         let t = &result.trades[0];
@@ -1449,5 +1316,62 @@ mod orb_recon_tests {
         assert_eq!(m.monthly.len(), 1);
         assert!((m.monthly["1970-01"] - 0.041).abs() < 1e-9);
         assert!((m.by_weekday["Thu"] - 0.041).abs() < 1e-9);
+    }
+
+    #[test]
+    fn golden_bracket_orders_via_resolve_exit() {
+        use crate::types::Candle;
+        let candles = vec![
+            Candle {
+                ts: 0,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+            Candle {
+                ts: crate::session::MS_PER_MIN,
+                open: 100.0,
+                high: 101.0,
+                low: 97.0,
+                close: 100.0,
+            },
+            Candle {
+                ts: 2 * crate::session::MS_PER_MIN,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+        ];
+        struct Sig2(Vec<Option<crate::strategy::Side>>);
+        impl crate::strategy::BarStrategy for Sig2 {
+            fn on_bar(&mut self, idx: usize, _candles: &[Candle]) -> Option<crate::strategy::Side> {
+                self.0.get(idx).copied().flatten()
+            }
+        }
+        let mut s = Sig2(vec![Some(crate::strategy::Side::Long), None, None]);
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        let inst2 = Instrument::new("TEST", 0.01, 1.0, 0.0, 0.0).expect("valid");
+        let r = crate::backtest::run(
+            &mut s,
+            &candles,
+            &inst2,
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &RunConfig::new(10000.0, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].entry_idx, 1);
+        assert_eq!(r.trades[0].exit_idx, 1);
+        assert!((r.trades[0].exit_price - 98.0).abs() < 1e-9);
+        assert_eq!(r.trades[0].reason, ExitReason::StopLoss);
+        assert!((r.equity_curve[1] - 9_998.0).abs() < 1e-9);
     }
 }

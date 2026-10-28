@@ -56,9 +56,25 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS runs (
     equity_curve TEXT NOT NULL,
     trades TEXT NOT NULL,
     owner_id TEXT NOT NULL DEFAULT 'local'
+);
+CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    run_id INTEGER,
+    created_at INTEGER NOT NULL,
+    started_at INTEGER,
+    stopped_at INTEGER,
+    equity REAL NOT NULL DEFAULT 10000.0,
+    last_price REAL,
+    last_ts INTEGER,
+    owner_id TEXT NOT NULL DEFAULT 'local'
 )";
 
 const ADD_OWNER_ID: &str = "ALTER TABLE runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
+const ADD_AGENTS_OWNER: &str =
+    "ALTER TABLE agents ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -100,6 +116,46 @@ impl Db {
         if !has_owner_id {
             conn.execute_batch(ADD_OWNER_ID)
                 .map_err(|e| DbError::Init(e.to_string()))?;
+        }
+        let agents_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agents'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| DbError::Init(e.to_string()))?
+            > 0;
+        if !agents_exists {
+            conn.execute_batch(
+                "CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    run_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    stopped_at INTEGER,
+                    equity REAL NOT NULL DEFAULT 10000.0,
+                    last_price REAL,
+                    last_ts INTEGER,
+                    owner_id TEXT NOT NULL DEFAULT 'local'
+                )",
+            )
+            .map_err(|e| DbError::Init(e.to_string()))?;
+        } else {
+            let has_agents_owner = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'owner_id'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| DbError::Init(e.to_string()))?
+                > 0;
+            if !has_agents_owner {
+                conn.execute_batch(ADD_AGENTS_OWNER)
+                    .map_err(|e| DbError::Init(e.to_string()))?;
+            }
         }
         Ok(())
     }

@@ -6,6 +6,7 @@ mod feeds;
 mod indicators;
 mod instrument;
 mod optimizer;
+mod orders;
 mod ratelimit;
 mod session;
 mod sizing;
