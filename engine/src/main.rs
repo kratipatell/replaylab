@@ -13,6 +13,7 @@ mod sizing;
 mod stats;
 mod strategy;
 mod types;
+mod validation;
 mod verdict;
 
 use std::sync::Arc;

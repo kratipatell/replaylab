@@ -34,7 +34,17 @@ impl RateLimiter {
         self.check_at(key, now_ms())
     }
 
+    /// Charge `cost` at once. A request that cannot pay the full cost leaves
+    /// the bucket untouched.
+    pub fn check_n(&self, key: &str, cost: u32) -> Result<(), u64> {
+        self.check_cost_at(key, now_ms(), cost)
+    }
+
     fn check_at(&self, key: &str, now_ms: u64) -> Result<(), u64> {
+        self.check_cost_at(key, now_ms, 1)
+    }
+
+    fn check_cost_at(&self, key: &str, now_ms: u64, cost: u32) -> Result<(), u64> {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if buckets.len() >= MAX_TRACKED_KEYS {
             buckets.retain(|_, b| b.reset_at_ms > now_ms);
@@ -47,11 +57,11 @@ impl RateLimiter {
             bucket.count = 0;
             bucket.reset_at_ms = now_ms.saturating_add(self.window_ms);
         }
-        if bucket.count >= self.limit {
+        if bucket.count.saturating_add(cost) > self.limit {
             let wait_ms = bucket.reset_at_ms.saturating_sub(now_ms);
             return Err(wait_ms.div_ceil(1000).max(1));
         }
-        bucket.count += 1;
+        bucket.count += cost;
         Ok(())
     }
 }
@@ -84,5 +94,24 @@ mod tests {
         assert_eq!(limiter.check_at("b", 0), Ok(()));
         assert!(limiter.check_at("a", 1).is_err());
         assert!(limiter.check_at("b", 1).is_err());
+    }
+
+    #[test]
+    fn a_multi_cost_check_charges_every_unit() {
+        let limiter = RateLimiter::new(3, 60_000);
+        assert_eq!(limiter.check_cost_at("ip", 0, 2), Ok(()));
+        assert_eq!(limiter.check_at("ip", 1), Ok(()));
+        assert_eq!(limiter.check_at("ip", 2), Err(60));
+        assert_eq!(limiter.check_cost_at("ip", 3, 1), Err(60));
+        assert_eq!(limiter.check_cost_at("ip", 60_000, 3), Ok(()));
+    }
+
+    #[test]
+    fn an_unaffordable_cost_does_not_partially_spend() {
+        let limiter = RateLimiter::new(2, 60_000);
+        assert_eq!(limiter.check_cost_at("ip", 0, 2), Ok(()));
+        assert!(limiter.check_cost_at("ip", 1, 1).is_err());
+        assert!(limiter.check_at("ip", 2).is_err());
+        assert_eq!(limiter.check_cost_at("ip", 60_000, 1), Ok(()));
     }
 }

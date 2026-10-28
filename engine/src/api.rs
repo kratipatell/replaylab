@@ -236,6 +236,7 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/health", get(health))
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
+        .route("/validate", post(post_validate))
         .route("/optimize", post(post_optimize).get(list_optimize))
         .route("/optimize/{job_id}", get(get_optimize))
         .route("/runs", get(list_runs))
@@ -384,6 +385,12 @@ enum BacktestFailure {
 }
 
 impl BacktestFailure {
+    fn reason(&self) -> &str {
+        match self {
+            BacktestFailure::Upstream(msg) | BacktestFailure::BadRequest(msg) => msg,
+        }
+    }
+
     fn into_error_response(self) -> Response {
         match self {
             BacktestFailure::Upstream(msg) => {
@@ -394,6 +401,79 @@ impl BacktestFailure {
             }
         }
     }
+}
+
+struct SimParams {
+    interval: String,
+    step: i64,
+    start: i64,
+    end: i64,
+    split: Option<f64>,
+    fee_bps: f64,
+    slippage_bps: f64,
+    bars_per_year: f64,
+}
+
+impl SimParams {
+    fn request_for(&self, symbol: &str) -> SimRequest {
+        SimRequest {
+            symbol: symbol.to_string(),
+            interval: self.interval.clone(),
+            step: self.step,
+            start: self.start,
+            end: self.end,
+            split: self.split,
+            fee_bps: self.fee_bps,
+            slippage_bps: self.slippage_bps,
+            bars_per_year: self.bars_per_year,
+        }
+    }
+}
+
+fn parse_sim_params(
+    interval: &str,
+    start_ms: i64,
+    end_ms: i64,
+    fee_bps: Option<f64>,
+    slippage_bps: Option<f64>,
+    split: Option<f64>,
+) -> Result<SimParams, String> {
+    let step = crate::feeds::interval_ms(interval)
+        .ok_or_else(|| format!("unknown interval: {interval}"))?;
+    if start_ms >= end_ms {
+        return Err("start_ms must be less than end_ms".to_string());
+    }
+    check_range_limit(start_ms, end_ms, step).map_err(|e| e.to_string())?;
+    let defaults = crate::backtest::BacktestConfig::default();
+    let fee_bps = fee_bps.unwrap_or(defaults.fee_bps);
+    let slippage_bps = slippage_bps.unwrap_or(defaults.slippage_bps);
+    if !(0.0..=1000.0).contains(&fee_bps) || !fee_bps.is_finite() {
+        return Err(format!("fee_bps must be between 0 and 1000, got {fee_bps}"));
+    }
+    if !(0.0..=1000.0).contains(&slippage_bps) || !slippage_bps.is_finite() {
+        return Err(format!(
+            "slippage_bps must be between 0 and 1000, got {slippage_bps}"
+        ));
+    }
+    let bars_per_year = crate::stats::bars_per_year(interval)
+        .ok_or_else(|| format!("unknown timeframe: {interval}"))?;
+    if let Some(split) = split {
+        if !(split > 0.0 && split < 1.0) || !split.is_finite() {
+            return Err(format!(
+                "split must be strictly between 0 and 1, got {split}"
+            ));
+        }
+    }
+    Ok(SimParams {
+        interval: interval.to_string(),
+        step,
+        start: start_ms,
+        end: end_ms,
+        split,
+        fee_bps,
+        slippage_bps,
+        bars_per_year,
+    })
 }
 
 fn run_backtest(
@@ -454,6 +534,84 @@ fn run_backtest(
     })
 }
 
+fn run_validation(
+    cache_dir: &std::path::Path,
+    source: &dyn crate::feeds::KlineSource,
+    strategy: &crate::strategy::Strategy,
+    params: &SimParams,
+    symbols: &[String],
+) -> Result<crate::validation::CrossMarket, BacktestFailure> {
+    let mut markets = Vec::with_capacity(symbols.len());
+    let mut unchecked = Vec::new();
+    let mut first_failure: Option<BacktestFailure> = None;
+
+    for symbol in symbols {
+        let mut per_market = strategy.clone();
+        per_market.asset = symbol.clone();
+        let req = params.request_for(symbol);
+        match run_backtest(cache_dir, source, &per_market, &req) {
+            Ok(parts) => markets.push(crate::validation::MarketCheck {
+                symbol: symbol.clone(),
+                candle_count: parts.candle_count,
+                stats: parts.stats,
+                in_sample: parts.in_sample,
+                out_of_sample: parts.out_of_sample,
+                verdict: parts.verdict,
+            }),
+            Err(failure) => {
+                unchecked.push(crate::validation::UncheckedMarket {
+                    symbol: symbol.clone(),
+                    reason: failure.reason().to_string(),
+                });
+                if first_failure.is_none() {
+                    first_failure = Some(failure);
+                }
+            }
+        }
+    }
+
+    if markets.is_empty() {
+        return Err(first_failure.unwrap_or_else(|| {
+            BacktestFailure::BadRequest("no markets were checked".to_string())
+        }));
+    }
+    Ok(crate::validation::assess(markets, unchecked))
+}
+
+fn validation_symbols(
+    primary: &str,
+    requested: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    let requested = match requested {
+        Some(list) if list.is_empty() => {
+            return Err("symbols must name at least one other market".to_string())
+        }
+        Some(list) => list,
+        None => crate::validation::DEFAULT_SYMBOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let mut symbols = vec![primary.to_string()];
+    for symbol in requested {
+        crate::feeds::validate_symbol(&symbol).map_err(|e| e.to_string())?;
+        if !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+    }
+    if symbols.len() < 2 {
+        return Err("at least two markets are needed to validate elsewhere".to_string());
+    }
+    if symbols.len() > crate::validation::MAX_SYMBOLS {
+        return Err(format!(
+            "at most {} markets per validation, got {}",
+            crate::validation::MAX_SYMBOLS,
+            symbols.len()
+        ));
+    }
+    Ok(symbols)
+}
+
 async fn post_backtest(
     State(state): State<AppState>,
     Extension(limits): Extension<Arc<Limits>>,
@@ -471,77 +629,21 @@ async fn post_backtest(
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     let symbol = req.strategy.asset.clone();
-    let interval = req.strategy.timeframe.clone();
     if let Err(e) = crate::feeds::validate_symbol(&symbol) {
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    let step = match crate::feeds::interval_ms(&interval) {
-        Some(s) => s,
-        None => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                format!("unknown interval: {interval}"),
-            )
-            .into_response();
-        }
+    let params = match parse_sim_params(
+        &req.strategy.timeframe,
+        req.start_ms,
+        req.end_ms,
+        req.fee_bps,
+        req.slippage_bps,
+        req.split,
+    ) {
+        Ok(p) => p,
+        Err(msg) => return err_json(StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    if req.start_ms >= req.end_ms {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            "start_ms must be less than end_ms".to_string(),
-        )
-        .into_response();
-    }
-    if let Err(e) = check_range_limit(req.start_ms, req.end_ms, step) {
-        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
-    let defaults = crate::backtest::BacktestConfig::default();
-    let fee_bps = req.fee_bps.unwrap_or(defaults.fee_bps);
-    let slippage_bps = req.slippage_bps.unwrap_or(defaults.slippage_bps);
-    if !(0.0..=1000.0).contains(&fee_bps) || !fee_bps.is_finite() {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            format!("fee_bps must be between 0 and 1000, got {fee_bps}"),
-        )
-        .into_response();
-    }
-    if !(0.0..=1000.0).contains(&slippage_bps) || !slippage_bps.is_finite() {
-        return err_json(
-            StatusCode::BAD_REQUEST,
-            format!("slippage_bps must be between 0 and 1000, got {slippage_bps}"),
-        )
-        .into_response();
-    }
-    let bars_per_year = match crate::stats::bars_per_year(&interval) {
-        Some(b) => b,
-        None => {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                format!("unknown timeframe: {interval}"),
-            )
-            .into_response();
-        }
-    };
-    if let Some(split) = req.split {
-        if !(split > 0.0 && split < 1.0) || !split.is_finite() {
-            return err_json(
-                StatusCode::BAD_REQUEST,
-                format!("split must be strictly between 0 and 1, got {split}"),
-            )
-            .into_response();
-        }
-    }
-    let sim = SimRequest {
-        symbol,
-        interval,
-        step,
-        start: req.start_ms,
-        end: req.end_ms,
-        split: req.split,
-        fee_bps,
-        slippage_bps,
-        bars_per_year,
-    };
+    let sim = params.request_for(&symbol);
     let source = state.source.clone();
     let cache_dir = state.cache_dir.clone();
     let strategy = req.strategy.clone();
@@ -606,6 +708,86 @@ async fn post_backtest(
         Json(serde_json::to_value(resp).unwrap_or_default()),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidateBody {
+    strategy: crate::strategy::Strategy,
+    start_ms: i64,
+    end_ms: i64,
+    fee_bps: Option<f64>,
+    slippage_bps: Option<f64>,
+    split: Option<f64>,
+    symbols: Option<Vec<String>>,
+}
+
+// One backtest token is charged per market, since each market is a full run.
+async fn post_validate(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    ClientIp(ip): ClientIp,
+    body: Result<Json<ValidateBody>, JsonRejection>,
+) -> Response {
+    let req = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
+    };
+    if let Err(e) = req.strategy.validate() {
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let primary = req.strategy.asset.clone();
+    if let Err(e) = crate::feeds::validate_symbol(&primary) {
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let symbols = match validation_symbols(&primary, req.symbols) {
+        Ok(s) => s,
+        Err(msg) => return err_json(StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    if let Err(retry_after) = limits.backtest.check_n(&ip, symbols.len() as u32) {
+        return rate_limited(
+            retry_after,
+            "too many validation requests; try again shortly",
+        );
+    }
+    let params = match parse_sim_params(
+        &req.strategy.timeframe,
+        req.start_ms,
+        req.end_ms,
+        req.fee_bps,
+        req.slippage_bps,
+        req.split,
+    ) {
+        Ok(p) => p,
+        Err(msg) => return err_json(StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+
+    let source = state.source.clone();
+    let cache_dir = state.cache_dir.clone();
+    let strategy = req.strategy;
+    let timeout = limits.backtest_timeout;
+    let computed = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            run_validation(&cache_dir, source.as_ref(), &strategy, &params, &symbols)
+        }),
+    )
+    .await;
+    let cross = match computed {
+        Err(_) => {
+            return err_json(
+                StatusCode::REQUEST_TIMEOUT,
+                format!("validation timed out after {}s", timeout.as_secs()),
+            )
+            .into_response();
+        }
+        Ok(Err(join)) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, join.to_string()).into_response();
+        }
+        Ok(Ok(Err(failure))) => return failure.into_error_response(),
+        Ok(Ok(Ok(cross))) => cross,
+    };
+    (StatusCode::OK, Json(cross)).into_response()
 }
 
 async fn post_optimize(
@@ -1801,6 +1983,242 @@ mod tests {
             assert!(v["verdict"]["reasons"].is_array());
             assert!(v["verdict"]["oos_trades"].is_number());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn validate_body(strategy: serde_json::Value, start: i64, end: i64) -> serde_json::Value {
+        serde_json::json!({
+            "strategy": strategy,
+            "start_ms": start,
+            "end_ms": end,
+        })
+    }
+
+    fn seeded_strategy() -> serde_json::Value {
+        serde_json::json!({
+            "asset": "BTCUSDT",
+            "timeframe": "1h",
+            "side": "long",
+            "entry": {"all": [{"left": {"ind": "close"}, "op": "crosses_above", "right": {"ind": "sma", "period": 10}}]},
+            "exit": {"all": [{"left": {"ind": "close"}, "op": "crosses_below", "right": {"ind": "sma", "period": 10}}]},
+            "stop_loss_pct": 2.0,
+            "take_profit_pct": 4.0,
+        })
+    }
+
+    #[tokio::test]
+    async fn validate_runs_the_same_strategy_on_three_markets() {
+        let dir = temp_dir("validate_three");
+        let fake = FakeSource::new();
+        let body = validate_body(valid_strategy(), fake.start(), fake.end());
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::post("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["tested"], 3);
+        assert!(v["holds"].as_u64().unwrap() <= v["tested"].as_u64().unwrap());
+        assert!(v["grade"].is_string());
+        assert!(v["headline"].is_string());
+        assert!(v["unchecked"].as_array().unwrap().is_empty());
+        let markets = v["markets"].as_array().expect("markets");
+        assert_eq!(markets.len(), 3);
+        let symbols: Vec<&str> = markets
+            .iter()
+            .map(|m| m["symbol"].as_str().unwrap())
+            .collect();
+        assert_eq!(symbols, vec!["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+        for market in markets {
+            assert!(market["candle_count"].as_u64().unwrap() > 0);
+            assert!(market["stats"]["trades"].as_u64().unwrap() > 0);
+            assert!(market["out_of_sample"].is_null());
+            assert!(market["verdict"]["grade"].is_string());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_keeps_the_primary_market_first_and_dedupes() {
+        let dir = temp_dir("validate_dedupe");
+        let fake = FakeSource::new();
+        let mut body = validate_body(valid_strategy(), fake.start(), fake.end());
+        body["symbols"] = serde_json::json!(["ETHUSDT", "BTCUSDT", "ETHUSDT"]);
+        let res = app(test_state(dir.clone()))
+            .oneshot(
+                Request::post("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let markets = v["markets"].as_array().expect("markets");
+        assert_eq!(markets.len(), 2);
+        assert_eq!(markets[0]["symbol"], "BTCUSDT");
+        assert_eq!(markets[1]["symbol"], "ETHUSDT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_bad_symbol_lists() {
+        let dir = temp_dir("validate_bad_symbols");
+        let fake = FakeSource::new();
+        let cases = vec![
+            serde_json::json!([]),
+            serde_json::json!(["btcusdt"]),
+            serde_json::json!(["BTCUSDT"]),
+            serde_json::json!(["ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]),
+        ];
+        for symbols in cases {
+            let mut body = validate_body(valid_strategy(), fake.start(), fake.end());
+            body["symbols"] = symbols.clone();
+            let res = app(test_state(dir.clone()))
+                .oneshot(
+                    Request::post("/validate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "symbols: {symbols}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct PickySource {
+        inner: FakeSource,
+        broken: &'static str,
+    }
+
+    impl crate::feeds::KlineSource for PickySource {
+        fn fetch(
+            &self,
+            symbol: &str,
+            interval: &str,
+            start_ms: i64,
+            end_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
+            if symbol == self.broken {
+                return Err(crate::feeds::FeedError::Request("feed down".to_string()));
+            }
+            self.inner.fetch(symbol, interval, start_ms, end_ms, limit)
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_reports_a_market_it_could_not_load() {
+        let dir = temp_dir("validate_unchecked");
+        let fake = FakeSource::new();
+        let state = AppState {
+            source: Arc::new(PickySource {
+                inner: FakeSource::new(),
+                broken: "ETHUSDT",
+            }),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+        };
+        let body = validate_body(valid_strategy(), fake.start(), fake.end());
+        let res = app(state)
+            .oneshot(
+                Request::post("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["tested"], 2);
+        assert_eq!(v["grade"], "fragile");
+        let unchecked = v["unchecked"].as_array().expect("unchecked");
+        assert_eq!(unchecked.len(), 1);
+        assert_eq!(unchecked[0]["symbol"], "ETHUSDT");
+        assert!(
+            unchecked[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("feed down"),
+            "reason: {}",
+            unchecked[0]["reason"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_charges_the_backtest_budget_per_market() {
+        let dir = temp_dir("validate_rate_limit");
+        let fake = FakeSource::new();
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::new(3, 5, 2),
+        )
+        .expect("router");
+        let body = validate_body(valid_strategy(), fake.start(), fake.end());
+        let request = || {
+            Request::post("/validate")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let res = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = router.oneshot(request()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(res.headers().get("retry-after").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn validate_aggregates_the_same_walk_on_every_market() {
+        let dir = temp_dir("validate_walk");
+        let candles = seeded_walk(3000, 42);
+        let start = candles.first().map(|c| c.ts).unwrap_or(0);
+        let end = candles.last().map(|c| c.ts).unwrap_or(0);
+        let state = AppState {
+            source: Arc::new(WalkSource {
+                data: candles.clone(),
+            }),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+        };
+        let body = validate_body(seeded_strategy(), start, end);
+        let res = app(state)
+            .oneshot(
+                Request::post("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let markets = v["markets"].as_array().expect("markets");
+        assert_eq!(markets.len(), 3);
+        for market in markets {
+            assert_eq!(market["stats"], markets[0]["stats"]);
+            assert_eq!(market["verdict"], markets[0]["verdict"]);
+        }
+        assert_eq!(v["grade"], markets[0]["verdict"]["grade"]);
+        assert_eq!(v["tested"], 3);
+        assert_eq!(
+            v["holds"].as_u64().unwrap(),
+            if v["grade"] == "holds" { 3 } else { 0 }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

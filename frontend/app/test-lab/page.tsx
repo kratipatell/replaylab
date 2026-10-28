@@ -1,12 +1,15 @@
 // Test Lab: describe an idea, run it on past prices, get an honest verdict.
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getRun,
   listRuns,
   postBacktest,
+  postValidate,
+  type BacktestRequest,
   type BacktestResponse,
+  type CrossMarket,
   type RunSummary,
   type SavedRun,
 } from "@/lib/api";
@@ -24,6 +27,7 @@ import {
 } from "@/lib/testlab";
 import { HANDOFF_KEY, parseHandoff } from "@/lib/check";
 import BacktestForm from "@/components/BacktestForm";
+import CrossMarketCard from "@/components/CrossMarketCard";
 import EquityCharts, { MonthlyTable } from "@/components/EquityCharts";
 import SavedRuns from "@/components/SavedRuns";
 import StatsTable from "@/components/StatsTable";
@@ -37,9 +41,14 @@ export default function TestLab() {
   const [engineError, setEngineError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<BacktestResponse | null>(null);
+  const [submittedRequest, setSubmittedRequest] = useState<BacktestRequest | null>(null);
   const [submittedSplit, setSubmittedSplit] = useState<number | null>(null);
   const [submittedStart, setSubmittedStart] = useState<number | null>(null);
   const [submittedEnd, setSubmittedEnd] = useState<number | null>(null);
+  const [crossMarket, setCrossMarket] = useState<CrossMarket | null>(null);
+  const [crossMarketLoading, setCrossMarketLoading] = useState(false);
+  const [crossMarketError, setCrossMarketError] = useState<string | null>(null);
+  const crossMarketRun = useRef(0);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runsLoading, setRunsLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -116,10 +125,16 @@ export default function TestLab() {
       return;
     }
     setLoading(true);
+    crossMarketRun.current += 1;
+    setCrossMarket(null);
+    setCrossMarketLoading(false);
+    setCrossMarketError(null);
     try {
       const range = resolveRange(form, now);
-      const res = await postBacktest(buildRequest(form, now));
+      const request = buildRequest(form, now);
+      const res = await postBacktest(request);
       setResult(res);
+      setSubmittedRequest(request);
       setSubmittedSplit(holdBackToSplit(Number(form.split)));
       setSubmittedStart(range.startMs);
       setSubmittedEnd(range.endMs);
@@ -149,6 +164,11 @@ export default function TestLab() {
     try {
       setSaved(await getRun(id));
       setResult(null);
+      setSubmittedRequest(null);
+      crossMarketRun.current += 1;
+      setCrossMarket(null);
+      setCrossMarketLoading(false);
+      setCrossMarketError(null);
       setEngineError(null);
       setClientErrors([]);
     } catch (e) {
@@ -158,6 +178,33 @@ export default function TestLab() {
       setSavedLoading(false);
     }
   }, []);
+
+  const checkOtherMarkets = useCallback(async (): Promise<void> => {
+    if (submittedRequest === null) {
+      return;
+    }
+    const runId = crossMarketRun.current + 1;
+    crossMarketRun.current = runId;
+    setCrossMarketLoading(true);
+    setCrossMarketError(null);
+    try {
+      const cross = await postValidate(submittedRequest);
+      if (crossMarketRun.current !== runId) {
+        return;
+      }
+      setCrossMarket(cross);
+    } catch (e) {
+      if (crossMarketRun.current !== runId) {
+        return;
+      }
+      setCrossMarket(null);
+      setCrossMarketError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (crossMarketRun.current === runId) {
+        setCrossMarketLoading(false);
+      }
+    }
+  }, [submittedRequest]);
 
   return (
     <div className="flex max-w-4xl flex-col gap-6">
@@ -216,6 +263,35 @@ export default function TestLab() {
             verdict={result.verdict}
             onUseLongRange={() => handleFormChange({ ...form, preset: "5y" })}
           />
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => void checkOtherMarkets()}
+              disabled={crossMarketLoading || submittedRequest === null}
+              className="w-fit rounded border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-medium disabled:opacity-60"
+            >
+              {crossMarketLoading
+                ? "Checking other markets…"
+                : crossMarket === null
+                  ? "Check this rule on other markets"
+                  : "Run the cross-market check again"}
+            </button>
+            <p className="text-xs text-[var(--muted)]">
+              Runs the same rule on BTC, ETH and SOL with the same costs.
+            </p>
+            {crossMarketError !== null && !crossMarketLoading && (
+              <div
+                role="alert"
+                className="rounded border border-[var(--verdict-fails)] p-3 text-sm"
+              >
+                <p className="font-semibold">Could not check other markets:</p>
+                <p>{crossMarketError}</p>
+              </div>
+            )}
+            {crossMarket !== null && !crossMarketLoading && (
+              <CrossMarketCard result={crossMarket} />
+            )}
+          </div>
           <StatsTable
             full={result.stats}
             inSample={result.in_sample}

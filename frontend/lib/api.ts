@@ -131,6 +131,34 @@ export interface BacktestResponse {
   equity_curve: number[];
 }
 
+export interface MarketCheck {
+  symbol: string;
+  candle_count: number;
+  stats: Stats;
+  in_sample: Stats | null;
+  out_of_sample: Stats | null;
+  verdict: Verdict;
+}
+
+export interface UncheckedMarket {
+  symbol: string;
+  reason: string;
+}
+
+export interface CrossMarket {
+  grade: Grade;
+  headline: string;
+  reasons: string[];
+  holds: number;
+  tested: number;
+  markets: MarketCheck[];
+  unchecked: UncheckedMarket[];
+}
+
+export interface ValidateRequest extends BacktestRequest {
+  symbols?: string[];
+}
+
 export interface RunSummary {
   id: number;
   created_at: number;
@@ -210,6 +238,18 @@ export function postBacktest(
   signal?: AbortSignal,
 ): Promise<BacktestResponse> {
   return request<BacktestResponse>("/backtest", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function postValidate(
+  body: ValidateRequest,
+  signal?: AbortSignal,
+): Promise<CrossMarket> {
+  return request<CrossMarket>("/validate", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

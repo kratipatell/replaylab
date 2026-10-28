@@ -17,6 +17,17 @@ pub enum Grade {
     NotEnoughData,
 }
 
+impl Grade {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Grade::Holds => "holds",
+            Grade::Fragile => "fragile",
+            Grade::Fails => "fails",
+            Grade::NotEnoughData => "not enough data",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Verdict {
     pub grade: Grade,
