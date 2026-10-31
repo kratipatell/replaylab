@@ -380,6 +380,56 @@ export function buildRequest(form: TestLabForm, nowMs: number): BacktestRequest 
   return body;
 }
 
+function sameRules(group: RuleGroupState, submitted: Rules | null | undefined): boolean {
+  return JSON.stringify(toRules(group)) === JSON.stringify(submitted ?? { all: [], any: [] });
+}
+
+function sameNumber(raw: string, submitted: number | undefined): boolean {
+  return raw.trim() === "" ? submitted === undefined : submitted !== undefined && Number(raw) === submitted;
+}
+
+// Labels for form inputs that no longer match the request the results were
+// pinned to, with the value those results actually used.
+export function describeStaleInputs(
+  form: TestLabForm,
+  submitted: BacktestRequest,
+  nowMs: number,
+): string[] {
+  const { strategy } = submitted;
+  const stale: string[] = [];
+  const add = (differs: boolean, label: string): void => {
+    if (differs) {
+      stale.push(label);
+    }
+  };
+
+  add(form.asset !== strategy.asset, `asset ${strategy.asset}`);
+  add(form.timeframe !== strategy.timeframe, `timeframe ${strategy.timeframe}`);
+  add(form.side !== strategy.side, `side ${strategy.side}`);
+  add(!sameRules(form.entry, strategy.entry), "entry rules");
+  add(!sameRules(form.exit, strategy.exit), "exit rules");
+  add(!sameNumber(form.stopLoss, strategy.stop_loss_pct), `stop loss ${strategy.stop_loss_pct}`);
+  add(!sameNumber(form.takeProfit, strategy.take_profit_pct), `take profit ${strategy.take_profit_pct}`);
+  const submittedSplit = submitted.split;
+  if (submittedSplit !== undefined && form.split !== "") {
+    add(
+      holdBackToSplit(Number(form.split)) !== submittedSplit,
+      `hold back ${Number(splitToHoldBack(submittedSplit).toFixed(2))}%`,
+    );
+  }
+
+  const range = resolveRange(form, nowMs);
+  const rangeDiffers =
+    form.preset === "custom"
+      ? Math.floor(range.startMs) !== submitted.start_ms || Math.floor(range.endMs) !== submitted.end_ms
+      : range.endMs - range.startMs !== submitted.end_ms - submitted.start_ms;
+  add(rangeDiffers, "date range");
+
+  add(Number(form.feeBps) !== submitted.fee_bps, `fees ${submitted.fee_bps}`);
+  add(Number(form.slippageBps) !== submitted.slippage_bps, `slippage ${submitted.slippage_bps}`);
+  return stale;
+}
+
 export const PARTIAL_LOAD_NOTE = "Part of this idea could not be loaded:";
 
 export function formatLoadNote(notes: string[]): string | null {

@@ -16,6 +16,7 @@ import {
 import {
   buildRequest,
   defaultForm,
+  describeStaleInputs,
   fixHint,
   formatLoadNote,
   holdBackToSplit,
@@ -206,6 +207,11 @@ export default function TestLab() {
     }
   }, [submittedRequest]);
 
+  const staleInputs =
+    result !== null && submittedRequest !== null
+      ? describeStaleInputs(form, submittedRequest, submittedRequest.end_ms)
+      : [];
+
   return (
     <div className="flex max-w-4xl flex-col gap-6">
       <div className="flex flex-col gap-1">
@@ -255,6 +261,14 @@ export default function TestLab() {
 
       {result !== null && !loading && (
         <div className="flex flex-col gap-4">
+          {staleInputs.length > 0 && (
+            <p
+              role="status"
+              className="rounded border border-[var(--verdict-fragile)] bg-[var(--surface)] p-3 text-sm"
+            >
+              Results are for earlier inputs: {staleInputs.join(", ")}. Run test to update.
+            </p>
+          )}
           <p className="text-xs text-[var(--muted)]">
             Run {result.run_id === null ? "" : `#${result.run_id} · `}
             {plural(result.candle_count, "candle")}
@@ -277,7 +291,9 @@ export default function TestLab() {
                   : "Run the cross-market check again"}
             </button>
             <p className="text-xs text-[var(--muted)]">
-              Runs the same rule on BTC, ETH and SOL with the same costs.
+              Runs the same rule on BTC, ETH and SOL with the costs the results
+              used: fees {submittedRequest?.fee_bps} bps, slippage{" "}
+              {submittedRequest?.slippage_bps} bps.
             </p>
             {crossMarketError !== null && !crossMarketLoading && (
               <div

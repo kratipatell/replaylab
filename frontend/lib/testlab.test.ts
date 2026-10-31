@@ -4,6 +4,9 @@ import {
   MAX_CHART_POINTS,
   PARTIAL_LOAD_NOTE,
   type SeriesPoint,
+  buildRequest,
+  defaultForm,
+  describeStaleInputs,
   downsample,
   drawdownPct,
   estimateCandles,
@@ -106,6 +109,53 @@ describe("seriesX", () => {
 function roundTrip(strategy: Strategy): Strategy {
   return formToStrategy(strategyToForm(strategy).form);
 }
+
+describe("describeStaleInputs", () => {
+  const now = Date.UTC(2026, 0, 1);
+
+  function run() {
+    const form = { ...defaultForm(), takeProfit: "4", feeBps: "5" };
+    return { form, submitted: buildRequest(form, now) };
+  }
+
+  it("has no notice when the form matches the submitted request", () => {
+    const { form, submitted } = run();
+    expect(describeStaleInputs(form, submitted, now)).toEqual([]);
+  });
+
+  it("names take profit with the value the results used", () => {
+    const { form, submitted } = run();
+    expect(describeStaleInputs({ ...form, takeProfit: "3" }, submitted, now)).toEqual([
+      "take profit 4",
+    ]);
+  });
+
+  it("names fees with the value the results used", () => {
+    const { form, submitted } = run();
+    expect(describeStaleInputs({ ...form, feeBps: "10" }, submitted, now)).toEqual(["fees 5"]);
+  });
+
+  it("clears when the edited value is changed back", () => {
+    const { form, submitted } = run();
+    const edited = { ...form, takeProfit: "3" };
+    expect(describeStaleInputs(edited, submitted, now)).not.toEqual([]);
+    expect(describeStaleInputs({ ...edited, takeProfit: "4" }, submitted, now)).toEqual([]);
+  });
+
+  it("clears after a new run pins results to the edited form", () => {
+    const { form } = run();
+    const edited = { ...form, takeProfit: "3", feeBps: "10" };
+    const submitted = buildRequest(edited, now);
+    expect(describeStaleInputs(edited, submitted, now)).toEqual([]);
+  });
+
+  it("names every differing input in one notice", () => {
+    const { form, submitted } = run();
+    expect(
+      describeStaleInputs({ ...form, takeProfit: "3", feeBps: "10" }, submitted, now),
+    ).toEqual(["take profit 4", "fees 5"]);
+  });
+});
 
 describe("strategy to form mapping", () => {
   it("round-trips a long entry with a number operand and a stop", () => {
