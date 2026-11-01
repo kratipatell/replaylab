@@ -1225,6 +1225,28 @@ mod legacy_tests {
             t.exit_price
         );
     }
+
+    #[test]
+    fn same_bar_stop_and_target_exits_at_the_stop() {
+        let candles = vec![
+            c(0, 90.0, 115.0, 90.0, 110.0),
+            c(1, 100.0, 101.0, 99.0, 100.0),
+            c(2, 100.0, 106.0, 97.0, 100.0),
+        ];
+        let strat = long_strategy(entry_close_gt(100.0), None, Some(2.0), Some(2.0));
+        let res = backtest_strategy(&strat, &candles, &zero_cost()).unwrap();
+        assert_eq!(res.trades.len(), 1);
+        let t = &res.trades[0];
+        assert_eq!(t.entry_idx, 1);
+        assert_eq!(t.exit_idx, 2);
+        assert_eq!(t.reason, ExitReason::StopLoss);
+        assert!(
+            (t.exit_price - 98.0).abs() < 1e-12,
+            "exit {} expected stop 98.0",
+            t.exit_price
+        );
+        assert!((t.return_pct - (-2.0)).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]
