@@ -86,6 +86,7 @@ pub struct Trail {
     percent: Option<f64>,
     base: Option<f64>,
     level: Option<f64>,
+    prev_level: Option<f64>,
 }
 
 impl Trail {
@@ -103,6 +104,7 @@ impl Trail {
             percent,
             base: level,
             level,
+            prev_level: level,
         }
     }
 
@@ -122,9 +124,16 @@ impl Trail {
         self.level
     }
 
+    /// Level as it stood at the previous bar's close, before the last
+    /// `advance`, so a level the current bar's own high creates is excluded.
+    pub fn previous_level(&self) -> Option<f64> {
+        self.prev_level
+    }
+
     /// Advance the ratchet with `bar`, then return the new level.
     pub fn advance(&mut self, side: Side, bar: &Candle) -> Option<f64> {
         let pct = self.percent?;
+        self.prev_level = self.level;
         let t = pct / 100.0;
         let candidate = match side {
             Side::Long => {
@@ -189,7 +198,9 @@ fn gapped_through(side: Side, level: f64, open: f64) -> bool {
 ///
 /// The stop is checked before the target when both are touched inside the
 /// same bar, because the bar does not say which came first. A gap through a
-/// level fills at the open.
+/// level fills at the open. The gap is measured against the stop as it stood
+/// at the previous close, so a level only the current bar's own high creates
+/// can never be gapped.
 pub fn resolve_exit(
     bar: &Candle,
     side: Side,
@@ -197,8 +208,7 @@ pub fn resolve_exit(
     target: Option<f64>,
     trail: &Trail,
 ) -> Option<(f64, ExitReason)> {
-    // The gap check uses the entry-relative trail, so only its level matters.
-    let gap_stop = tighter(side, fixed_stop, trail.base()).0;
+    let (gap_stop, gap_is_trail) = tighter(side, fixed_stop, trail.previous_level());
     let (stop, stop_is_trail) = tighter(side, fixed_stop, trail.level());
 
     let stop_hit = match side {
@@ -213,7 +223,7 @@ pub fn resolve_exit(
     };
 
     let stop_exit = |is_trail: bool| match gap_stop {
-        Some(g) if gapped_through(side, g, bar.open) => Some((bar.open, reason_for(is_trail))),
+        Some(g) if gapped_through(side, g, bar.open) => Some((bar.open, reason_for(gap_is_trail))),
         _ => stop.map(|s| (s, reason_for(is_trail))),
     };
 
@@ -431,19 +441,54 @@ mod tests {
     }
 
     #[test]
-    fn gap_check_uses_the_entry_relative_trail() {
+    fn gap_check_uses_the_previous_bar_level() {
         let mut trail = Trail::new(Side::Long, 100.0, Some(10.0));
-        trail.advance(Side::Long, &bar(100.0, 150.0, 99.0, 148.0));
-        assert_eq!(trail.level(), Some(135.0));
-        // Open 130 is under the ratcheted level but above the entry-relative
-        // one, so this is a stop hit, not a gap.
-        let b = bar(130.0, 132.0, 129.0, 131.0);
+        assert_eq!(trail.previous_level(), Some(90.0));
+        trail.advance(Side::Long, &bar(100.0, 120.0, 99.0, 118.0));
+        assert_eq!(trail.level(), Some(108.0));
+        assert_eq!(trail.previous_level(), Some(90.0));
+        trail.advance(Side::Long, &bar(118.0, 125.0, 117.0, 124.0));
+        assert_eq!(trail.level(), Some(112.5));
+        assert_eq!(trail.previous_level(), Some(108.0));
+        assert_eq!(trail.base(), Some(90.0));
+        // Open 105 is under the 108 earlier bars reached but above the
+        // entry-relative 90, so the ratchet is a gap and pays the open.
+        let b = bar(105.0, 106.0, 104.0, 104.5);
         let got = resolve_exit(&b, Side::Long, None, None, &trail);
-        assert_eq!(got, Some((135.0, ExitReason::Trailing)));
-        // A true gap opens under the entry-relative trail and fills at the open.
-        let b = bar(85.0, 86.0, 84.0, 85.0);
-        let got = resolve_exit(&b, Side::Long, None, None, &trail);
-        assert_eq!(got, Some((85.0, ExitReason::Trailing)));
+        assert_eq!(got, Some((105.0, ExitReason::Trailing)));
+    }
+
+    #[test]
+    fn short_gap_above_a_ratcheted_trail_fills_at_the_open() {
+        let mut trail = Trail::new(Side::Short, 100.0, Some(10.0));
+        assert_eq!(trail.level(), Some(110.0));
+        trail.advance(Side::Short, &bar(100.0, 101.0, 80.0, 82.0));
+        assert_eq!(trail.level(), Some(88.0));
+        trail.advance(Side::Short, &bar(84.0, 85.0, 75.0, 76.0));
+        assert_eq!(trail.level(), Some(82.5));
+        assert_eq!(trail.previous_level(), Some(88.0));
+        // Open 90 is above the 88 that earlier lows had already ratcheted,
+        // which is what the gap check reads, so it pays the 90 open rather
+        // than the 82.5 level.
+        let b = bar(90.0, 92.0, 89.0, 89.5);
+        let got = resolve_exit(&b, Side::Short, None, None, &trail);
+        assert_eq!(got, Some((90.0, ExitReason::Trailing)));
+    }
+
+    #[test]
+    fn a_stop_the_current_bar_ratchets_is_not_a_gap() {
+        let mut trail = Trail::new(Side::Long, 100.0, Some(10.0));
+        // This bar's own high lifts the level from 90 to 108, above the 100
+        // open, and its low touches 108. Only the previous level counts for
+        // the gap, so this fills at the level, not the open.
+        let b = bar(100.0, 120.0, 100.0, 118.0);
+        trail.advance(Side::Long, &b);
+        assert_eq!(trail.level(), Some(108.0));
+        assert_eq!(trail.previous_level(), Some(90.0));
+        assert_eq!(
+            resolve_exit(&b, Side::Long, None, None, &trail),
+            Some((108.0, ExitReason::Trailing))
+        );
     }
 
     #[test]

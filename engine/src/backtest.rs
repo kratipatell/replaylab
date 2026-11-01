@@ -638,6 +638,42 @@ mod tests {
         };
         assert!(b.validate().is_err());
     }
+
+    #[test]
+    fn ratcheted_trail_opening_below_the_level_fills_at_the_open() {
+        // Entry 100 with a 10% trail: entry-relative level 90, ratcheted to
+        // 108 by the 120 high. The last bar opens at 105, under that 108.
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 111.0, 100.0, 110.0),
+            c(2 * MS_PER_MIN, 110.0, 120.0, 110.0, 119.0),
+            c(3 * MS_PER_MIN, 105.0, 106.0, 104.0, 104.5),
+        ];
+        let mut s = Sig(vec![Some(Side::Long), None, None, None]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: Some(10.0),
+        };
+        let r = run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &session_all(),
+            &run_cfg(),
+        )
+        .unwrap();
+        assert_eq!(r.trades.len(), 1);
+        assert_eq!(r.trades[0].entry_idx, 1);
+        assert_eq!(r.trades[0].exit_idx, 3);
+        assert_eq!(r.trades[0].reason, ExitReason::Trailing);
+        // The 108 stop was already breached at the open, so the gap pays the
+        // 105 open rather than a price the position could not have got.
+        assert!((r.trades[0].exit_price - 105.0).abs() < 1e-9);
+        assert!((r.equity_curve[3] - 10_005.0).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]
