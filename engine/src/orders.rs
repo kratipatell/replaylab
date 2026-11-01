@@ -197,7 +197,8 @@ pub fn resolve_exit(
     target: Option<f64>,
     trail: &Trail,
 ) -> Option<(f64, ExitReason)> {
-    let (gap_stop, gap_is_trail) = tighter(side, fixed_stop, trail.base());
+    // The gap check uses the entry-relative trail, so only its level matters.
+    let gap_stop = tighter(side, fixed_stop, trail.base()).0;
     let (stop, stop_is_trail) = tighter(side, fixed_stop, trail.level());
 
     let stop_hit = match side {
@@ -235,7 +236,7 @@ pub fn resolve_exit(
             if target_gapped {
                 Some((bar.open, ExitReason::TakeProfit))
             } else {
-                stop_exit(gap_is_trail)
+                stop_exit(stop_is_trail)
             }
         }
     }
@@ -373,6 +374,19 @@ mod tests {
         let trail = Trail::new(Side::Long, 100.0, None);
         let got = resolve_exit(&b, Side::Long, Some(98.0), Some(105.0), &trail);
         assert_eq!(got, Some((98.0, ExitReason::StopLoss)));
+    }
+
+    #[test]
+    fn both_levels_one_bar_reports_a_ratcheted_trail_as_trailing() {
+        let mut trail = Trail::new(Side::Long, 100.0, Some(10.0));
+        trail.advance(Side::Long, &bar(100.0, 120.0, 99.0, 118.0));
+        assert_eq!(trail.base(), Some(90.0));
+        assert_eq!(trail.level(), Some(108.0));
+        // Fixed 95 is tighter than the entry-relative trail but looser than
+        // the ratchet, and this bar touches both the ratchet and the target.
+        let b = bar(109.0, 111.0, 107.0, 110.0);
+        let got = resolve_exit(&b, Side::Long, Some(95.0), Some(110.0), &trail);
+        assert_eq!(got, Some((108.0, ExitReason::Trailing)));
     }
 
     #[test]
