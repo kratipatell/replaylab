@@ -129,6 +129,223 @@ fn levels(side: Side, entry: f64, b: &Bracket) -> (Option<f64>, Option<f64>, Opt
     }
 }
 
+struct PendingEntry {
+    side: Side,
+    sig_ts: i64,
+}
+
+struct SimCtx<'a> {
+    instrument: &'a Instrument,
+    cost_rate: f64,
+    pv: f64,
+    sizing: Sizing,
+    bracket: &'a Bracket,
+    session: &'a SessionFilter,
+    exit_at_session_end: bool,
+}
+
+struct SimState {
+    equity: f64,
+    position: Option<OpenPos>,
+    pending: Option<PendingEntry>,
+    pending_exit: bool,
+    trades: Vec<Trade>,
+    equity_curve: Vec<f64>,
+}
+
+fn close_position(
+    ctx: &SimCtx,
+    pos: &OpenPos,
+    exit_raw: f64,
+    exit_ts: i64,
+    exit_idx: usize,
+    reason: ExitReason,
+    equity_before: f64,
+) -> (f64, Trade) {
+    let sign = match pos.side {
+        Side::Long => 1.0,
+        Side::Short => -1.0,
+    };
+    let exit_cost = ctx.cost_rate * pos.qty * ctx.pv * exit_raw;
+    let pnl = sign * pos.qty * ctx.pv * (exit_raw - pos.entry_raw);
+    let after = equity_before + pnl - pos.entry_cost - exit_cost;
+    let ret = 100.0 * (after / equity_before - 1.0);
+    let trade = Trade {
+        entry_idx: pos.entry_idx,
+        exit_idx,
+        entry_ts: pos.entry_ts,
+        exit_ts,
+        side: pos.side,
+        entry_price: pos.entry_raw,
+        exit_price: exit_raw,
+        return_pct: ret,
+        reason,
+    };
+    (after, trade)
+}
+
+impl SimState {
+    fn new(initial_equity: f64, n: usize) -> SimState {
+        SimState {
+            equity: initial_equity,
+            position: None,
+            pending: None,
+            pending_exit: false,
+            trades: Vec::new(),
+            equity_curve: Vec::with_capacity(n),
+        }
+    }
+
+    fn step(
+        &mut self,
+        i: usize,
+        candles: &[Candle],
+        strategy: &mut dyn BarStrategy,
+        ctx: &SimCtx,
+    ) -> Result<(), BacktestError> {
+        let bar = &candles[i];
+        let next = candles.get(i + 1);
+        if self.pending_exit {
+            if let Some(pos) = self.position.take() {
+                let raw_exit = bar.open;
+                let (after, trade) = close_position(
+                    ctx,
+                    &pos,
+                    raw_exit,
+                    bar.ts,
+                    i,
+                    ExitReason::Signal,
+                    self.equity,
+                );
+                self.equity = after;
+                self.trades.push(trade);
+            }
+            self.pending_exit = false;
+        }
+        if self.position.is_none() {
+            if let Some(entry) = self.pending.take() {
+                if ctx.session.contains(entry.sig_ts) && ctx.session.contains(bar.ts) {
+                    let entry_raw = ctx.instrument.round_to_tick(bar.open);
+                    let qty = quantity(ctx.sizing, self.equity, entry_raw)?;
+                    let entry_cost = ctx.cost_rate * qty * ctx.pv * entry_raw;
+                    self.position = Some(OpenPos {
+                        entry_idx: i,
+                        entry_ts: bar.ts,
+                        entry_raw,
+                        side: entry.side,
+                        qty,
+                        equity_at_entry: self.equity,
+                        entry_cost,
+                        peak: entry_raw,
+                        trail: Trail::new(entry.side, entry_raw, ctx.bracket.trailing_pct),
+                    });
+                    strategy.on_fill(i);
+                }
+            }
+        }
+
+        if let Some(mut pos) = self.position.take() {
+            let (fixed_stop, target, _base_trail) = levels(pos.side, pos.entry_raw, ctx.bracket);
+            let mut peak = pos.peak;
+            if ctx.bracket.trailing_pct.is_some() {
+                match pos.side {
+                    Side::Long => {
+                        if bar.high > peak {
+                            peak = bar.high;
+                        }
+                    }
+                    Side::Short => {
+                        if bar.low < peak {
+                            peak = bar.low;
+                        }
+                    }
+                }
+            }
+            pos.peak = peak;
+            let _ = pos.trail.advance(pos.side, bar);
+            let exit = orders::resolve_exit(bar, pos.side, fixed_stop, target, &pos.trail);
+            if let Some((raw_exit, reason)) = exit {
+                let (after, trade) =
+                    close_position(ctx, &pos, raw_exit, bar.ts, i, reason, self.equity);
+                self.equity = after;
+                self.trades.push(trade);
+            } else {
+                self.position = Some(pos);
+                if ctx.exit_at_session_end
+                    && ctx.session.contains(bar.ts)
+                    && next.is_none_or(|b| !ctx.session.contains(b.ts))
+                {
+                    let Some(pos) = self.position.take() else {
+                        return Err(BacktestError::Internal("missing position".to_string()));
+                    };
+                    let raw_exit = bar.close;
+                    let (after, trade) = close_position(
+                        ctx,
+                        &pos,
+                        raw_exit,
+                        bar.ts,
+                        i,
+                        ExitReason::SessionEnd,
+                        self.equity,
+                    );
+                    self.equity = after;
+                    self.trades.push(trade);
+                }
+            }
+        }
+
+        if next.is_some() {
+            if self.position.is_some() {
+                if strategy.exit_on_bar(i, candles) {
+                    self.pending_exit = true;
+                }
+            } else if self.pending.is_none() && ctx.session.contains(bar.ts) {
+                if let Some(side) = strategy.on_bar(i, candles) {
+                    self.pending = Some(PendingEntry {
+                        side,
+                        sig_ts: bar.ts,
+                    });
+                }
+            }
+        }
+
+        if let Some(pos) = &self.position {
+            let sign = match pos.side {
+                Side::Long => 1.0,
+                Side::Short => -1.0,
+            };
+            let mtm_cost = ctx.cost_rate * pos.qty * ctx.pv * bar.close;
+            let mtm = pos.equity_at_entry + sign * pos.qty * ctx.pv * (bar.close - pos.entry_raw)
+                - pos.entry_cost
+                - mtm_cost;
+            self.equity_curve.push(mtm);
+        } else {
+            self.equity_curve.push(self.equity);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, i: usize, bar: &Candle, ctx: &SimCtx) {
+        if let Some(pos) = self.position.take() {
+            let raw_exit = bar.close;
+            let (after, trade) = close_position(
+                ctx,
+                &pos,
+                raw_exit,
+                bar.ts,
+                i,
+                ExitReason::EndOfData,
+                self.equity,
+            );
+            self.equity = after;
+            self.trades.push(trade);
+            if let Some(last) = self.equity_curve.last_mut() {
+                *last = self.equity;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     strategy: &mut dyn BarStrategy,
@@ -150,175 +367,23 @@ pub fn run(
             equity_curve: Vec::new(),
         });
     }
-    let cost_rate = instrument.cost_rate();
-    let pv = instrument.point_value;
-
-    let mut trades: Vec<Trade> = Vec::new();
-    let mut equity_curve: Vec<f64> = Vec::with_capacity(n);
-    let mut equity = cfg.initial_equity;
-    let mut position: Option<OpenPos> = None;
-    let mut pending: Option<(Side, usize)> = None;
-    let mut pending_exit = false;
-
-    let close_position = |pos: &OpenPos,
-                          exit_raw: f64,
-                          exit_ts: i64,
-                          exit_idx: usize,
-                          reason: ExitReason,
-                          equity_before: f64|
-     -> (f64, Trade) {
-        let sign = match pos.side {
-            Side::Long => 1.0,
-            Side::Short => -1.0,
-        };
-        let exit_cost = cost_rate * pos.qty * pv * exit_raw;
-        let pnl = sign * pos.qty * pv * (exit_raw - pos.entry_raw);
-        let after = equity_before + pnl - pos.entry_cost - exit_cost;
-        let ret = 100.0 * (after / equity_before - 1.0);
-        let trade = Trade {
-            entry_idx: pos.entry_idx,
-            exit_idx,
-            entry_ts: pos.entry_ts,
-            exit_ts,
-            side: pos.side,
-            entry_price: pos.entry_raw,
-            exit_price: exit_raw,
-            return_pct: ret,
-            reason,
-        };
-        (after, trade)
+    let ctx = SimCtx {
+        instrument,
+        cost_rate: instrument.cost_rate(),
+        pv: instrument.point_value,
+        sizing,
+        bracket,
+        session,
+        exit_at_session_end: cfg.exit_at_session_end,
     };
-
+    let mut state = SimState::new(cfg.initial_equity, n);
     for i in 0..n {
-        if pending_exit {
-            if let Some(pos) = position.take() {
-                let raw_exit = candles[i].open;
-                let (after, trade) =
-                    close_position(&pos, raw_exit, candles[i].ts, i, ExitReason::Signal, equity);
-                equity = after;
-                trades.push(trade);
-            }
-            pending_exit = false;
-        }
-        if position.is_none() {
-            if let Some((side, sig_idx)) = pending.take() {
-                if session.contains(candles[sig_idx].ts) && session.contains(candles[i].ts) {
-                    let entry_raw = instrument.round_to_tick(candles[i].open);
-                    let qty = quantity(sizing, equity, entry_raw)?;
-                    let entry_cost = cost_rate * qty * pv * entry_raw;
-                    position = Some(OpenPos {
-                        entry_idx: i,
-                        entry_ts: candles[i].ts,
-                        entry_raw,
-                        side,
-                        qty,
-                        equity_at_entry: equity,
-                        entry_cost,
-                        peak: entry_raw,
-                        trail: Trail::new(side, entry_raw, bracket.trailing_pct),
-                    });
-                    strategy.on_fill(i);
-                }
-            }
-        }
-
-        if let Some(mut pos) = position.take() {
-            let (fixed_stop, target, _base_trail) = levels(pos.side, pos.entry_raw, bracket);
-            let mut peak = pos.peak;
-            if bracket.trailing_pct.is_some() {
-                match pos.side {
-                    Side::Long => {
-                        if candles[i].high > peak {
-                            peak = candles[i].high;
-                        }
-                    }
-                    Side::Short => {
-                        if candles[i].low < peak {
-                            peak = candles[i].low;
-                        }
-                    }
-                }
-            }
-            pos.peak = peak;
-            let _ = pos.trail.advance(pos.side, &candles[i]);
-            let exit = orders::resolve_exit(&candles[i], pos.side, fixed_stop, target, &pos.trail);
-            if let Some((raw_exit, reason)) = exit {
-                let (after, trade) =
-                    close_position(&pos, raw_exit, candles[i].ts, i, reason, equity);
-                equity = after;
-                trades.push(trade);
-            } else {
-                position = Some(pos);
-                if cfg.exit_at_session_end
-                    && session.contains(candles[i].ts)
-                    && (i + 1 == n || !session.contains(candles[i + 1].ts))
-                {
-                    let Some(pos) = position.take() else {
-                        return Err(BacktestError::Internal("missing position".to_string()));
-                    };
-                    let raw_exit = candles[i].close;
-                    let (after, trade) = close_position(
-                        &pos,
-                        raw_exit,
-                        candles[i].ts,
-                        i,
-                        ExitReason::SessionEnd,
-                        equity,
-                    );
-                    equity = after;
-                    trades.push(trade);
-                }
-            }
-        }
-
-        if i + 1 < n {
-            if position.is_some() {
-                if strategy.exit_on_bar(i, candles) {
-                    pending_exit = true;
-                }
-            } else if pending.is_none() && session.contains(candles[i].ts) {
-                if let Some(side) = strategy.on_bar(i, candles) {
-                    pending = Some((side, i));
-                }
-            }
-        }
-
-        if let Some(pos) = &position {
-            let sign = match pos.side {
-                Side::Long => 1.0,
-                Side::Short => -1.0,
-            };
-            let mtm_cost = cost_rate * pos.qty * pv * candles[i].close;
-            let mtm = pos.equity_at_entry
-                + sign * pos.qty * pv * (candles[i].close - pos.entry_raw)
-                - pos.entry_cost
-                - mtm_cost;
-            equity_curve.push(mtm);
-        } else {
-            equity_curve.push(equity);
-        }
+        state.step(i, candles, strategy, &ctx)?;
     }
-
-    if let Some(pos) = position.take() {
-        let raw_exit = candles[n - 1].close;
-        let (after, trade) = close_position(
-            &pos,
-            raw_exit,
-            candles[n - 1].ts,
-            n - 1,
-            ExitReason::EndOfData,
-            equity,
-        );
-        equity = after;
-        trades.push(trade);
-        if let Some(last) = equity_curve.last_mut() {
-            *last = equity;
-        }
-    }
-
+    state.finish(n - 1, &candles[n - 1], &ctx);
     Ok(BacktestResult {
-        trades,
-        equity_curve,
+        trades: state.trades,
+        equity_curve: state.equity_curve,
     })
 }
 
@@ -1431,5 +1496,454 @@ mod orb_recon_tests {
         assert!((r.trades[0].exit_price - 98.0).abs() < 1e-9);
         assert_eq!(r.trades[0].reason, ExitReason::StopLoss);
         assert!((r.equity_curve[1] - 9_998.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod golden_sim_tests {
+    use crate::backtest::{run, BacktestResult, Bracket, ExitReason, RunConfig, Trade};
+    use crate::instrument::Instrument;
+    use crate::session::{SessionFilter, MS_PER_MIN};
+    use crate::sizing::Sizing;
+    use crate::strategy::{BarStrategy, Orb, OrbConfig, Side};
+    use crate::types::Candle;
+
+    fn c(ts: i64, o: f64, h: f64, l: f64, cl: f64) -> Candle {
+        Candle {
+            ts,
+            open: o,
+            high: h,
+            low: l,
+            close: cl,
+        }
+    }
+
+    fn inst() -> Instrument {
+        Instrument::new("TEST", 0.01, 1.0, 0.0, 0.0).expect("valid")
+    }
+
+    fn cfg(exit_at_session_end: bool) -> RunConfig {
+        RunConfig::new(10_000.0, exit_at_session_end).expect("valid")
+    }
+
+    struct Scripted {
+        entries: Vec<Option<Side>>,
+        exits: Vec<bool>,
+    }
+
+    impl BarStrategy for Scripted {
+        fn on_bar(&mut self, idx: usize, _candles: &[Candle]) -> Option<Side> {
+            self.entries.get(idx).copied().flatten()
+        }
+
+        fn exit_on_bar(&mut self, idx: usize, _candles: &[Candle]) -> bool {
+            self.exits.get(idx).copied().unwrap_or(false)
+        }
+    }
+
+    fn scripted(entries: &[Option<Side>], exits: &[bool]) -> Scripted {
+        Scripted {
+            entries: entries.to_vec(),
+            exits: exits.to_vec(),
+        }
+    }
+
+    fn flat() -> Bracket {
+        Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: None,
+        }
+    }
+
+    fn case_take_profit_exit() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 103.0, 100.0, 102.0),
+            c(2 * MS_PER_MIN, 102.0, 102.0, 102.0, 102.0),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None], &[]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: Some(2.0),
+            trailing_pct: None,
+        };
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_stop_loss_exit() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 101.0, 97.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None], &[]);
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: None,
+            trailing_pct: None,
+        };
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_trailing_exit_after_ratchet() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 110.0, 109.0, 109.0),
+            c(2 * MS_PER_MIN, 109.0, 109.0, 108.0, 108.5),
+            c(3 * MS_PER_MIN, 108.5, 108.5, 108.5, 108.5),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None, None], &[]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: Some(1.0),
+        };
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_gap_through_trail_fills_at_open() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 111.0, 100.0, 110.0),
+            c(2 * MS_PER_MIN, 110.0, 120.0, 110.0, 119.0),
+            c(3 * MS_PER_MIN, 105.0, 106.0, 104.0, 104.5),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None, None], &[]);
+        let b = Bracket {
+            stop_pct: None,
+            target_pct: None,
+            trailing_pct: Some(10.0),
+        };
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_signal_exit() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.5, 99.5, 100.0),
+            c(2 * MS_PER_MIN, 105.0, 106.0, 104.0, 105.5),
+            c(3 * MS_PER_MIN, 105.5, 106.0, 104.0, 105.0),
+        ];
+        let mut s = scripted(
+            &[Some(Side::Long), None, None, None],
+            &[false, true, false, false],
+        );
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat(),
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_session_end_exit() -> BacktestResult {
+        let candles = vec![
+            c(570 * MS_PER_MIN, 100.0, 100.4, 99.8, 100.2),
+            c(571 * MS_PER_MIN, 100.2, 101.0, 100.0, 100.8),
+            c(572 * MS_PER_MIN, 100.8, 102.0, 100.7, 101.5),
+            c(600 * MS_PER_MIN, 101.5, 101.6, 101.4, 101.5),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None, None], &[]);
+        let session = SessionFilter::new(570, 600).expect("valid");
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat(),
+            &session,
+            &cfg(true),
+        )
+        .unwrap()
+    }
+
+    fn case_end_of_data_flatten() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 101.0, 99.0, 100.5),
+            c(2 * MS_PER_MIN, 100.5, 102.0, 100.0, 101.5),
+        ];
+        let mut s = scripted(&[Some(Side::Long), None, None], &[]);
+        run(
+            &mut s,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &flat(),
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn case_orb_run() -> BacktestResult {
+        let candles = vec![
+            c(0, 100.0, 101.0, 99.0, 100.0),
+            c(MS_PER_MIN, 100.0, 102.0, 99.5, 101.0),
+            c(2 * MS_PER_MIN, 101.0, 103.0, 100.0, 102.5),
+            c(3 * MS_PER_MIN, 102.5, 104.0, 102.0, 103.5),
+            c(4 * MS_PER_MIN, 103.5, 107.0, 103.0, 106.0),
+        ];
+        let mut orb = Orb::new(OrbConfig::new(2, 0.0, 1).expect("valid"));
+        let b = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: Some(4.0),
+            trailing_pct: None,
+        };
+        run(
+            &mut orb,
+            &candles,
+            &inst(),
+            Sizing::FixedQty(1.0),
+            &b,
+            &SessionFilter::all_day(),
+            &cfg(false),
+        )
+        .unwrap()
+    }
+
+    fn golden(label: &str, got: &BacktestResult, trades: &[Trade], equity: &[f64]) {
+        assert_eq!(got.trades, trades, "{label}: trades");
+        assert_eq!(got.equity_curve, equity, "{label}: equity_curve");
+    }
+
+    #[test]
+    fn golden_take_profit_exit() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 1,
+            entry_ts: 60_000,
+            exit_ts: 60_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 102.0,
+            return_pct: 0.019999999999997797,
+            reason: ExitReason::TakeProfit,
+        }];
+        golden(
+            "take_profit",
+            &case_take_profit_exit(),
+            &expected,
+            &[10000.0, 10002.0, 10002.0],
+        );
+    }
+
+    #[test]
+    fn golden_stop_loss_exit() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 1,
+            entry_ts: 60_000,
+            exit_ts: 60_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 98.0,
+            return_pct: -0.019999999999997797,
+            reason: ExitReason::StopLoss,
+        }];
+        golden(
+            "stop_loss",
+            &case_stop_loss_exit(),
+            &expected,
+            &[10000.0, 9998.0, 9998.0],
+        );
+    }
+
+    #[test]
+    fn golden_trailing_exit_after_ratchet() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 2,
+            entry_ts: 60_000,
+            exit_ts: 120_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 108.9,
+            return_pct: 0.08900000000000574,
+            reason: ExitReason::Trailing,
+        }];
+        golden(
+            "trailing_ratchet",
+            &case_trailing_exit_after_ratchet(),
+            &expected,
+            &[10000.0, 10009.0, 10008.9, 10008.9],
+        );
+    }
+
+    #[test]
+    fn golden_gap_through_trail_fills_at_open() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 3,
+            entry_ts: 60_000,
+            exit_ts: 180_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 105.0,
+            return_pct: 0.04999999999999449,
+            reason: ExitReason::Trailing,
+        }];
+        golden(
+            "gap_trail",
+            &case_gap_through_trail_fills_at_open(),
+            &expected,
+            &[10000.0, 10010.0, 10019.0, 10005.0],
+        );
+    }
+
+    #[test]
+    fn golden_signal_exit() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 2,
+            entry_ts: 60_000,
+            exit_ts: 120_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 105.0,
+            return_pct: 0.04999999999999449,
+            reason: ExitReason::Signal,
+        }];
+        golden(
+            "signal_exit",
+            &case_signal_exit(),
+            &expected,
+            &[10000.0, 10000.0, 10005.0, 10005.0],
+        );
+    }
+
+    #[test]
+    fn golden_session_end_exit() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 2,
+            entry_ts: 34_260_000,
+            exit_ts: 34_320_000,
+            side: Side::Long,
+            entry_price: 100.2,
+            exit_price: 101.5,
+            return_pct: 0.012999999999996348,
+            reason: ExitReason::SessionEnd,
+        }];
+        golden(
+            "session_end",
+            &case_session_end_exit(),
+            &expected,
+            &[10000.0, 10000.6, 10001.3, 10001.3],
+        );
+    }
+
+    #[test]
+    fn golden_end_of_data_flatten() {
+        let expected = [Trade {
+            entry_idx: 1,
+            exit_idx: 2,
+            entry_ts: 60_000,
+            exit_ts: 120_000,
+            side: Side::Long,
+            entry_price: 100.0,
+            exit_price: 101.5,
+            return_pct: 0.01500000000000945,
+            reason: ExitReason::EndOfData,
+        }];
+        golden(
+            "end_of_data",
+            &case_end_of_data_flatten(),
+            &expected,
+            &[10000.0, 10000.5, 10001.5],
+        );
+    }
+
+    #[test]
+    fn golden_orb_run() {
+        let expected = [Trade {
+            entry_idx: 3,
+            exit_idx: 4,
+            entry_ts: 180_000,
+            exit_ts: 240_000,
+            side: Side::Long,
+            entry_price: 102.5,
+            exit_price: 106.60000000000001,
+            return_pct: 0.041000000000002146,
+            reason: ExitReason::TakeProfit,
+        }];
+        golden(
+            "orb",
+            &case_orb_run(),
+            &expected,
+            &[10000.0, 10000.0, 10000.0, 10001.0, 10004.1],
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    #[test]
+    fn f64_bits_survive_json_round_trip() {
+        let awkward = [
+            106.60000000000001,
+            0.1 + 0.2,
+            -0.0,
+            1.0 / 3.0,
+            f64::MIN_POSITIVE,
+            1e-300,
+            4.1e-2,
+            1.0 + f64::EPSILON,
+        ];
+        assert_ne!(
+            106.60000000000001f64.to_bits(),
+            106.6f64.to_bits(),
+            "the awkward value must differ from the round one, else the test proves nothing"
+        );
+        for v in awkward {
+            let text = serde_json::to_string(&v).expect("serialize");
+            let back: f64 = serde_json::from_str(&text).expect("deserialize");
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "{v:?} round-tripped through {text} as {back:?}"
+            );
+        }
     }
 }
