@@ -241,6 +241,11 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/optimize/{job_id}", get(get_optimize))
         .route("/runs", get(list_runs))
         .route("/runs/{id}", get(get_run))
+        .route("/agents", get(list_agents).post(post_agent))
+        .route("/agents/{id}", get(get_agent))
+        .route("/agents/{id}/start", post(start_agent))
+        .route("/agents/{id}/stop", post(stop_agent))
+        .route("/agents/{id}/advance", post(advance_agent))
         .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(Extension(Arc::new(limits)))
@@ -249,6 +254,34 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(serde_json::json!({"error": msg.into()})))
+}
+
+/// Failure carried by helpers that do not own the response. Keeping this small
+/// avoids `Result<_, Response>` and the large error type that comes with it.
+struct ApiFailure {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiFailure {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    fn into_response(self) -> Response {
+        err_json(self.status, self.message).into_response()
+    }
 }
 
 async fn health() -> impl IntoResponse {
@@ -974,6 +1007,509 @@ async fn get_run(State(state): State<AppState>, Path(id): Path<i64>) -> Response
             .into_response(),
         Ok(None) => err_json(StatusCode::NOT_FOUND, format!("unknown run: {id}")).into_response(),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn now_secs() -> i64 {
+    now_ms() / 1000
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateAgentBody {
+    name: String,
+    strategy: Option<crate::strategy::Strategy>,
+    run_id: Option<i64>,
+    initial_equity: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StartAgentBody {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AdvanceAgentBody {
+    end_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentDetail {
+    agent: crate::db::AgentSummary,
+    strategy: crate::strategy::Strategy,
+    initial_equity: f64,
+    candle_count: usize,
+    position: Option<crate::backtest::PositionView>,
+    trades: Vec<crate::backtest::Trade>,
+    equity_curve: Vec<f64>,
+}
+
+fn agent_detail(row: crate::db::AgentRow) -> Result<AgentDetail, ApiFailure> {
+    let strategy: crate::strategy::Strategy = serde_json::from_value(row.strategy)
+        .map_err(|e| ApiFailure::internal(format!("agent strategy is corrupt: {e}")))?;
+    let (candle_count, position, trades, equity_curve) = match row.snapshot.as_deref() {
+        Some(text) => {
+            let snapshot = crate::agent::AgentSnapshot::from_json(text)
+                .map_err(|e| ApiFailure::internal(e.to_string()))?;
+            (
+                snapshot.candle_count(),
+                snapshot.position(),
+                snapshot.trades().to_vec(),
+                snapshot.equity_curve().to_vec(),
+            )
+        }
+        None => (0, None, Vec::new(), Vec::new()),
+    };
+    Ok(AgentDetail {
+        agent: row.summary,
+        strategy,
+        initial_equity: row.initial_equity,
+        candle_count,
+        position,
+        trades,
+        equity_curve,
+    })
+}
+
+fn agent_json(detail: AgentDetail) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(detail).unwrap_or_default()),
+    )
+        .into_response()
+}
+
+fn agent_or_404(state: &AppState, id: &str) -> Result<crate::db::AgentRow, ApiFailure> {
+    match state.db.get_agent(id) {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(ApiFailure::not_found(format!("unknown agent: {id}"))),
+        Err(e) => Err(ApiFailure::internal(e.to_string())),
+    }
+}
+
+fn agent_status(row: &crate::db::AgentRow) -> Result<crate::agent::AgentStatus, ApiFailure> {
+    crate::agent::AgentStatus::parse(&row.summary.status).ok_or_else(|| {
+        ApiFailure::internal(format!("agent {} has an unknown status", row.summary.id))
+    })
+}
+
+fn agent_spec(row: &crate::db::AgentRow) -> Result<crate::strategy::Strategy, ApiFailure> {
+    serde_json::from_value(row.strategy.clone())
+        .map_err(|e| ApiFailure::internal(format!("agent strategy is corrupt: {e}")))
+}
+
+async fn load_agent_candles(
+    state: &AppState,
+    symbol: &str,
+    interval: &str,
+    start: i64,
+    end: i64,
+    timeout: Duration,
+) -> Result<Vec<crate::types::Candle>, ApiFailure> {
+    let source = state.source.clone();
+    let cache_dir = state.cache_dir.clone();
+    let symbol = symbol.to_string();
+    let interval = interval.to_string();
+    let loaded = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            crate::feeds::load_or_fetch(&cache_dir, source.as_ref(), &symbol, &interval, start, end)
+        }),
+    )
+    .await;
+    match loaded {
+        Err(_) => Err(ApiFailure::new(
+            StatusCode::REQUEST_TIMEOUT,
+            format!("agent request timed out after {}s", timeout.as_secs()),
+        )),
+        Ok(Err(join)) => Err(ApiFailure::internal(join.to_string())),
+        Ok(Ok(Err(e))) => Err(ApiFailure::new(StatusCode::BAD_GATEWAY, e.to_string())),
+        Ok(Ok(Ok(candles))) => Ok(candles),
+    }
+}
+
+async fn list_agents(State(state): State<AppState>) -> Response {
+    match state.db.list_agents() {
+        Ok(agents) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "agents": agents })),
+        )
+            .into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_agent(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match agent_or_404(&state, &id) {
+        Ok(row) => match agent_detail(row) {
+            Ok(detail) => agent_json(detail),
+            Err(e) => e.into_response(),
+        },
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn post_agent(
+    State(state): State<AppState>,
+    body: Result<Json<CreateAgentBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
+    };
+    let (spec, run_id) = match (body.strategy, body.run_id) {
+        (Some(spec), None) => (spec, None),
+        (None, Some(run_id)) => match state.db.get_run(run_id) {
+            Ok(Some(run)) => match serde_json::from_value(run.strategy) {
+                Ok(spec) => (spec, Some(run_id)),
+                Err(e) => {
+                    return err_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("run {run_id} has a corrupt strategy: {e}"),
+                    )
+                    .into_response()
+                }
+            },
+            Ok(None) => {
+                return err_json(StatusCode::NOT_FOUND, format!("unknown run: {run_id}"))
+                    .into_response()
+            }
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        },
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "provide exactly one of strategy or run_id".to_string(),
+            )
+            .into_response()
+        }
+    };
+    let equity = body
+        .initial_equity
+        .unwrap_or(crate::agent::DEFAULT_INITIAL_EQUITY);
+    if let Err(e) = crate::agent::validate_new(&body.name, &spec, equity) {
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let strategy = match serde_json::to_value(&spec) {
+        Ok(v) => v,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    let id = crate::agent::new_agent_id();
+    if let Err(e) = state
+        .db
+        .create_agent(&id, body.name.trim(), &strategy, run_id, equity)
+    {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    match agent_or_404(&state, &id).and_then(agent_detail) {
+        Ok(detail) => (
+            StatusCode::CREATED,
+            Json(serde_json::to_value(detail).unwrap_or_default()),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn start_agent(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    Path(id): Path<String>,
+    body: Result<Json<StartAgentBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
+    };
+    let row = match agent_or_404(&state, &id) {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
+    };
+    let status = match agent_status(&row) {
+        Ok(status) => status,
+        Err(e) => return e.into_response(),
+    };
+    if status == crate::agent::AgentStatus::Running {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} is already running"),
+        )
+        .into_response();
+    }
+    // A stopped agent keeps its snapshot: start resumes it rather than
+    // replaying history and rewriting decisions already taken.
+    if row.snapshot.is_some() {
+        match state.db.start_agent(&id, now_secs()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return err_json(StatusCode::NOT_FOUND, format!("unknown agent: {id}"))
+                    .into_response()
+            }
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        }
+        return match agent_or_404(&state, &id).and_then(agent_detail) {
+            Ok(detail) => agent_json(detail),
+            Err(e) => e.into_response(),
+        };
+    }
+    let spec = match agent_spec(&row) {
+        Ok(spec) => spec,
+        Err(e) => return e.into_response(),
+    };
+    let (start, end) = match (body.start_ms, body.end_ms) {
+        (Some(start), Some(end)) => (start, end),
+        _ => match row.summary.run_id {
+            Some(run_id) => match state.db.get_run(run_id) {
+                Ok(Some(run)) => (run.start_ms, run.end_ms),
+                Ok(None) => {
+                    return err_json(StatusCode::NOT_FOUND, format!("unknown run: {run_id}"))
+                        .into_response()
+                }
+                Err(e) => {
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                        .into_response()
+                }
+            },
+            None => {
+                return err_json(
+                    StatusCode::BAD_REQUEST,
+                    "start_ms and end_ms are required for an agent not created from a run"
+                        .to_string(),
+                )
+                .into_response()
+            }
+        },
+    };
+    let step = match crate::feeds::interval_ms(&spec.timeframe) {
+        Some(step) => step,
+        None => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("unknown interval: {}", spec.timeframe),
+            )
+            .into_response()
+        }
+    };
+    if start >= end {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "start_ms must be less than end_ms".to_string(),
+        )
+        .into_response();
+    }
+    if let Err(e) = check_range_limit(start, end, step) {
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let candles = match load_agent_candles(
+        &state,
+        &spec.asset,
+        &spec.timeframe,
+        start,
+        end,
+        limits.backtest_timeout,
+    )
+    .await
+    {
+        Ok(candles) => candles,
+        Err(e) => {
+            let _ = state
+                .db
+                .record_agent_error(&id, "could not load warm-up candles");
+            return e.into_response();
+        }
+    };
+    if candles.is_empty() {
+        let _ = state
+            .db
+            .record_agent_error(&id, "no closed candles in the warm-up range");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "no closed candles in the warm-up range".to_string(),
+        )
+        .into_response();
+    }
+    let snapshot = match crate::agent::AgentSnapshot::warm_up(
+        &spec,
+        &candles,
+        &crate::backtest::BacktestConfig::default(),
+        row.initial_equity,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            let _ = state.db.record_agent_error(&id, &e.to_string());
+            return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+    let snapshot_json = match snapshot.to_json() {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = state.db.record_agent_error(&id, &e.to_string());
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    if let Err(e) = state.db.start_agent_with_snapshot(
+        &id,
+        now_secs(),
+        snapshot.equity(),
+        snapshot.last_price(),
+        snapshot.last_ts(),
+        &snapshot_json,
+    ) {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    match agent_or_404(&state, &id).and_then(agent_detail) {
+        Ok(detail) => agent_json(detail),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn stop_agent(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let row = match agent_or_404(&state, &id) {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
+    };
+    let status = match agent_status(&row) {
+        Ok(status) => status,
+        Err(e) => return e.into_response(),
+    };
+    if status == crate::agent::AgentStatus::Draft {
+        return err_json(StatusCode::CONFLICT, format!("agent {id} has not started"))
+            .into_response();
+    }
+    if status == crate::agent::AgentStatus::Running {
+        if let Err(e) = state.db.stop_agent(&id, now_secs()) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match agent_or_404(&state, &id).and_then(agent_detail) {
+        Ok(detail) => agent_json(detail),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn advance_agent(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    Path(id): Path<String>,
+    body: Result<Json<AdvanceAgentBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(e) => return err_json(e.status(), e.to_string()).into_response(),
+    };
+    let row = match agent_or_404(&state, &id) {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
+    };
+    let status = match agent_status(&row) {
+        Ok(status) => status,
+        Err(e) => return e.into_response(),
+    };
+    if status != crate::agent::AgentStatus::Running {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} is {}; start it first", status.as_str()),
+        )
+        .into_response();
+    }
+    let spec = match agent_spec(&row) {
+        Ok(spec) => spec,
+        Err(e) => return e.into_response(),
+    };
+    let Some(text) = row.snapshot.as_deref() else {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} has no snapshot; start it first"),
+        )
+        .into_response();
+    };
+    let mut snapshot = match crate::agent::AgentSnapshot::from_json(text) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    let step = match crate::feeds::interval_ms(&spec.timeframe) {
+        Some(step) => step,
+        None => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("unknown interval: {}", spec.timeframe),
+            )
+            .into_response()
+        }
+    };
+    let start = snapshot.last_ts() + step;
+    let end = body.end_ms.unwrap_or_else(now_ms);
+    if start >= end {
+        return match agent_or_404(&state, &id).and_then(agent_detail) {
+            Ok(detail) => agent_json(detail),
+            Err(e) => e.into_response(),
+        };
+    }
+    let candles = match load_agent_candles(
+        &state,
+        &spec.asset,
+        &spec.timeframe,
+        start,
+        end,
+        limits.backtest_timeout,
+    )
+    .await
+    {
+        Ok(candles) => candles,
+        Err(e) => {
+            let _ = state
+                .db
+                .record_agent_error(&id, "could not load new candles");
+            return e.into_response();
+        }
+    };
+    let outcome = match snapshot.advance(&candles) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = state.db.record_agent_error(&id, &e.to_string());
+            return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+    if outcome.new_candles > 0 {
+        let snapshot_json = match snapshot.to_json() {
+            Ok(text) => text,
+            Err(e) => {
+                let _ = state.db.record_agent_error(&id, &e.to_string());
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+        if let Err(e) = state.db.save_agent_snapshot(
+            &id,
+            status.as_str(),
+            outcome.equity,
+            outcome.last_price,
+            outcome.last_ts,
+            &snapshot_json,
+        ) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match agent_or_404(&state, &id).and_then(agent_detail) {
+        Ok(detail) => agent_json(detail),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2219,6 +2755,218 @@ mod tests {
             v["holds"].as_u64().unwrap(),
             if v["grade"] == "holds" { 3 } else { 0 }
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn json_req(uri: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::post(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn create_agent(
+        router: &Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = router
+            .clone()
+            .oneshot(json_req("/agents", &body))
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, body_json(res).await)
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_warm_up_advance_stop_and_resume() {
+        let dir = temp_dir("agent_lifecycle");
+        let router = app(test_state(dir.clone()));
+        let fake = FakeSource::new();
+        let step: i64 = 3_600_000;
+
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Paper BTC",
+                "strategy": valid_strategy(),
+                "initial_equity": 5000.0,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+        assert_eq!(created["agent"]["status"], "draft");
+        assert_eq!(created["agent"]["symbol"], "BTCUSDT");
+        assert_eq!(created["initial_equity"], 5000.0);
+
+        let res = router
+            .clone()
+            .oneshot(Request::get("/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let listed = body_json(res).await;
+        assert_eq!(listed["agents"].as_array().expect("agents").len(), 1);
+
+        let warm_end = fake.start() + step * 100;
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": warm_end }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let started = body_json(res).await;
+        assert_eq!(started["agent"]["status"], "running");
+        let warm_bars = started["candle_count"].as_u64().expect("candles");
+        assert!(warm_bars >= 90, "warm-up bars: {warm_bars}");
+        assert!(started["agent"]["equity"].as_f64().expect("equity") > 0.0);
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/advance"),
+                &serde_json::json!({ "end_ms": fake.end() }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let advanced = body_json(res).await;
+        assert!(
+            advanced["candle_count"].as_u64().expect("candles") > warm_bars,
+            "advance must append new closed candles"
+        );
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/stop"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["agent"]["status"], "stopped");
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/advance"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["agent"]["status"], "running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agent_can_be_deployed_from_a_saved_run() {
+        let dir = temp_dir("agent_from_run");
+        let router = app(test_state(dir.clone()));
+        let fake = FakeSource::new();
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                "/backtest",
+                &serde_json::json!({
+                    "strategy": valid_strategy(),
+                    "start_ms": fake.start(),
+                    "end_ms": fake.end(),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let run_id = body_json(res).await["run_id"].as_i64().expect("run id");
+
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({ "name": "From run", "run_id": run_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        assert_eq!(created["agent"]["run_id"], run_id);
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+
+        // The saved run supplies the warm-up range, so an empty body is enough.
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let started = body_json(res).await;
+        assert_eq!(started["agent"]["status"], "running");
+        assert_eq!(started["candle_count"].as_u64().expect("candles"), 300);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_ambiguous_creation_and_missing_warm_up() {
+        let dir = temp_dir("agent_bad");
+        let router = app(test_state(dir.clone()));
+
+        let (status, _) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Both",
+                "strategy": valid_strategy(),
+                "run_id": 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = create_agent(&router, serde_json::json!({ "name": "Neither" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = create_agent(
+            &router,
+            serde_json::json!({ "name": "  ", "strategy": valid_strategy() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, created) = create_agent(
+            &router,
+            serde_json::json!({ "name": "No range", "strategy": valid_strategy() }),
+        )
+        .await;
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = router
+            .clone()
+            .oneshot(Request::get("/agents/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

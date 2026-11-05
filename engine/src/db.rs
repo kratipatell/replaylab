@@ -19,6 +19,31 @@ pub struct SavedRun {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AgentSummary {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub symbol: String,
+    pub interval: String,
+    pub run_id: Option<i64>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub stopped_at: Option<i64>,
+    pub equity: f64,
+    pub last_price: Option<f64>,
+    pub last_ts: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRow {
+    pub summary: AgentSummary,
+    pub strategy: serde_json::Value,
+    pub initial_equity: f64,
+    pub snapshot: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
     pub id: i64,
     pub created_at: i64,
@@ -67,14 +92,21 @@ CREATE TABLE IF NOT EXISTS agents (
     started_at INTEGER,
     stopped_at INTEGER,
     equity REAL NOT NULL DEFAULT 10000.0,
+    initial_equity REAL NOT NULL DEFAULT 10000.0,
     last_price REAL,
     last_ts INTEGER,
+    snapshot TEXT,
+    last_error TEXT,
     owner_id TEXT NOT NULL DEFAULT 'local'
 )";
 
 const ADD_OWNER_ID: &str = "ALTER TABLE runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
 const ADD_AGENTS_OWNER: &str =
     "ALTER TABLE agents ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
+const ADD_AGENTS_EQUITY: &str =
+    "ALTER TABLE agents ADD COLUMN initial_equity REAL NOT NULL DEFAULT 10000.0";
+const ADD_AGENTS_SNAPSHOT: &str = "ALTER TABLE agents ADD COLUMN snapshot TEXT";
+const ADD_AGENTS_ERROR: &str = "ALTER TABLE agents ADD COLUMN last_error TEXT";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -95,6 +127,29 @@ pub enum DbError {
     List(String),
     #[error("get run: {0}")]
     Get(String),
+    #[error("create agent: {0}")]
+    CreateAgent(String),
+    #[error("list agents: {0}")]
+    ListAgents(String),
+    #[error("get agent: {0}")]
+    GetAgent(String),
+    #[error("update agent: {0}")]
+    UpdateAgent(String),
+}
+
+fn add_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<(), DbError> {
+    let count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            params![column],
+            |row| row.get(0),
+        )
+        .map_err(|e| DbError::Init(e.to_string()))?;
+    if count == 0 {
+        conn.execute_batch(ddl)
+            .map_err(|e| DbError::Init(e.to_string()))?;
+    }
+    Ok(())
 }
 
 impl Db {
@@ -105,58 +160,11 @@ impl Db {
     }
 
     fn migrate(conn: &Connection) -> Result<(), DbError> {
-        let has_owner_id = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = 'owner_id'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|e| DbError::Init(e.to_string()))?
-            > 0;
-        if !has_owner_id {
-            conn.execute_batch(ADD_OWNER_ID)
-                .map_err(|e| DbError::Init(e.to_string()))?;
-        }
-        let agents_exists = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agents'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|e| DbError::Init(e.to_string()))?
-            > 0;
-        if !agents_exists {
-            conn.execute_batch(
-                "CREATE TABLE agents (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    run_id INTEGER,
-                    created_at INTEGER NOT NULL,
-                    started_at INTEGER,
-                    stopped_at INTEGER,
-                    equity REAL NOT NULL DEFAULT 10000.0,
-                    last_price REAL,
-                    last_ts INTEGER,
-                    owner_id TEXT NOT NULL DEFAULT 'local'
-                )",
-            )
-            .map_err(|e| DbError::Init(e.to_string()))?;
-        } else {
-            let has_agents_owner = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'owner_id'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|e| DbError::Init(e.to_string()))?
-                > 0;
-            if !has_agents_owner {
-                conn.execute_batch(ADD_AGENTS_OWNER)
-                    .map_err(|e| DbError::Init(e.to_string()))?;
-            }
-        }
+        add_column(conn, "runs", "owner_id", ADD_OWNER_ID)?;
+        add_column(conn, "agents", "owner_id", ADD_AGENTS_OWNER)?;
+        add_column(conn, "agents", "initial_equity", ADD_AGENTS_EQUITY)?;
+        add_column(conn, "agents", "snapshot", ADD_AGENTS_SNAPSHOT)?;
+        add_column(conn, "agents", "last_error", ADD_AGENTS_ERROR)?;
         Ok(())
     }
 
@@ -294,6 +302,186 @@ impl Db {
             Some(r) => Ok(Some(r.map_err(|e| DbError::Get(e.to_string()))?)),
         }
     }
+
+    pub fn create_agent(
+        &self,
+        id: &str,
+        name: &str,
+        strategy: &serde_json::Value,
+        run_id: Option<i64>,
+        initial_equity: f64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            // owner_id stays 'local' until accounts exist.
+            "INSERT INTO agents
+                (id, name, status, strategy, run_id, created_at, equity, initial_equity, owner_id)
+             VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6, ?6, 'local')",
+            params![
+                id,
+                name,
+                strategy.to_string(),
+                run_id,
+                now_secs(),
+                initial_equity
+            ],
+        )
+        .map_err(|e| DbError::CreateAgent(e.to_string()))?;
+        Ok(())
+    }
+
+    fn agent_summary_from_row(row: &rusqlite::Row) -> rusqlite::Result<AgentSummary> {
+        let strategy_txt: String = row.get(3)?;
+        let strategy: serde_json::Value =
+            serde_json::from_str(&strategy_txt).unwrap_or(serde_json::Value::Null);
+        Ok(AgentSummary {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            status: row.get(2)?,
+            symbol: strategy
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            interval: strategy
+                .get("timeframe")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            run_id: row.get(4)?,
+            created_at: row.get(5)?,
+            started_at: row.get(6)?,
+            stopped_at: row.get(7)?,
+            equity: row.get(8)?,
+            last_price: row.get(9)?,
+            last_ts: row.get(10)?,
+            last_error: row.get(11)?,
+        })
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentSummary>, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, status, strategy, run_id, created_at, started_at,
+                        stopped_at, equity, last_price, last_ts, last_error
+                 FROM agents ORDER BY created_at DESC, id DESC",
+            )
+            .map_err(|e| DbError::ListAgents(e.to_string()))?;
+        let rows = stmt
+            .query_map([], Self::agent_summary_from_row)
+            .map_err(|e| DbError::ListAgents(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| DbError::ListAgents(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_agent(&self, id: &str) -> Result<Option<AgentRow>, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, status, strategy, run_id, created_at, started_at,
+                        stopped_at, equity, last_price, last_ts, last_error,
+                        initial_equity, snapshot
+                 FROM agents WHERE id = ?1",
+            )
+            .map_err(|e| DbError::GetAgent(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                let summary = Self::agent_summary_from_row(row)?;
+                let strategy_txt: String = row.get(3)?;
+                Ok(AgentRow {
+                    summary,
+                    strategy: serde_json::from_str(&strategy_txt)
+                        .unwrap_or(serde_json::Value::Null),
+                    initial_equity: row.get(12)?,
+                    snapshot: row.get(13)?,
+                })
+            })
+            .map_err(|e| DbError::GetAgent(e.to_string()))?;
+        match rows.next() {
+            None => Ok(None),
+            Some(row) => Ok(Some(row.map_err(|e| DbError::GetAgent(e.to_string()))?)),
+        }
+    }
+
+    pub fn start_agent(&self, id: &str, started_at: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents
+             SET status = 'running', started_at = ?2, stopped_at = NULL, last_error = NULL
+             WHERE id = ?1",
+            params![id, started_at],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_agent_with_snapshot(
+        &self,
+        id: &str,
+        started_at: i64,
+        equity: f64,
+        last_price: f64,
+        last_ts: i64,
+        snapshot: &str,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents
+             SET status = 'running', started_at = ?2, stopped_at = NULL,
+                 equity = ?3, last_price = ?4, last_ts = ?5,
+                 snapshot = ?6, last_error = NULL
+             WHERE id = ?1",
+            params![id, started_at, equity, last_price, last_ts, snapshot],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    pub fn stop_agent(&self, id: &str, stopped_at: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents SET status = 'stopped', stopped_at = ?2 WHERE id = ?1",
+            params![id, stopped_at],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    pub fn save_agent_snapshot(
+        &self,
+        id: &str,
+        status: &str,
+        equity: f64,
+        last_price: f64,
+        last_ts: i64,
+        snapshot: &str,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents
+             SET status = ?2, equity = ?3, last_price = ?4, last_ts = ?5,
+                 snapshot = ?6, last_error = NULL
+             WHERE id = ?1",
+            params![id, status, equity, last_price, last_ts, snapshot],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    pub fn record_agent_error(&self, id: &str, error: &str) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents SET last_error = ?2 WHERE id = ?1",
+            params![id, error],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +514,107 @@ mod tests {
         let got = db.get_run(1).expect("get").expect("exists");
         assert_eq!(got.strategy, strat);
         assert!(db.get_run(999).expect("get").is_none());
+    }
+
+    fn strategy_json() -> serde_json::Value {
+        serde_json::json!({"asset": "BTCUSDT", "timeframe": "1h", "side": "long"})
+    }
+
+    #[test]
+    fn agent_lifecycle_roundtrip() {
+        let db = Db::open_in_memory().expect("mem db");
+        db.create_agent("ag-1", "Paper BTC", &strategy_json(), None, 10_000.0)
+            .expect("create");
+
+        let agents = db.list_agents().expect("list");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "ag-1");
+        assert_eq!(agents[0].status, "draft");
+        assert_eq!(agents[0].symbol, "BTCUSDT");
+        assert_eq!(agents[0].interval, "1h");
+        assert_eq!(agents[0].equity, 10_000.0);
+
+        let row = db.get_agent("ag-1").expect("get").expect("exists");
+        assert_eq!(row.strategy, strategy_json());
+        assert_eq!(row.initial_equity, 10_000.0);
+        assert!(row.snapshot.is_none());
+
+        assert!(db.start_agent("ag-1", 10).expect("start"));
+        assert!(db
+            .save_agent_snapshot("ag-1", "running", 10_050.0, 101.0, 1_234, "{}")
+            .expect("snapshot"));
+        let row = db.get_agent("ag-1").expect("get").expect("exists");
+        assert_eq!(row.summary.status, "running");
+        assert_eq!(row.summary.started_at, Some(10));
+        assert_eq!(row.summary.equity, 10_050.0);
+        assert_eq!(row.summary.last_price, Some(101.0));
+        assert_eq!(row.summary.last_ts, Some(1_234));
+        assert_eq!(row.snapshot.as_deref(), Some("{}"));
+
+        assert!(db.record_agent_error("ag-1", "boom").expect("error"));
+        assert_eq!(
+            db.get_agent("ag-1")
+                .expect("get")
+                .expect("exists")
+                .summary
+                .last_error
+                .as_deref(),
+            Some("boom")
+        );
+
+        assert!(db.stop_agent("ag-1", 20).expect("stop"));
+        assert_eq!(
+            db.get_agent("ag-1")
+                .expect("get")
+                .expect("exists")
+                .summary
+                .status,
+            "stopped"
+        );
+        assert!(!db.start_agent("missing", 1).expect("missing"));
+        assert!(!db.stop_agent("missing", 1).expect("missing"));
+        assert!(!db
+            .save_agent_snapshot("missing", "running", 1.0, 1.0, 1, "{}")
+            .expect("missing"));
+    }
+
+    const OLD_AGENTS_SCHEMA: &str = "CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        strategy TEXT NOT NULL,
+        run_id INTEGER,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        stopped_at INTEGER,
+        equity REAL NOT NULL DEFAULT 10000.0,
+        last_price REAL,
+        last_ts INTEGER
+    )";
+
+    #[test]
+    fn migration_adds_agent_columns_and_keeps_rows() {
+        let path = temp_db_path("agent_migrate");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        {
+            let conn = Connection::open(&path).expect("open old");
+            conn.execute_batch(OLD_AGENTS_SCHEMA).expect("old agents");
+            conn.execute(
+                "INSERT INTO agents (id, name, status, strategy, created_at)
+                 VALUES ('old', 'Old agent', 'draft', '{}', 1)",
+                [],
+            )
+            .expect("old row");
+        }
+        let db = Db::open(&path).expect("migrate");
+        let row = db.get_agent("old").expect("get").expect("exists");
+        assert_eq!(row.summary.name, "Old agent");
+        assert_eq!(row.initial_equity, 10_000.0);
+        assert!(row.snapshot.is_none());
+        assert!(row.summary.last_error.is_none());
+        drop(db);
+        let _ = Db::open(&path).expect("reopen");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
     const OLD_SCHEMA: &str = "CREATE TABLE runs (

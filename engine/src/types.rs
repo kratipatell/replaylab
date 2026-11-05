@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Candle {
     pub ts: i64,
     pub open: f64,

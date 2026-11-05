@@ -1,3 +1,4 @@
+mod agent;
 mod api;
 mod backtest;
 mod config;

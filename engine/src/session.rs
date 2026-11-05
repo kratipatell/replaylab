@@ -15,7 +15,7 @@ pub fn is_new_day(prev_ts: i64, ts: i64) -> bool {
     day_id(prev_ts) != day_id(ts)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionFilter {
     pub open_min_utc: u16,
     pub close_min_utc: u16,
