@@ -209,7 +209,7 @@ pub trait BarStrategy {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct OrbConfig {
     pub range_bars: usize,
     pub buffer_pct: f64,
@@ -241,7 +241,7 @@ impl OrbConfig {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Orb {
     cfg: OrbConfig,
     day: Option<i64>,
@@ -324,7 +324,7 @@ impl BarStrategy for Orb {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesStrategy {
     side: Side,
     entry: Rules,

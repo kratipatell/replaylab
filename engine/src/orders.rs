@@ -1,8 +1,8 @@
 use crate::strategy::Side;
 use crate::types::Candle;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExitReason {
     Signal,
     StopLoss,
@@ -80,7 +80,7 @@ pub fn fill_price(order: &EntryOrder, bar: &Candle) -> Option<f64> {
 
 /// Trailing stop state. The level ratchets one way only and the peak it
 /// follows is the best price the position has seen, not the current bar.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Trail {
     peak: f64,
     percent: Option<f64>,

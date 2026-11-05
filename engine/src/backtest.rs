@@ -5,7 +5,7 @@ use crate::session::SessionFilter;
 use crate::sizing::{quantity, Sizing};
 use crate::strategy::{BarStrategy, Side, Strategy};
 use crate::types::Candle;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use crate::orders::ExitReason;
 
@@ -24,7 +24,7 @@ impl Default for BacktestConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_idx: usize,
     pub exit_idx: usize,
@@ -101,6 +101,7 @@ impl RunConfig {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct OpenPos {
     entry_idx: usize,
     entry_ts: i64,
@@ -129,6 +130,7 @@ fn levels(side: Side, entry: f64, b: &Bracket) -> (Option<f64>, Option<f64>, Opt
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct PendingEntry {
     side: Side,
     sig_ts: i64,
@@ -144,6 +146,7 @@ struct SimCtx<'a> {
     exit_at_session_end: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct SimState {
     equity: f64,
     position: Option<OpenPos>,
@@ -1919,6 +1922,375 @@ mod golden_sim_tests {
 
 #[cfg(test)]
 mod resume_tests {
+    use super::*;
+    use crate::session::{MS_PER_DAY, MS_PER_MIN};
+    use crate::strategy::{
+        Condition, IndicatorKind, IndicatorRef, Op, Operand, Orb, OrbConfig, Rules, RulesStrategy,
+        Strategy,
+    };
+
+    fn json<T: serde::Serialize>(v: &T) -> String {
+        serde_json::to_string(v).expect("serialize")
+    }
+
+    fn unjson<T: serde::de::DeserializeOwned>(text: &str) -> T {
+        serde_json::from_str(text).expect("deserialize")
+    }
+
+    fn num(v: f64) -> Operand {
+        Operand::Number(v)
+    }
+
+    fn close() -> Operand {
+        Operand::Indicator(IndicatorRef {
+            ind: IndicatorKind::Close,
+            period: None,
+        })
+    }
+
+    fn rule(op: Op, rhs: f64) -> Rules {
+        Rules {
+            all: vec![Condition {
+                left: close(),
+                op,
+                right: num(rhs),
+            }],
+            any: vec![],
+        }
+    }
+
+    /// O/H/L derived from the previous close so the bars carry the kind of
+    /// non-round binary fractions a real feed produces.
+    fn candles_from(closes: &[f64]) -> Vec<Candle> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &cl)| {
+                let open = if i == 0 { cl } else { closes[i - 1] };
+                Candle {
+                    ts: i as i64 * MS_PER_MIN,
+                    open,
+                    high: open.max(cl) + 0.4,
+                    low: open.min(cl) - 0.6,
+                    close: cl,
+                }
+            })
+            .collect()
+    }
+
+    /// Same wiring as `backtest_strategy`, except the bracket also carries a
+    /// trailing stop so the resume test can hit a mid-ratchet split.
+    fn rules_setup(spec: &Strategy) -> (Instrument, Sizing, Bracket, SessionFilter, RunConfig) {
+        let cfg = BacktestConfig {
+            fee_bps: 5.0,
+            slippage_bps: 2.0,
+        };
+        let (instrument, sizing, mut bracket, session, run_cfg) =
+            crate::strategy::rules_v2_setup(spec, &cfg).expect("setup");
+        bracket.trailing_pct = Some(6.0);
+        (instrument, sizing, bracket, session, run_cfg)
+    }
+
+    fn ctx_of<'a>(
+        instrument: &'a Instrument,
+        sizing: Sizing,
+        bracket: &'a Bracket,
+        session: &'a SessionFilter,
+        run_cfg: &'a RunConfig,
+    ) -> SimCtx<'a> {
+        SimCtx {
+            instrument,
+            cost_rate: instrument.cost_rate(),
+            pv: instrument.point_value,
+            sizing,
+            bracket,
+            session,
+            exit_at_session_end: run_cfg.exit_at_session_end,
+        }
+    }
+
+    /// Drives `step` over every bar and then `finish`, exactly like `run`.
+    fn drive(
+        state: &mut SimState,
+        strategy: &mut dyn BarStrategy,
+        candles: &[Candle],
+        from: usize,
+        ctx: &SimCtx,
+    ) -> Result<(), BacktestError> {
+        for i in from..candles.len() {
+            state.step(i, candles, strategy, ctx)?;
+        }
+        let last = candles.len() - 1;
+        state.finish(last, &candles[last], ctx);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct Coverage {
+        splits: usize,
+        mid_position: usize,
+        ratcheted_trail: usize,
+        pending_entry: usize,
+        pending_exit: usize,
+    }
+
+    impl Coverage {
+        fn observe(&mut self, state: &SimState) {
+            self.splits += 1;
+            if let Some(pos) = &state.position {
+                self.mid_position += 1;
+                if pos.trail.peak() > pos.entry_raw && pos.trail.level() != pos.trail.base() {
+                    self.ratcheted_trail += 1;
+                }
+            }
+            if state.pending.is_some() {
+                self.pending_entry += 1;
+            }
+            if state.pending_exit {
+                self.pending_exit += 1;
+            }
+        }
+
+        fn assert_exercised(&self) {
+            assert!(self.mid_position > 0, "no split landed mid-position");
+            assert!(
+                self.ratcheted_trail > 0,
+                "no split landed after a trail ratchet"
+            );
+            assert!(
+                self.pending_entry > 0,
+                "no split landed with a pending entry armed"
+            );
+            assert!(
+                self.pending_exit > 0,
+                "no split landed with a signal exit armed"
+            );
+        }
+    }
+
+    fn assert_same(got: &BacktestResult, want: &BacktestResult, k: usize) {
+        assert_eq!(
+            got.trades, want.trades,
+            "trades diverged after resuming at bar {k}"
+        );
+        assert_eq!(
+            got.equity_curve.len(),
+            want.equity_curve.len(),
+            "equity length diverged after resuming at bar {k}"
+        );
+        assert_eq!(
+            got.equity_curve, want.equity_curve,
+            "equity curve diverged after resuming at bar {k}"
+        );
+    }
+
+    #[test]
+    fn rules_strategy_resume_matches_full_run_at_every_split() {
+        let spec = Strategy {
+            asset: "TEST".to_string(),
+            timeframe: "1h".to_string(),
+            side: Side::Long,
+            entry: rule(Op::Gt, 101.5),
+            exit: Some(rule(Op::Lt, 102.5)),
+            stop_loss_pct: None,
+            take_profit_pct: None,
+            claim: None,
+        };
+        spec.validate().expect("valid");
+        let closes = [
+            100.0, 101.6, 103.2, 104.4, 102.0, 102.0, 100.4, 101.8, 103.0, 103.9, 102.1, 102.1,
+            100.9, 102.3, 103.6, 104.2, 102.4, 102.4, 100.2, 99.0, 99.6, 100.0,
+        ];
+        let candles = candles_from(&closes);
+        let (instrument, sizing, bracket, session, run_cfg) = rules_setup(&spec);
+        let ctx = ctx_of(&instrument, sizing, &bracket, &session, &run_cfg);
+
+        let mut full_strategy = RulesStrategy::new(&spec);
+        let full = run(
+            &mut full_strategy,
+            &candles,
+            &instrument,
+            sizing,
+            &bracket,
+            &session,
+            &run_cfg,
+        )
+        .expect("full run");
+
+        let mut by_step = SimState::new(run_cfg.initial_equity, candles.len());
+        let mut by_step_strategy = RulesStrategy::new(&spec);
+        drive(&mut by_step, &mut by_step_strategy, &candles, 0, &ctx).expect("step run");
+        assert_eq!(
+            BacktestResult {
+                trades: by_step.trades.clone(),
+                equity_curve: by_step.equity_curve.clone(),
+            },
+            full,
+            "the step harness must reproduce run() before it can prove anything"
+        );
+        assert!(!full.trades.is_empty(), "corpus must trade");
+
+        let mut coverage = Coverage::default();
+        for k in 0..=candles.len() {
+            let mut head_state = SimState::new(run_cfg.initial_equity, candles.len());
+            let mut head_strategy = RulesStrategy::new(&spec);
+            for i in 0..k {
+                head_state
+                    .step(i, &candles, &mut head_strategy, &ctx)
+                    .expect("head step");
+            }
+            coverage.observe(&head_state);
+
+            let state_text = json(&head_state);
+            let strategy_text = json(&head_strategy);
+            assert!(
+                state_text.len() > 2 && strategy_text.len() > 2,
+                "snapshot at bar {k} must carry something"
+            );
+
+            let mut tail_state: SimState = unjson(&state_text);
+            let mut tail_strategy: RulesStrategy = unjson(&strategy_text);
+            drive(&mut tail_state, &mut tail_strategy, &candles, k, &ctx).expect("tail step");
+
+            let resumed = BacktestResult {
+                trades: tail_state.trades,
+                equity_curve: tail_state.equity_curve,
+            };
+            assert_same(&resumed, &full, k);
+            assert_eq!(tail_state.equity, by_step.equity, "final equity at bar {k}");
+        }
+        assert_eq!(coverage.splits, candles.len() + 1);
+        coverage.assert_exercised();
+    }
+
+    #[test]
+    fn orb_resume_matches_full_run_after_the_range_is_ready() {
+        let cfg = OrbConfig::new(2, 0.1, 1).expect("valid");
+        let day = MS_PER_DAY;
+        let candles = vec![
+            Candle {
+                ts: day,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+            },
+            Candle {
+                ts: day + MS_PER_MIN,
+                open: 100.0,
+                high: 102.0,
+                low: 99.5,
+                close: 101.0,
+            },
+            Candle {
+                ts: day + 2 * MS_PER_MIN,
+                open: 101.0,
+                high: 103.0,
+                low: 100.0,
+                close: 102.5,
+            },
+            Candle {
+                ts: day + 3 * MS_PER_MIN,
+                open: 102.5,
+                high: 104.0,
+                low: 102.0,
+                close: 103.5,
+            },
+            Candle {
+                ts: day + 4 * MS_PER_MIN,
+                open: 103.5,
+                high: 107.0,
+                low: 103.0,
+                close: 106.0,
+            },
+            Candle {
+                ts: 2 * day,
+                open: 106.0,
+                high: 106.5,
+                low: 104.0,
+                close: 105.0,
+            },
+            Candle {
+                ts: 2 * day + MS_PER_MIN,
+                open: 105.0,
+                high: 108.0,
+                low: 104.5,
+                close: 107.5,
+            },
+            Candle {
+                ts: 2 * day + 2 * MS_PER_MIN,
+                open: 107.5,
+                high: 109.5,
+                low: 107.0,
+                close: 109.0,
+            },
+            Candle {
+                ts: 2 * day + 3 * MS_PER_MIN,
+                open: 109.0,
+                high: 110.0,
+                low: 108.0,
+                close: 108.5,
+            },
+        ];
+        let instrument = Instrument::new("TEST", 0.01, 1.0, 5.0, 2.0).expect("valid");
+        let sizing = Sizing::FixedQty(1.0);
+        let bracket = Bracket {
+            stop_pct: Some(2.0),
+            target_pct: Some(4.0),
+            trailing_pct: None,
+        };
+        let session = SessionFilter::all_day();
+        let run_cfg = RunConfig::new(10_000.0, false).expect("valid");
+        let ctx = ctx_of(&instrument, sizing, &bracket, &session, &run_cfg);
+
+        let full = run(
+            &mut Orb::new(cfg),
+            &candles,
+            &instrument,
+            sizing,
+            &bracket,
+            &session,
+            &run_cfg,
+        )
+        .expect("full run");
+        assert!(!full.trades.is_empty(), "corpus must trade");
+
+        let mut resumed_splits = 0;
+        let mut skipped = 0;
+        for k in 0..=candles.len() {
+            let mut head = Orb::new(cfg);
+            let mut head_state = SimState::new(run_cfg.initial_equity, candles.len());
+            for i in 0..k {
+                head_state
+                    .step(i, &candles, &mut head, &ctx)
+                    .expect("head step");
+            }
+            // Before the opening range is complete the ORB keeps its bounds as
+            // +/-infinity, which JSON cannot carry (see the module report).
+            if head.range().is_none() {
+                skipped += 1;
+                continue;
+            }
+            resumed_splits += 1;
+
+            let state_text = json(&head_state);
+            let strategy_text = json(&head);
+            let mut tail_state: SimState = unjson(&state_text);
+            let mut tail_strategy: Orb = unjson(&strategy_text);
+            drive(&mut tail_state, &mut tail_strategy, &candles, k, &ctx).expect("tail step");
+
+            let resumed = BacktestResult {
+                trades: tail_state.trades,
+                equity_curve: tail_state.equity_curve,
+            };
+            assert_same(&resumed, &full, k);
+        }
+        assert!(
+            resumed_splits >= 5,
+            "only {resumed_splits} splits were resumable ({skipped} skipped)"
+        );
+    }
+
     #[test]
     fn f64_bits_survive_json_round_trip() {
         let awkward = [
