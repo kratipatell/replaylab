@@ -69,7 +69,15 @@ pub enum AgentError {
 pub struct AgentSnapshot {
     candles: Vec<Candle>,
     strategy: RulesStrategy,
+    #[serde(serialize_with = "serialize_agent_simulator")]
     simulator: Simulator,
+}
+
+fn serialize_agent_simulator<S>(simulator: &Simulator, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    simulator.serialize_agent_snapshot(serializer)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +88,16 @@ pub struct Advance {
     pub last_ts: i64,
     pub trades: Vec<Trade>,
     pub position: Option<PositionView>,
+    #[serde(skip)]
+    pub events: Vec<crate::backtest::DecisionEvent>,
+    #[serde(skip)]
+    pub equity_points: Vec<EquityPoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EquityPoint {
+    pub bar_ts: i64,
+    pub equity: f64,
 }
 
 pub fn validate_new(name: &str, spec: &Strategy, initial_equity: f64) -> Result<(), AgentError> {
@@ -151,9 +169,18 @@ impl AgentSnapshot {
         let start = self.candles.len();
         let before = self.simulator.trades().len();
         self.candles.extend(fresh.iter().copied());
+        let mut events = Vec::new();
+        let mut equity_points = Vec::with_capacity(fresh.len());
         for i in start..self.candles.len() {
-            self.simulator
-                .step_live(i, &self.candles, &mut self.strategy)?;
+            events.extend(self.simulator.step_live_with_events(
+                i,
+                &self.candles,
+                &mut self.strategy,
+            )?);
+            equity_points.push(EquityPoint {
+                bar_ts: self.candles[i].ts,
+                equity: self.simulator.current_equity(),
+            });
         }
         Ok(Advance {
             new_candles: fresh.len(),
@@ -162,6 +189,8 @@ impl AgentSnapshot {
             last_ts: self.last_ts(),
             trades: self.simulator.trades()[before..].to_vec(),
             position: self.simulator.position(),
+            events,
+            equity_points,
         })
     }
 
@@ -173,6 +202,8 @@ impl AgentSnapshot {
             last_ts: self.last_ts(),
             trades: Vec::new(),
             position: self.simulator.position(),
+            events: Vec::new(),
+            equity_points: Vec::new(),
         }
     }
 
@@ -181,15 +212,14 @@ impl AgentSnapshot {
     }
 
     pub fn from_json(text: &str) -> Result<AgentSnapshot, AgentError> {
-        serde_json::from_str(text).map_err(|e| AgentError::Snapshot(e.to_string()))
+        let mut snapshot: AgentSnapshot =
+            serde_json::from_str(text).map_err(|e| AgentError::Snapshot(e.to_string()))?;
+        snapshot.simulator.restore_last_bar_equity();
+        Ok(snapshot)
     }
 
     pub fn equity(&self) -> f64 {
-        self.simulator
-            .equity_curve()
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.simulator.equity())
+        self.simulator.current_equity()
     }
 
     pub fn last_ts(&self) -> i64 {
@@ -210,6 +240,17 @@ impl AgentSnapshot {
 
     pub fn equity_curve(&self) -> &[f64] {
         self.simulator.equity_curve()
+    }
+
+    pub fn equity_points(&self) -> Vec<EquityPoint> {
+        self.candles
+            .iter()
+            .zip(self.simulator.equity_curve())
+            .map(|(candle, &equity)| EquityPoint {
+                bar_ts: candle.ts,
+                equity,
+            })
+            .collect()
     }
 
     pub fn position(&self) -> Option<PositionView> {
@@ -433,13 +474,15 @@ mod tests {
             AgentSnapshot::warm_up(&spec, &all[..5], &cfg, 10_000.0, limits()).expect("warm up");
 
         let text = agent.to_json().expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("snapshot json");
+        assert!(value["simulator"]["state"].get("equity_curve").is_none());
         let mut resumed = AgentSnapshot::from_json(&text).expect("deserialize");
         agent.advance(&all[5..]).expect("advance original");
         resumed.advance(&all[5..]).expect("advance resumed");
 
         assert_eq!(agent.trades(), resumed.trades());
-        assert_eq!(agent.equity_curve(), resumed.equity_curve());
         assert_eq!(agent.equity(), resumed.equity());
+        assert_eq!(resumed.equity_curve().len(), all.len() - 5);
     }
 
     #[test]

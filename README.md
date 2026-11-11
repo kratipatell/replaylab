@@ -25,6 +25,9 @@ never holds user funds.
   over HTTP.
 - Candle data is cached on disk under `CACHE_DIR`; runs live in the SQLite
   database at `DB_PATH`.
+- Admin routes require `ADMIN_TOKEN` in the `x-admin-token` request header.
+  Leave it unset to fail closed. Keep the token on the engine/server side;
+  never expose it to frontend code or browser requests.
 - The LLM reader behind the Check page lives only in the Next.js server; the
   Rust engine never calls an LLM and treats LLM output as untrusted input.
 - Backtests, paper agents, and live trading all share one simulator.

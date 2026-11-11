@@ -38,6 +38,20 @@ pub struct Trade {
     pub reason: ExitReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionEvent {
+    pub bar_ts: i64,
+    pub kind: String,
+    pub seq: i64,
+    pub reason: Option<String>,
+    pub price: Option<f64>,
+    pub qty: Option<f64>,
+    pub requested_qty: Option<f64>,
+    pub configured: Option<f64>,
+    pub observed: Option<f64>,
+    pub equity: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BacktestResult {
     pub trades: Vec<Trade>,
@@ -179,9 +193,42 @@ struct SimState {
     pending: Option<PendingEntry>,
     pending_exit: PendingExit,
     trades: Vec<Trade>,
+    #[serde(default)]
     equity_curve: Vec<f64>,
     #[serde(default)]
     risk: RiskState,
+    #[serde(default)]
+    last_bar_equity: Option<f64>,
+    #[serde(default)]
+    pending_halt_event: Option<HaltLimit>,
+    #[serde(default)]
+    pending_entry_blocked: bool,
+}
+
+#[derive(Serialize)]
+struct AgentSimulatorSnapshot<'a> {
+    instrument: &'a Instrument,
+    cost_rate: f64,
+    pv: f64,
+    sizing: Sizing,
+    bracket: Bracket,
+    session: &'a SessionFilter,
+    exit_at_session_end: bool,
+    risk: Option<RiskLimits>,
+    state: AgentSimStateSnapshot<'a>,
+}
+
+#[derive(Serialize)]
+struct AgentSimStateSnapshot<'a> {
+    equity: f64,
+    position: &'a Option<OpenPos>,
+    pending: &'a Option<PendingEntry>,
+    pending_exit: PendingExit,
+    trades: &'a [Trade],
+    risk: RiskState,
+    last_bar_equity: Option<f64>,
+    pending_halt_event: Option<HaltLimit>,
+    pending_entry_blocked: bool,
 }
 
 fn close_position(
@@ -217,14 +264,72 @@ fn close_position(
 
 /// Size of the entry about to fill, or `None` when the position cap leaves
 /// less than the venue's minimum order.
-fn entry_qty(ctx: &SimCtx, equity: f64, price: f64) -> Result<Option<f64>, BacktestError> {
-    let qty = quantity(ctx.sizing, equity, price)?;
+fn entry_qty_detail(
+    ctx: &SimCtx,
+    equity: f64,
+    price: f64,
+) -> Result<(f64, Option<f64>), BacktestError> {
+    let requested = quantity(ctx.sizing, equity, price)?;
     let Some(limits) = ctx.risk else {
-        return Ok(Some(qty));
+        return Ok((requested, Some(requested)));
     };
     let cap = equity * (limits.max_position_pct / 100.0) / (price * ctx.pv);
-    let clamped = qty.min(cap);
-    Ok((clamped >= ctx.instrument.min_qty).then_some(clamped))
+    let clamped = requested.min(cap);
+    Ok((
+        requested,
+        (clamped >= ctx.instrument.min_qty).then_some(clamped),
+    ))
+}
+
+fn emit(events: &mut Option<&mut Vec<DecisionEvent>>, create: impl FnOnce() -> DecisionEvent) {
+    if let Some(events) = events.as_deref_mut() {
+        let mut event = create();
+        event.seq = events.len() as i64;
+        events.push(event);
+    }
+}
+
+fn event(bar_ts: i64, kind: &str, reason: Option<String>) -> DecisionEvent {
+    DecisionEvent {
+        bar_ts,
+        kind: kind.to_string(),
+        seq: 0,
+        reason,
+        price: None,
+        qty: None,
+        requested_qty: None,
+        configured: None,
+        observed: None,
+        equity: 0.0,
+    }
+}
+
+fn exit_reason_code(reason: ExitReason) -> &'static str {
+    match reason {
+        ExitReason::Signal => "signal",
+        ExitReason::StopLoss => "stop_loss",
+        ExitReason::TakeProfit => "take_profit",
+        ExitReason::Trailing => "trailing",
+        ExitReason::SessionEnd => "session_end",
+        ExitReason::EndOfData => "end_of_data",
+        ExitReason::RiskHalt => "risk_halt",
+    }
+}
+
+fn halt_reason_code(limit: HaltLimit) -> &'static str {
+    match limit {
+        HaltLimit::DailyLoss => "daily_loss",
+        HaltLimit::Drawdown => "drawdown",
+        HaltLimit::KillSwitch => "kill_switch",
+    }
+}
+
+fn configured_limit(limits: &RiskLimits, limit: HaltLimit) -> Option<f64> {
+    match limit {
+        HaltLimit::DailyLoss => Some(limits.max_daily_loss_pct),
+        HaltLimit::Drawdown => Some(limits.max_drawdown_pct),
+        HaltLimit::KillSwitch => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -260,20 +365,25 @@ impl SimState {
             trades: Vec::new(),
             equity_curve: Vec::with_capacity(n),
             risk: RiskState::starting(initial_equity),
+            last_bar_equity: None,
+            pending_halt_event: None,
+            pending_entry_blocked: false,
         }
     }
 
     /// Cancel a queued entry and flatten the open position at the next open.
-    fn flatten_for_halt(&mut self) {
-        self.pending = None;
+    fn flatten_for_halt(&mut self) -> bool {
+        let blocked_entry = self.pending.take().is_some();
         if self.position.is_some() {
             self.pending_exit = PendingExit::Reason(ExitReason::RiskHalt);
         }
+        blocked_entry
     }
 
     fn halt_now(&mut self, limit: HaltLimit) {
         self.risk.force_halt(limit);
-        self.flatten_for_halt();
+        self.pending_entry_blocked |= self.flatten_for_halt();
+        self.pending_halt_event = Some(limit);
     }
 
     /// `live` means another bar is expected but not known yet, so a decision
@@ -286,23 +396,54 @@ impl SimState {
         strategy: &mut dyn BarStrategy,
         ctx: &SimCtx,
         live: bool,
+        mut events: Option<&mut Vec<DecisionEvent>>,
     ) -> Result<(), BacktestError> {
         let bar = &candles[i];
         let next = candles.get(i + 1);
+        if let Some(limit) = self.pending_halt_event.take() {
+            emit(&mut events, || {
+                let mut logged = event(
+                    bar.ts,
+                    "halt_triggered",
+                    Some(halt_reason_code(limit).to_string()),
+                );
+                if let Some(limits) = ctx.risk {
+                    logged.configured = configured_limit(limits, limit);
+                    logged.observed = Some(
+                        self.risk.observed_value(
+                            limit,
+                            self.last_bar_equity
+                                .or_else(|| self.equity_curve.last().copied())
+                                .unwrap_or(self.equity),
+                        ),
+                    );
+                }
+                logged
+            });
+        }
+        if std::mem::take(&mut self.pending_entry_blocked) {
+            emit(&mut events, || {
+                event(bar.ts, "entry_dropped", Some("blocked_by_halt".to_string()))
+            });
+        }
         if self.pending_exit.is_set() {
             if let Some(pos) = self.position.take() {
                 let raw_exit = bar.open;
-                let (after, trade) = close_position(
-                    ctx,
-                    &pos,
-                    raw_exit,
-                    bar.ts,
-                    i,
-                    self.pending_exit.reason(),
-                    self.equity,
-                );
+                let reason = self.pending_exit.reason();
+                let (after, trade) =
+                    close_position(ctx, &pos, raw_exit, bar.ts, i, reason, self.equity);
                 self.equity = after;
                 self.trades.push(trade);
+                emit(&mut events, || {
+                    let mut logged = event(
+                        bar.ts,
+                        "exit_filled",
+                        Some(exit_reason_code(reason).to_string()),
+                    );
+                    logged.price = Some(raw_exit);
+                    logged.qty = Some(pos.qty);
+                    logged
+                });
             }
             self.pending_exit = PendingExit::Legacy(false);
         }
@@ -310,7 +451,21 @@ impl SimState {
             if let Some(entry) = self.pending.take() {
                 if ctx.session.contains(entry.sig_ts) && ctx.session.contains(bar.ts) {
                     let entry_raw = ctx.instrument.round_to_tick(bar.open);
-                    if let Some(qty) = entry_qty(ctx, self.equity, entry_raw)? {
+                    let (requested_qty, qty) = entry_qty_detail(ctx, self.equity, entry_raw)?;
+                    if let Some(qty) = qty {
+                        if qty < requested_qty {
+                            emit(&mut events, || {
+                                let mut logged = event(
+                                    bar.ts,
+                                    "entry_clamped",
+                                    Some("position_cap".to_string()),
+                                );
+                                logged.price = Some(entry_raw);
+                                logged.qty = Some(qty);
+                                logged.requested_qty = Some(requested_qty);
+                                logged
+                            });
+                        }
                         let entry_cost = ctx.cost_rate * qty * ctx.pv * entry_raw;
                         self.position = Some(OpenPos {
                             entry_idx: i,
@@ -324,6 +479,35 @@ impl SimState {
                             trail: Trail::new(entry.side, entry_raw, ctx.bracket.trailing_pct),
                         });
                         strategy.on_fill(i);
+                        emit(&mut events, || {
+                            let mut logged = event(
+                                bar.ts,
+                                "entry_filled",
+                                Some(
+                                    match entry.side {
+                                        Side::Long => "long",
+                                        Side::Short => "short",
+                                    }
+                                    .to_string(),
+                                ),
+                            );
+                            logged.price = Some(entry_raw);
+                            logged.qty = Some(qty);
+                            logged
+                        });
+                    } else {
+                        emit(&mut events, || {
+                            let mut logged =
+                                event(bar.ts, "entry_dropped", Some("below_min_qty".to_string()));
+                            logged.price = Some(entry_raw);
+                            logged.qty =
+                                Some(requested_qty.min(ctx.risk.map_or(requested_qty, |risk| {
+                                    self.equity * (risk.max_position_pct / 100.0)
+                                        / (entry_raw * ctx.pv)
+                                })));
+                            logged.requested_qty = Some(requested_qty);
+                            logged
+                        });
                     }
                 }
             }
@@ -354,6 +538,16 @@ impl SimState {
                     close_position(ctx, &pos, raw_exit, bar.ts, i, reason, self.equity);
                 self.equity = after;
                 self.trades.push(trade);
+                emit(&mut events, || {
+                    let mut logged = event(
+                        bar.ts,
+                        "exit_filled",
+                        Some(exit_reason_code(reason).to_string()),
+                    );
+                    logged.price = Some(raw_exit);
+                    logged.qty = Some(pos.qty);
+                    logged
+                });
             } else {
                 self.position = Some(pos);
                 if ctx.exit_at_session_end
@@ -394,6 +588,19 @@ impl SimState {
                         side,
                         sig_ts: bar.ts,
                     });
+                    emit(&mut events, || {
+                        event(
+                            bar.ts,
+                            "signal_received",
+                            Some(
+                                match side {
+                                    Side::Long => "long",
+                                    Side::Short => "short",
+                                }
+                                .to_string(),
+                            ),
+                        )
+                    });
                 }
             }
         }
@@ -411,15 +618,34 @@ impl SimState {
             }
             None => self.equity,
         };
-        let prev_close = self.equity_curve.last().copied().unwrap_or(bar_equity);
+        let prev_close = self
+            .last_bar_equity
+            .or_else(|| self.equity_curve.last().copied())
+            .unwrap_or(bar_equity);
         self.equity_curve.push(bar_equity);
+        self.last_bar_equity = Some(bar_equity);
         if let Some(limits) = ctx.risk {
-            if self
-                .risk
-                .observe(limits, bar.ts, bar_equity, prev_close)
-                .is_some()
-            {
-                self.flatten_for_halt();
+            if let Some(limit) = self.risk.observe(limits, bar.ts, bar_equity, prev_close) {
+                emit(&mut events, || {
+                    let mut logged = event(
+                        bar.ts,
+                        "halt_triggered",
+                        Some(halt_reason_code(limit).to_string()),
+                    );
+                    logged.configured = configured_limit(limits, limit);
+                    logged.observed = Some(self.risk.observed_value(limit, bar_equity));
+                    logged
+                });
+                if self.flatten_for_halt() {
+                    emit(&mut events, || {
+                        event(bar.ts, "entry_dropped", Some("blocked_by_halt".to_string()))
+                    });
+                }
+            }
+        }
+        if let Some(events) = events {
+            for logged in events {
+                logged.equity = bar_equity;
             }
         }
         Ok(())
@@ -442,6 +668,7 @@ impl SimState {
             if let Some(last) = self.equity_curve.last_mut() {
                 *last = self.equity;
             }
+            self.last_bar_equity = Some(self.equity);
         }
     }
 }
@@ -475,6 +702,34 @@ pub struct Simulator {
 }
 
 impl Simulator {
+    pub fn serialize_agent_snapshot<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        AgentSimulatorSnapshot {
+            instrument: &self.instrument,
+            cost_rate: self.cost_rate,
+            pv: self.pv,
+            sizing: self.sizing,
+            bracket: self.bracket,
+            session: &self.session,
+            exit_at_session_end: self.exit_at_session_end,
+            risk: self.risk,
+            state: AgentSimStateSnapshot {
+                equity: self.state.equity,
+                position: &self.state.position,
+                pending: &self.state.pending,
+                pending_exit: self.state.pending_exit,
+                trades: &self.state.trades,
+                risk: self.state.risk,
+                last_bar_equity: self.state.last_bar_equity,
+                pending_halt_event: self.state.pending_halt_event,
+                pending_entry_blocked: self.state.pending_entry_blocked,
+            },
+        }
+        .serialize(serializer)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         instrument: Instrument,
@@ -541,7 +796,7 @@ impl Simulator {
             self.exit_at_session_end,
             self.risk.as_ref(),
         );
-        self.state.step(i, candles, strategy, &ctx, false)
+        self.state.step(i, candles, strategy, &ctx, false, None)
     }
 
     pub fn step_live(
@@ -560,7 +815,29 @@ impl Simulator {
             self.exit_at_session_end,
             self.risk.as_ref(),
         );
-        self.state.step(i, candles, strategy, &ctx, true)
+        self.state.step(i, candles, strategy, &ctx, true, None)
+    }
+
+    pub fn step_live_with_events(
+        &mut self,
+        i: usize,
+        candles: &[Candle],
+        strategy: &mut dyn BarStrategy,
+    ) -> Result<Vec<DecisionEvent>, BacktestError> {
+        let ctx = sim_ctx(
+            &self.instrument,
+            self.cost_rate,
+            self.pv,
+            self.sizing,
+            &self.bracket,
+            &self.session,
+            self.exit_at_session_end,
+            self.risk.as_ref(),
+        );
+        let mut events = Vec::new();
+        self.state
+            .step(i, candles, strategy, &ctx, true, Some(&mut events))?;
+        Ok(events)
     }
 
     pub fn finish(&mut self, i: usize, bar: &Candle) {
@@ -577,8 +854,17 @@ impl Simulator {
         self.state.finish(i, bar, &ctx);
     }
 
-    pub fn equity(&self) -> f64 {
-        self.state.equity
+    pub fn current_equity(&self) -> f64 {
+        self.state
+            .last_bar_equity
+            .or_else(|| self.state.equity_curve.last().copied())
+            .unwrap_or(self.state.equity)
+    }
+
+    pub fn restore_last_bar_equity(&mut self) {
+        if self.state.last_bar_equity.is_none() {
+            self.state.last_bar_equity = self.state.equity_curve.last().copied();
+        }
     }
 
     pub fn trades(&self) -> &[Trade] {
@@ -818,6 +1104,120 @@ mod tests {
             sim.step(i, &candles, &mut s).expect("step");
         }
         sim.position().map(|p| p.qty)
+    }
+
+    #[test]
+    fn shared_simulator_emits_fill_clamp_drop_risk_halt_and_exit_events() {
+        let candles = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 69.0, 70.0),
+            c(3 * MS_PER_MIN, 70.0, 70.0, 70.0, 70.0),
+        ];
+        let mut strategy = Sig(vec![Some(Side::Long), None, None, None]);
+        let mut sim = Simulator::new(
+            inst(),
+            Sizing::FixedQty(100.0),
+            no_bracket(),
+            session_all(),
+            10_000.0,
+            false,
+            Some(limits(50.0, 100.0, 10.0)),
+        )
+        .expect("sim");
+        let mut events = Vec::new();
+        for i in 0..candles.len() {
+            events.extend(
+                sim.step_live_with_events(i, &candles, &mut strategy)
+                    .expect("live step"),
+            );
+        }
+        assert!(events.iter().any(|e| e.kind == "signal_received"));
+        let clamp = events
+            .iter()
+            .find(|e| e.kind == "entry_clamped")
+            .expect("cap clamp");
+        assert_eq!(clamp.reason.as_deref(), Some("position_cap"));
+        assert_eq!(clamp.requested_qty, Some(100.0));
+        assert_eq!(clamp.qty, Some(50.0));
+        let fill = events
+            .iter()
+            .find(|e| e.kind == "entry_filled")
+            .expect("entry fill");
+        assert_eq!(fill.price, Some(100.0));
+        assert_eq!(fill.qty, Some(50.0));
+        let halt = events
+            .iter()
+            .find(|e| e.kind == "halt_triggered")
+            .expect("risk halt");
+        assert_eq!(halt.reason.as_deref(), Some("drawdown"));
+        assert_eq!(halt.configured, Some(10.0));
+        assert!(halt.observed.is_some_and(|value| value >= 10.0));
+        let exit = events
+            .iter()
+            .find(|e| e.kind == "exit_filled")
+            .expect("risk exit");
+        assert_eq!(exit.reason.as_deref(), Some("risk_halt"));
+        assert_eq!(exit.price, Some(70.0));
+
+        let min_size_instrument = inst().with_min_qty(11.0).expect("min qty");
+        let mut dropped_strategy = Sig(vec![Some(Side::Long), None]);
+        let mut dropped_sim = Simulator::new(
+            min_size_instrument,
+            Sizing::FixedQty(100.0),
+            no_bracket(),
+            session_all(),
+            10_000.0,
+            false,
+            Some(limits(10.0, 100.0, 100.0)),
+        )
+        .expect("sim");
+        dropped_sim
+            .step_live_with_events(0, &candles[..2], &mut dropped_strategy)
+            .expect("signal step");
+        let dropped = dropped_sim
+            .step_live_with_events(1, &candles[..2], &mut dropped_strategy)
+            .expect("drop step");
+        let drop = dropped
+            .iter()
+            .find(|e| e.kind == "entry_dropped")
+            .expect("minimum size drop");
+        assert_eq!(drop.reason.as_deref(), Some("below_min_qty"));
+        assert_eq!(drop.requested_qty, Some(100.0));
+        assert_eq!(drop.qty, Some(10.0));
+
+        let stopped = vec![
+            c(0, 100.0, 100.0, 100.0, 100.0),
+            c(MS_PER_MIN, 100.0, 100.0, 100.0, 100.0),
+            c(2 * MS_PER_MIN, 100.0, 100.0, 94.0, 94.0),
+        ];
+        let mut blocked_strategy = Sig(vec![Some(Side::Long), None, Some(Side::Long)]);
+        let mut blocked_sim = Simulator::new(
+            inst(),
+            Sizing::FixedQty(100.0),
+            Bracket {
+                stop_pct: Some(5.0),
+                target_pct: None,
+                trailing_pct: None,
+            },
+            session_all(),
+            10_000.0,
+            false,
+            Some(limits(100.0, 1.0, 100.0)),
+        )
+        .expect("sim");
+        blocked_sim
+            .step_live_with_events(0, &stopped, &mut blocked_strategy)
+            .expect("signal");
+        blocked_sim
+            .step_live_with_events(1, &stopped, &mut blocked_strategy)
+            .expect("fill");
+        let blocked = blocked_sim
+            .step_live_with_events(2, &stopped, &mut blocked_strategy)
+            .expect("stop and halt");
+        assert!(blocked.iter().any(|e| {
+            e.kind == "entry_dropped" && e.reason.as_deref() == Some("blocked_by_halt")
+        }));
     }
 
     #[test]
@@ -2518,7 +2918,7 @@ mod resume_tests {
         ctx: &SimCtx,
     ) -> Result<(), BacktestError> {
         for i in from..candles.len() {
-            state.step(i, candles, strategy, ctx, false)?;
+            state.step(i, candles, strategy, ctx, false, None)?;
         }
         let last = candles.len() - 1;
         state.finish(last, &candles[last], ctx);
@@ -2636,7 +3036,7 @@ mod resume_tests {
             let mut head_strategy = RulesStrategy::new(&spec);
             for i in 0..k {
                 head_state
-                    .step(i, &candles, &mut head_strategy, &ctx, false)
+                    .step(i, &candles, &mut head_strategy, &ctx, false, None)
                     .expect("head step");
             }
             coverage.observe(&head_state);
@@ -2762,7 +3162,7 @@ mod resume_tests {
             let mut head_state = SimState::new(run_cfg.initial_equity, candles.len());
             for i in 0..k {
                 head_state
-                    .step(i, &candles, &mut head, &ctx, false)
+                    .step(i, &candles, &mut head, &ctx, false, None)
                     .expect("head step");
             }
             // Before the opening range is complete the ORB keeps its bounds as

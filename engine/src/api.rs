@@ -26,6 +26,10 @@ use crate::ratelimit::RateLimiter;
 const DEFAULT_BACKTEST_TIMEOUT_SECS: u64 = 60;
 const BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const ADMIN_HEADER: &str = "x-admin-token";
+const DEFAULT_DECISIONS_LIMIT: i64 = 100;
+const MAX_DECISIONS_LIMIT: i64 = 500;
+const DEFAULT_EQUITY_LIMIT: i64 = 1_000;
+const MAX_EQUITY_LIMIT: i64 = 5_000;
 
 #[derive(Clone)]
 pub struct Limits {
@@ -249,6 +253,8 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/runs/{id}", get(get_run))
         .route("/agents", get(list_agents).post(post_agent))
         .route("/agents/{id}", get(get_agent))
+        .route("/agents/{id}/decisions", get(get_agent_decisions))
+        .route("/agents/{id}/equity", get(get_agent_equity))
         .route("/agents/{id}/start", post(start_agent))
         .route("/agents/{id}/stop", post(stop_agent))
         .route("/agents/{id}/advance", post(advance_agent))
@@ -1114,22 +1120,33 @@ struct AgentDetail {
     equity_curve: Vec<f64>,
 }
 
-fn agent_detail(row: crate::db::AgentRow) -> Result<AgentDetail, ApiFailure> {
+fn agent_detail(state: &AppState, row: crate::db::AgentRow) -> Result<AgentDetail, ApiFailure> {
+    let agent_id = row.summary.id.clone();
     let strategy: crate::strategy::Strategy = serde_json::from_value(row.strategy)
         .map_err(|e| ApiFailure::internal(format!("agent strategy is corrupt: {e}")))?;
-    let (candle_count, position, trades, equity_curve, halt) = match row.snapshot.as_deref() {
-        Some(text) => {
-            let snapshot = crate::agent::AgentSnapshot::from_json(text)
-                .map_err(|e| ApiFailure::internal(e.to_string()))?;
-            (
-                snapshot.candle_count(),
-                snapshot.position(),
-                snapshot.trades().to_vec(),
-                snapshot.equity_curve().to_vec(),
-                snapshot.halt(),
-            )
-        }
-        None => (0, None, Vec::new(), Vec::new(), None),
+    let (candle_count, position, trades, snapshot_equity_curve, halt) =
+        match row.snapshot.as_deref() {
+            Some(text) => {
+                let snapshot = crate::agent::AgentSnapshot::from_json(text)
+                    .map_err(|e| ApiFailure::internal(e.to_string()))?;
+                (
+                    snapshot.candle_count(),
+                    snapshot.position(),
+                    snapshot.trades().to_vec(),
+                    snapshot.equity_curve().to_vec(),
+                    snapshot.halt(),
+                )
+            }
+            None => (0, None, Vec::new(), Vec::new(), None),
+        };
+    let history = state
+        .db
+        .list_agent_equity(&agent_id, crate::db::MAX_AGENT_EQUITY_POINTS, None)
+        .map_err(|e| ApiFailure::internal(e.to_string()))?;
+    let equity_curve = if history.is_empty() {
+        snapshot_equity_curve
+    } else {
+        history.into_iter().map(|point| point.equity).collect()
     };
     Ok(AgentDetail {
         agent: row.summary,
@@ -1214,11 +1231,133 @@ async fn list_agents(State(state): State<AppState>) -> Response {
 
 async fn get_agent(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match agent_or_404(&state, &id) {
-        Ok(row) => match agent_detail(row) {
+        Ok(row) => match agent_detail(&state, row) {
             Ok(detail) => agent_json(detail),
             Err(e) => e.into_response(),
         },
         Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentDecisionsQuery {
+    limit: Option<i64>,
+    before: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentEquityQuery {
+    limit: Option<i64>,
+    since: Option<i64>,
+}
+
+fn parse_decision_cursor(value: &str) -> Result<(i64, i64), String> {
+    let Some((bar_ts, seq)) = value.split_once(':') else {
+        return Err("before must be formatted as bar_ts:seq".to_string());
+    };
+    let bar_ts = bar_ts
+        .parse::<i64>()
+        .map_err(|_| "before bar_ts must be a non-negative integer".to_string())?;
+    let seq = seq
+        .parse::<i64>()
+        .map_err(|_| "before seq must be a non-negative integer".to_string())?;
+    if bar_ts < 0 || seq < 0 {
+        return Err("before values must be non-negative".to_string());
+    }
+    Ok((bar_ts, seq))
+}
+
+async fn get_agent_decisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<AgentDecisionsQuery>, QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(query) => query.0,
+        Err(error) => return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_DECISIONS_LIMIT);
+    if !(1..=MAX_DECISIONS_LIMIT).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_DECISIONS_LIMIT}"),
+        )
+        .into_response();
+    }
+    let before = match query
+        .before
+        .as_deref()
+        .map(parse_decision_cursor)
+        .transpose()
+    {
+        Ok(before) => before,
+        Err(error) => return err_json(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = agent_or_404(&state, &id) {
+        return error.into_response();
+    }
+    match state.db.list_agent_decisions(&id, limit, before) {
+        Ok(decisions) => {
+            let next_before = (decisions.len() == limit as usize)
+                .then(|| decisions.last())
+                .flatten()
+                .map(|row| format!("{}:{}", row.bar_ts, row.seq));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "decisions": decisions,
+                    "next_before": next_before,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    }
+}
+
+async fn get_agent_equity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<AgentEquityQuery>, QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(query) => query.0,
+        Err(error) => return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_EQUITY_LIMIT);
+    if !(1..=MAX_EQUITY_LIMIT).contains(&limit) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_EQUITY_LIMIT}"),
+        )
+        .into_response();
+    }
+    if query.since.is_some_and(|since| since < 0) {
+        return err_json(StatusCode::BAD_REQUEST, "since must be non-negative").into_response();
+    }
+    if let Err(error) = agent_or_404(&state, &id) {
+        return error.into_response();
+    }
+    match state.db.list_agent_equity(&id, limit, query.since) {
+        Ok(points) => {
+            let next_since = (points.len() == limit as usize)
+                .then(|| points.last())
+                .flatten()
+                .and_then(|point| point.bar_ts.checked_add(1));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "equity": points,
+                    "next_since": next_since,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -1283,7 +1422,7 @@ async fn post_agent(
     {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    match agent_or_404(&state, &id).and_then(agent_detail) {
+    match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
         Ok(detail) => (
             StatusCode::CREATED,
             Json(serde_json::to_value(detail).unwrap_or_default()),
@@ -1345,18 +1484,23 @@ async fn start_agent(
         // Snapshots written before agents enforced risk get the caps now.
         if snapshot.risk_limits().is_none() {
             snapshot.set_risk_limits(row.risk);
-            let json = match snapshot.to_json() {
-                Ok(json) => json,
-                Err(e) => {
-                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                        .into_response()
-                }
-            };
-            if let Err(e) = state.db.set_agent_snapshot(&id, &json) {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
         }
-        match state.db.start_agent(&id, now_secs()) {
+        let snapshot_json = match snapshot.to_json() {
+            Ok(json) => json,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        let equity_points = snapshot.equity_points();
+        match state.db.start_agent_with_snapshot(
+            &id,
+            now_secs(),
+            snapshot.equity(),
+            snapshot.last_price(),
+            snapshot.last_ts(),
+            &snapshot_json,
+            &equity_points,
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 return err_json(StatusCode::NOT_FOUND, format!("unknown agent: {id}"))
@@ -1366,7 +1510,7 @@ async fn start_agent(
                 return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
-        return match agent_or_404(&state, &id).and_then(agent_detail) {
+        return match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
             Ok(detail) => agent_json(detail),
             Err(e) => e.into_response(),
         };
@@ -1467,6 +1611,7 @@ async fn start_agent(
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
+    let equity_points = snapshot.equity_points();
     if let Err(e) = state.db.start_agent_with_snapshot(
         &id,
         now_secs(),
@@ -1474,10 +1619,11 @@ async fn start_agent(
         snapshot.last_price(),
         snapshot.last_ts(),
         &snapshot_json,
+        &equity_points,
     ) {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    match agent_or_404(&state, &id).and_then(agent_detail) {
+    match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
         Ok(detail) => agent_json(detail),
         Err(e) => e.into_response(),
     }
@@ -1501,7 +1647,7 @@ async fn stop_agent(State(state): State<AppState>, Path(id): Path<String>) -> Re
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     }
-    match agent_or_404(&state, &id).and_then(agent_detail) {
+    match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
         Ok(detail) => agent_json(detail),
         Err(e) => e.into_response(),
     }
@@ -1561,17 +1707,17 @@ async fn advance_agent(
         snapshot.kill_switch();
         reconciled = true;
     }
-    if reconciled {
-        let json = match snapshot.to_json() {
-            Ok(json) => json,
-            Err(e) => {
-                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-        };
-        if let Err(e) = state.db.set_agent_snapshot(&id, &json) {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    let history_exists = match state.db.list_agent_equity(&id, 1, None) {
+        Ok(points) => !points.is_empty(),
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
-    }
+    };
+    let prior_equity_points = if history_exists {
+        Vec::new()
+    } else {
+        snapshot.equity_points()
+    };
     let step = match crate::feeds::interval_ms(&spec.timeframe) {
         Some(step) => step,
         None => {
@@ -1585,7 +1731,23 @@ async fn advance_agent(
     let start = snapshot.last_ts() + step;
     let end = body.end_ms.unwrap_or_else(now_ms);
     if start >= end {
-        return match agent_or_404(&state, &id).and_then(agent_detail) {
+        if reconciled {
+            let json = match snapshot.to_json() {
+                Ok(json) => json,
+                Err(e) => {
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                        .into_response()
+                }
+            };
+            if let Err(e) =
+                state
+                    .db
+                    .set_agent_snapshot_with_equity(&id, &json, &prior_equity_points)
+            {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+        return match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
             Ok(detail) => agent_json(detail),
             Err(e) => e.into_response(),
         };
@@ -1623,18 +1785,35 @@ async fn advance_agent(
                 return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
-        if let Err(e) = state.db.save_agent_snapshot(
-            &id,
-            status.as_str(),
-            outcome.equity,
-            outcome.last_price,
-            outcome.last_ts,
-            &snapshot_json,
-        ) {
+        let mut equity_points = prior_equity_points;
+        equity_points.extend(outcome.equity_points.iter().cloned());
+        if let Err(e) = state.db.save_agent_advance(crate::db::AgentAdvanceWrite {
+            id: &id,
+            status: status.as_str(),
+            equity: outcome.equity,
+            last_price: outcome.last_price,
+            last_ts: outcome.last_ts,
+            snapshot: &snapshot_json,
+            decisions: &outcome.events,
+            equity_points: &equity_points,
+        }) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    } else if reconciled {
+        let json = match snapshot.to_json() {
+            Ok(json) => json,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        if let Err(e) = state
+            .db
+            .set_agent_snapshot_with_equity(&id, &json, &prior_equity_points)
+        {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     }
-    match agent_or_404(&state, &id).and_then(agent_detail) {
+    match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
         Ok(detail) => agent_json(detail),
         Err(e) => e.into_response(),
     }
@@ -1654,12 +1833,13 @@ fn update_snapshot(
     let mut snapshot = crate::agent::AgentSnapshot::from_json(text)
         .map_err(|e| ApiFailure::internal(e.to_string()))?;
     change(&mut snapshot);
+    let equity_points = snapshot.equity_points();
     let json = snapshot
         .to_json()
         .map_err(|e| ApiFailure::internal(e.to_string()))?;
     state
         .db
-        .set_agent_snapshot(id, &json)
+        .set_agent_snapshot_with_equity(id, &json, &equity_points)
         .map_err(|e| ApiFailure::internal(e.to_string()))?;
     Ok(true)
 }
@@ -1775,7 +1955,7 @@ async fn reset_agent(
         Ok(_) => {}
         Err(e) => return e.into_response(),
     }
-    match agent_or_404(&state, &id).and_then(agent_detail) {
+    match agent_or_404(&state, &id).and_then(|row| agent_detail(&state, row)) {
         Ok(detail) => agent_json(detail),
         Err(e) => e.into_response(),
     }
@@ -3116,6 +3296,10 @@ mod tests {
             .unwrap()
     }
 
+    fn get_req(uri: &str) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
     async fn create_agent(
         router: &Router,
         body: serde_json::Value,
@@ -3675,6 +3859,295 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await["agent"]["status"], "running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn agent_history_endpoints_paginate_validate_and_return_not_found() {
+        let dir = temp_dir("agent_history_routes");
+        let state = test_state(dir.clone());
+        let db = state.db.clone();
+        let router = app(state);
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "History",
+                "strategy": valid_strategy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+        let decisions = [
+            (100, 0, "signal_received"),
+            (100, 1, "entry_filled"),
+            (200, 0, "exit_filled"),
+            (300, 0, "halt_triggered"),
+            (300, 1, "exit_filled"),
+        ]
+        .map(|(bar_ts, seq, kind)| crate::backtest::DecisionEvent {
+            bar_ts,
+            kind: kind.to_string(),
+            seq,
+            reason: None,
+            price: None,
+            qty: None,
+            requested_qty: None,
+            configured: None,
+            observed: None,
+            equity: 10_000.0,
+        });
+        let points = [100, 200, 300, 400].map(|bar_ts| crate::agent::EquityPoint {
+            bar_ts,
+            equity: 10_000.0 + bar_ts as f64,
+        });
+        assert!(db
+            .save_agent_advance(crate::db::AgentAdvanceWrite {
+                id: &id,
+                status: "running",
+                equity: 10_400.0,
+                last_price: 100.0,
+                last_ts: 400,
+                snapshot: "{}",
+                decisions: &decisions,
+                equity_points: &points,
+            })
+            .expect("seed history"));
+
+        let res = router
+            .clone()
+            .oneshot(get_req(&format!("/agents/{id}/decisions")))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "read-only route has no admin gate"
+        );
+        assert_eq!(
+            body_json(res).await["decisions"].as_array().unwrap().len(),
+            5
+        );
+
+        let res = router
+            .clone()
+            .oneshot(get_req(&format!("/agents/{id}/decisions?limit=2")))
+            .await
+            .unwrap();
+        let page = body_json(res).await;
+        assert_eq!(page["decisions"][0]["bar_ts"], 300);
+        assert_eq!(page["decisions"][0]["seq"], 1);
+        assert_eq!(page["decisions"][1]["seq"], 0);
+        assert_eq!(page["next_before"], "300:0");
+
+        let res = router
+            .clone()
+            .oneshot(get_req(&format!(
+                "/agents/{id}/decisions?limit=2&before=300:0"
+            )))
+            .await
+            .unwrap();
+        let page = body_json(res).await;
+        assert_eq!(page["decisions"][0]["bar_ts"], 200);
+        assert_eq!(page["decisions"][1]["bar_ts"], 100);
+        assert_eq!(page["decisions"][1]["seq"], 1);
+
+        let res = router
+            .clone()
+            .oneshot(get_req(&format!("/agents/{id}/equity?limit=2")))
+            .await
+            .unwrap();
+        let page = body_json(res).await;
+        assert_eq!(page["equity"][0]["bar_ts"], 100);
+        assert_eq!(page["equity"][1]["bar_ts"], 200);
+        assert_eq!(page["next_since"], 201);
+
+        let res = router
+            .clone()
+            .oneshot(get_req(&format!("/agents/{id}/equity?limit=2&since=201")))
+            .await
+            .unwrap();
+        let page = body_json(res).await;
+        assert_eq!(page["equity"][0]["bar_ts"], 300);
+        assert_eq!(page["equity"][1]["bar_ts"], 400);
+
+        for uri in [
+            format!("/agents/{id}/decisions?limit=0"),
+            format!("/agents/{id}/decisions?limit=501"),
+            format!("/agents/{id}/decisions?before=-1:0"),
+            format!("/agents/{id}/decisions?before=1:-1"),
+            format!("/agents/{id}/equity?limit=0"),
+            format!("/agents/{id}/equity?limit=5001"),
+            format!("/agents/{id}/equity?since=-1"),
+            format!("/agents/{id}/equity?limit=abc"),
+        ] {
+            let res = router.clone().oneshot(get_req(&uri)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        for uri in ["/agents/missing/decisions", "/agents/missing/equity"] {
+            let res = router.clone().oneshot(get_req(uri)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retrying_agent_advance_does_not_duplicate_history() {
+        let dir = temp_dir("agent_history_retry");
+        let state = test_state(dir.clone());
+        let db = state.db.clone();
+        let router = app(state);
+        let fake = FakeSource::new();
+        let step = 3_600_000;
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Retry",
+                "strategy": valid_strategy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+        let warm_end = fake.start() + step * 100;
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": warm_end }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _started = body_json(res).await;
+
+        let advance = || {
+            json_req(
+                &format!("/agents/{id}/advance"),
+                &serde_json::json!({ "end_ms": fake.end() }),
+            )
+        };
+        let res = router.clone().oneshot(advance()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let advanced = body_json(res).await;
+        let decisions_before = db
+            .list_agent_decisions(&id, 5_000, None)
+            .expect("decisions after first advance");
+        let equity_before = db
+            .list_agent_equity(&id, 20_000, None)
+            .expect("equity after first advance");
+        assert!(!equity_before.is_empty());
+        assert_eq!(
+            equity_before.len() as u64,
+            advanced["candle_count"].as_u64().expect("candle count"),
+            "one point is stored for every bar processed by the agent"
+        );
+        let snapshot_before = db.get_agent(&id).expect("get").expect("exists").snapshot;
+
+        let res = router.clone().oneshot(advance()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let decisions_after = db
+            .list_agent_decisions(&id, 5_000, None)
+            .expect("decisions after retry");
+        let equity_after = db
+            .list_agent_equity(&id, 20_000, None)
+            .expect("equity after retry");
+        let snapshot_after = db.get_agent(&id).expect("get").expect("exists").snapshot;
+        assert_eq!(decisions_after.len(), decisions_before.len());
+        assert_eq!(equity_after.len(), equity_before.len());
+        assert_eq!(snapshot_after, snapshot_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn halted_agent_logs_flatten_and_halt_then_noop_adds_no_rows() {
+        let dir = temp_dir("halted_agent_history");
+        let state = admin_state(dir.clone(), Some("secret"));
+        let db = state.db.clone();
+        let router = app(state);
+        let fake = FakeSource::new();
+        let step = 3_600_000;
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Halted history",
+                "strategy": {
+                    "asset": "BTCUSDT",
+                    "timeframe": "1h",
+                    "side": "long",
+                    "entry": {"all": [{"left": {"ind": "close"}, "op": ">", "right": 0.0}]}
+                },
+                "risk": {
+                    "max_position_pct": 100.0,
+                    "max_daily_loss_pct": 100.0,
+                    "max_drawdown_pct": 100.0,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+        let warm_end = fake.start() + step * 100;
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": warm_end }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let started = body_json(res).await;
+        assert!(started["position"].is_object());
+
+        let res = router
+            .clone()
+            .oneshot(admin_req("/kill-switch", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let advance = || {
+            json_req(
+                &format!("/agents/{id}/advance"),
+                &serde_json::json!({ "end_ms": fake.end() }),
+            )
+        };
+        let res = router.clone().oneshot(advance()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let advanced = body_json(res).await;
+
+        let decisions = db
+            .list_agent_decisions(&id, 5_000, None)
+            .expect("decisions");
+        assert!(decisions.iter().any(|event| {
+            event.kind == "halt_triggered" && event.reason.as_deref() == Some("kill_switch")
+        }));
+        assert!(decisions.iter().any(|event| {
+            event.kind == "exit_filled" && event.reason.as_deref() == Some("risk_halt")
+        }));
+        let equity_count = db
+            .list_agent_equity(&id, 20_000, None)
+            .expect("equity")
+            .len();
+        assert_eq!(
+            equity_count as u64,
+            advanced["candle_count"].as_u64().expect("candle count")
+        );
+
+        let res = router.clone().oneshot(advance()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            db.list_agent_decisions(&id, 5_000, None)
+                .expect("decisions after noop")
+                .len(),
+            decisions.len()
+        );
+        assert_eq!(
+            db.list_agent_equity(&id, 20_000, None)
+                .expect("equity after noop")
+                .len(),
+            equity_count
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

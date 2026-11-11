@@ -106,6 +106,14 @@ impl RiskState {
         self.halt
     }
 
+    pub fn observed_value(&self, limit: HaltLimit, equity: f64) -> f64 {
+        match limit {
+            HaltLimit::DailyLoss => pct_below(self.day_start, equity),
+            HaltLimit::Drawdown => pct_below(self.peak, equity),
+            HaltLimit::KillSwitch => 0.0,
+        }
+    }
+
     pub fn is_halted(&self) -> bool {
         self.halt.is_some()
     }
