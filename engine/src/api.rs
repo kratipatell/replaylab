@@ -247,6 +247,7 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
         .route("/validate", post(post_validate))
+        .route("/walk-forward", post(post_walk_forward))
         .route("/optimize", post(post_optimize).get(list_optimize))
         .route("/optimize/{job_id}", get(get_optimize))
         .route("/runs", get(list_runs))
@@ -884,6 +885,94 @@ async fn post_validate(
         Ok(Ok(Ok(cross))) => cross,
     };
     (StatusCode::OK, Json(cross)).into_response()
+}
+
+async fn post_walk_forward(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    ClientIp(ip): ClientIp,
+    body: Result<Json<crate::walk_forward::WalkForwardRequest>, JsonRejection>,
+) -> Response {
+    if let Err(retry_after) = limits.optimize.check(&ip) {
+        return rate_limited(
+            retry_after,
+            "too many optimizer requests; try again shortly",
+        );
+    }
+    let req = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return err_json(error.status(), error.to_string()).into_response(),
+    };
+    if let Err(error) = req.strategy.validate() {
+        return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    if let Err(error) = crate::feeds::validate_symbol(&req.strategy.asset) {
+        return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    let sim = match parse_sim_params(
+        &req.strategy.timeframe,
+        req.start_ms,
+        req.end_ms,
+        req.fee_bps,
+        req.slippage_bps,
+        None,
+    ) {
+        Ok(params) => params,
+        Err(message) => return err_json(StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    if let Err(error) = crate::walk_forward::validate_request(&req) {
+        return err_json(StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+
+    let source = state.source.clone();
+    let cache_dir = state.cache_dir.clone();
+    let symbol = req.strategy.asset.clone();
+    let interval = req.strategy.timeframe.clone();
+    let start = req.start_ms;
+    let end = req.end_ms;
+    let cfg = crate::backtest::BacktestConfig {
+        fee_bps: sim.fee_bps,
+        slippage_bps: sim.slippage_bps,
+    };
+    let bars_per_year = sim.bars_per_year;
+    let timeout = limits.backtest_timeout;
+    let computed = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            let candles = crate::feeds::load_or_fetch(
+                &cache_dir,
+                source.as_ref(),
+                &symbol,
+                &interval,
+                start,
+                end,
+            )
+            .map_err(|error| BacktestFailure::Upstream(error.to_string()))?;
+            if candles.is_empty() {
+                return Err(BacktestFailure::BadRequest(
+                    "no candles in range".to_string(),
+                ));
+            }
+            crate::walk_forward::run(&req, &candles, &cfg, bars_per_year)
+                .map_err(|error| BacktestFailure::BadRequest(error.to_string()))
+        }),
+    )
+    .await;
+    let report = match computed {
+        Err(_) => {
+            return err_json(
+                StatusCode::REQUEST_TIMEOUT,
+                format!("walk-forward timed out after {}s", timeout.as_secs()),
+            )
+            .into_response();
+        }
+        Ok(Err(error)) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Ok(Ok(Err(failure))) => return failure.into_error_response(),
+        Ok(Ok(Ok(report))) => report,
+    };
+    (StatusCode::OK, Json(report)).into_response()
 }
 
 async fn post_optimize(
@@ -2067,6 +2156,23 @@ mod tests {
         })
     }
 
+    fn walk_forward_body(fake: &FakeSource) -> serde_json::Value {
+        serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": fake.start(),
+            "end_ms": fake.end(),
+            "windows": 2,
+            "is_bars": 60,
+            "oos_bars": 30,
+            "params": [{
+                "target": "entry.all.0.right",
+                "kind": "float",
+                "values": [99.0, 100.0, 101.0]
+            }],
+            "search": {"method": "grid"}
+        })
+    }
+
     #[tokio::test]
     async fn health_returns_200() {
         let dir = temp_dir("health");
@@ -2158,6 +2264,97 @@ mod tests {
         assert_eq!(v["equity_curve"].as_array().unwrap().len(), candle_count);
         assert!(v["in_sample"].is_null());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn walk_forward_rejects_invalid_windows_lengths_and_evaluation_caps() {
+        let dir = temp_dir("walk_forward_bad");
+        let fake = FakeSource::new();
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::new(30, 30, 2),
+        )
+        .expect("router");
+        let mut cases = Vec::new();
+
+        let mut body = walk_forward_body(&fake);
+        body["windows"] = serde_json::json!(1);
+        cases.push((body, "windows"));
+
+        let mut body = walk_forward_body(&fake);
+        body["windows"] = serde_json::json!(11);
+        cases.push((body, "windows"));
+
+        let mut body = walk_forward_body(&fake);
+        body["is_bars"] = serde_json::json!(0);
+        cases.push((body, "is_bars"));
+
+        let mut body = walk_forward_body(&fake);
+        body["oos_bars"] = serde_json::json!(0);
+        cases.push((body, "oos_bars"));
+
+        let mut body = walk_forward_body(&fake);
+        body["windows"] = serde_json::json!(2);
+        body["is_bars"] = serde_json::json!(200);
+        body["oos_bars"] = serde_json::json!(60);
+        cases.push((body, "not enough candles"));
+
+        let mut body = walk_forward_body(&fake);
+        body["windows"] = serde_json::json!(10);
+        body["search"] = serde_json::json!({"method": "random", "trials": 201, "seed": 7});
+        cases.push((body, "optimizer evaluations"));
+
+        for (body, expected) in cases {
+            let res = router
+                .clone()
+                .oneshot(json_req("/walk-forward", &body))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert!(
+                body_json(res).await["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(expected),
+                "expected {expected:?} in error for {body}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn walk_forward_reuses_optimizer_rate_limit_and_returns_report() {
+        let dir = temp_dir("walk_forward_rate");
+        let fake = FakeSource::new();
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::new(30, 1, 2),
+        )
+        .expect("router");
+        let body = walk_forward_body(&fake);
+        let first = router
+            .clone()
+            .oneshot(json_req("/walk-forward", &body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let report = body_json(first).await;
+        assert_eq!(report["mode"], "rolling");
+        assert_eq!(report["windows"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            report["stitched_oos_equity_curve"]
+                .as_array()
+                .unwrap()
+                .len(),
+            61
+        );
+        let second = router
+            .oneshot(json_req("/walk-forward", &body))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

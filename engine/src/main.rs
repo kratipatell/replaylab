@@ -17,6 +17,7 @@ mod strategy;
 mod types;
 mod validation;
 mod verdict;
+mod walk_forward;
 
 use std::sync::Arc;
 

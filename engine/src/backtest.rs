@@ -79,6 +79,12 @@ pub enum BacktestError {
     Sizing(#[from] crate::sizing::SizingError),
     #[error(transparent)]
     Risk(#[from] RiskError),
+    #[error("invalid simulation window [{start}, {end}) for {candles} candles")]
+    BadWindow {
+        start: usize,
+        end: usize,
+        candles: usize,
+    },
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -1013,6 +1019,57 @@ pub fn backtest_strategy(
         &session,
         &run_cfg,
     )
+}
+
+struct ActiveWindowStrategy<'a> {
+    inner: &'a mut dyn BarStrategy,
+    start: usize,
+}
+
+impl BarStrategy for ActiveWindowStrategy<'_> {
+    fn on_bar(&mut self, idx: usize, candles: &[Candle]) -> Option<Side> {
+        let signal = self.inner.on_bar(idx, candles);
+        (idx >= self.start).then_some(signal).flatten()
+    }
+
+    fn exit_on_bar(&mut self, idx: usize, candles: &[Candle]) -> bool {
+        self.inner.exit_on_bar(idx, candles)
+    }
+
+    fn on_fill(&mut self, idx: usize) {
+        self.inner.on_fill(idx);
+    }
+}
+
+/// Run the shared simulator through a bounded history prefix while suppressing
+/// entries before `active_start`. The prefix still warms strategy indicators.
+pub fn backtest_strategy_window(
+    spec: &Strategy,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    active_start: usize,
+    end: usize,
+    initial_equity: f64,
+) -> Result<BacktestResult, BacktestError> {
+    if active_start >= end || end > candles.len() {
+        return Err(BacktestError::BadWindow {
+            start: active_start,
+            end,
+            candles: candles.len(),
+        });
+    }
+    let prefix = &candles[..end];
+    let mut simulator = Simulator::from_strategy(spec, cfg, initial_equity, None)?;
+    let mut strategy = crate::strategy::RulesStrategy::new(spec);
+    let mut windowed = ActiveWindowStrategy {
+        inner: &mut strategy,
+        start: active_start,
+    };
+    for i in 0..end {
+        simulator.step(i, prefix, &mut windowed)?;
+    }
+    simulator.finish(end - 1, &prefix[end - 1]);
+    Ok(simulator.into_result())
 }
 
 /// `risk` is opt-in: `None` runs the same simulator with no caps and no risk

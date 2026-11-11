@@ -217,10 +217,45 @@ pub fn compute_stats(result: &BacktestResult, candles: &[Candle], bars_per_year:
 pub enum StatsError {
     #[error("invalid split_idx {0} for {1} candles")]
     BadSplit(usize, usize),
+    #[error("invalid stats window [{start}, {end}) for {candles} candles")]
+    BadWindow {
+        start: usize,
+        end: usize,
+        candles: usize,
+    },
     #[error("missing equity base at split_idx {0}")]
     MissingBase(usize),
     #[error("invalid equity base {0} at split_idx {1}")]
     BadBase(f64, usize),
+}
+
+pub fn window_stats(
+    result: &BacktestResult,
+    candles: &[Candle],
+    start: usize,
+    end: usize,
+    bars_per_year: f64,
+) -> Result<Stats, StatsError> {
+    if start >= end || end > candles.len() || end > result.equity_curve.len() {
+        return Err(StatsError::BadWindow {
+            start,
+            end,
+            candles: candles.len().min(result.equity_curve.len()),
+        });
+    }
+    let prefix = BacktestResult {
+        trades: result
+            .trades
+            .iter()
+            .filter(|trade| trade.entry_idx < end)
+            .cloned()
+            .collect(),
+        equity_curve: result.equity_curve[..end].to_vec(),
+    };
+    if start == 0 {
+        return Ok(compute_stats(&prefix, &candles[..end], bars_per_year));
+    }
+    split_stats(&prefix, &candles[..end], start, bars_per_year).map(|(_, oos)| oos)
 }
 
 pub fn split_stats(

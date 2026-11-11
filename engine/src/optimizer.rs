@@ -751,7 +751,7 @@ fn window_stats(
     )
 }
 
-fn mean_stats(all: &[Stats]) -> Stats {
+pub(crate) fn mean_stats(all: &[Stats]) -> Stats {
     debug_assert!(!all.is_empty());
     let n = all.len() as f64;
     let mean = |f: fn(&Stats) -> f64| all.iter().map(f).sum::<f64>() / n;
@@ -775,6 +775,88 @@ fn mean_stats(all: &[Stats]) -> Stats {
         max_drawdown_pct: mean(|s| s.max_drawdown_pct),
         sharpe: mean(|s| s.sharpe),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WindowOptimization {
+    pub strategy: Strategy,
+    pub params: BTreeMap<String, f64>,
+    pub stats: Stats,
+    pub score: f64,
+    pub trials: usize,
+}
+
+struct WindowCandidate {
+    strategy: Strategy,
+    params: BTreeMap<String, f64>,
+    stats: Stats,
+    score: f64,
+}
+
+/// Pick parameters using only the active IS range; earlier candles are passed
+/// to the shared simulator only as indicator warm-up.
+pub(crate) fn optimize_window(
+    spec: &OptimizeSpec,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    is_start: usize,
+    is_end: usize,
+) -> Result<WindowOptimization, OptimizerError> {
+    if is_start >= is_end || is_end > candles.len() {
+        return Err(OptimizerError::Msg(format!(
+            "invalid IS window [{is_start}, {is_end}) for {} candles",
+            candles.len()
+        )));
+    }
+    validate_search_trials(spec)?;
+    let (targets, _) = validate_specs(spec)?;
+    let combos = build_combos(spec)?;
+    let param_names: Vec<String> = spec
+        .params
+        .iter()
+        .map(|param| param.target.clone())
+        .collect();
+    let objective = spec.objective.unwrap_or_default();
+    let evaluated: Vec<Result<WindowCandidate, OptimizerError>> = combos
+        .par_iter()
+        .map(|combo| {
+            let mut strategy = spec.strategy.clone();
+            apply_params(&mut strategy, &targets, combo)?;
+            let result = crate::backtest::backtest_strategy_window(
+                &strategy, candles, cfg, is_start, is_end, 1.0,
+            )?;
+            let stats = stats::window_stats(&result, candles, is_start, is_end, bars_per_year)?;
+            let params = param_names
+                .iter()
+                .cloned()
+                .zip(combo.iter().copied())
+                .collect();
+            Ok(WindowCandidate {
+                strategy,
+                params,
+                score: objective.score(&stats),
+                stats,
+            })
+        })
+        .collect();
+    let mut evaluated: Vec<WindowCandidate> = evaluated.into_iter().collect::<Result<_, _>>()?;
+    evaluated.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| format!("{:?}", a.params).cmp(&format!("{:?}", b.params)))
+    });
+    let best = evaluated.into_iter().next().ok_or_else(|| {
+        OptimizerError::Msg("search produced no parameter combinations".to_string())
+    })?;
+    Ok(WindowOptimization {
+        strategy: best.strategy,
+        params: best.params,
+        stats: best.stats,
+        score: best.score,
+        trials: combos.len(),
+    })
 }
 
 pub fn overfit_flag(is_stats: &Stats, oos_stats: &Stats) -> (bool, f64, Option<String>) {
