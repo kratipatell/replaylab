@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
   Bot,
-  ChevronDown,
   ChevronsLeft,
   ChevronsRight,
   FlaskConical,
@@ -13,7 +12,6 @@ import {
   SearchCheck,
   type LucideIcon,
 } from "lucide-react";
-import { agents } from "@/lib/agents";
 
 type NavItem = { label: string; href: string; icon: LucideIcon };
 
@@ -21,11 +19,11 @@ const NAV: NavItem[] = [
   { label: "Home", href: "/", icon: Home },
   { label: "Test Lab", href: "/test-lab", icon: FlaskConical },
   { label: "Check", href: "/check", icon: SearchCheck },
+  { label: "Agents", href: "/agents", icon: Bot },
 ];
 
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false);
-  const [agentsOpen, setAgentsOpen] = useState(true);
 
   // Match the required auto-collapsed state on narrow viewports.
   useEffect(() => {
@@ -73,66 +71,31 @@ export default function Sidebar() {
         </div>
       )}
 
-      <button
-        type="button"
-        disabled
-        title="Coming soon"
-        className="flex w-full items-center justify-center gap-1 rounded bg-[var(--accent)] px-2 py-1.5 text-sm font-medium text-[var(--accent-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
+      <Link
+        href="/agents#new-agent"
+        title="New agent"
+        aria-label={collapsed ? "New agent" : undefined}
+        className="flex min-h-10 w-full items-center justify-center gap-1 rounded bg-[var(--accent)] px-2 py-1.5 text-sm font-medium text-[var(--accent-foreground)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
       >
-        <Plus size={16} />
+        <Plus size={16} aria-hidden="true" />
         {!collapsed && <span>New agent</span>}
-      </button>
+      </Link>
 
       <nav aria-label="Primary" className="flex w-full flex-col gap-1">
-        {NAV.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            aria-current="page"
-            title={item.label}
-            className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm font-medium text-[var(--accent)] ${
-              collapsed ? "justify-center" : ""
-            }`}
-          >
-            <item.icon size={16} />
-            {!collapsed && <span>{item.label}</span>}
-          </Link>
-        ))}
+        {NAV.map((item) => {
+          return (
+            <Link
+              key={item.href}
+              href={item.href}
+              title={item.label}
+              className={`flex min-h-10 items-center gap-2 rounded px-2 py-1.5 text-sm font-medium text-[var(--muted)] hover:text-[var(--foreground)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] ${collapsed ? "justify-center" : ""}`}
+            >
+              <item.icon size={16} aria-hidden="true" />
+              {!collapsed && <span>{item.label}</span>}
+            </Link>
+          );
+        })}
       </nav>
-
-      <div className="flex w-full flex-col gap-1">
-        <button
-          type="button"
-          aria-expanded={agentsOpen}
-          onClick={() => setAgentsOpen((value) => !value)}
-          className={`flex w-full items-center gap-1 rounded px-2 py-1.5 text-sm text-[var(--muted)] ${
-            collapsed ? "justify-center" : "justify-between"
-          }`}
-        >
-          <span className="flex items-center gap-1">
-            <Bot size={16} />
-            {!collapsed && <span>Agents</span>}
-          </span>
-          {!collapsed && (
-            <ChevronDown
-              size={16}
-              className={agentsOpen ? "" : "-rotate-90"}
-            />
-          )}
-        </button>
-        {agentsOpen &&
-          (collapsed ? null : agents.length === 0 ? (
-            <p className="px-2 text-xs text-[var(--muted)]">No agents yet.</p>
-          ) : (
-            <ul className="flex flex-col gap-1 px-2">
-              {agents.map((agent) => (
-                <li key={agent.id} className="text-sm">
-                  {agent.name}
-                </li>
-              ))}
-            </ul>
-          ))}
-      </div>
     </aside>
   );
 }

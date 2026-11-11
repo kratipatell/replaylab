@@ -1,4 +1,4 @@
-import { agents } from "@/lib/agents";
+import Link from "next/link";
 
 export default function AgentsCard() {
   return (
@@ -10,30 +10,17 @@ export default function AgentsCard() {
             PAPER
           </span>
         </div>
-        <button
-          type="button"
-          disabled
-          title="Coming soon"
-          className="rounded bg-[var(--accent)] px-3 py-1.5 text-sm font-medium text-[var(--accent-foreground)] disabled:cursor-not-allowed disabled:opacity-50"
+        <Link
+          href="/agents"
+          className="min-h-10 rounded bg-[var(--accent)] px-3 py-2 text-sm font-medium text-[var(--accent-foreground)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
         >
-          Start paper trading
-        </button>
+          Manage agents
+        </Link>
       </div>
       <p className="mt-2 text-sm text-[var(--muted)]">Simulated money only.</p>
-      {agents.length === 0 ? (
-        <p className="mt-4 text-sm text-[var(--muted)]">No agents yet.</p>
-      ) : (
-        <ul className="mt-4 flex flex-col gap-2">
-          {agents.map((agent) => (
-            <li
-              key={agent.id}
-              className="rounded border border-[var(--border)] px-3 py-2 text-sm"
-            >
-              {agent.name}
-            </li>
-          ))}
-        </ul>
-      )}
+      <p className="mt-4 text-sm text-[var(--muted)]">
+        Create, start, and inspect paper agents from the agent workspace.
+      </p>
     </section>
   );
 }

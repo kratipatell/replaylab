@@ -86,7 +86,8 @@ export type ExitReason =
   | "TakeProfit"
   | "Trailing"
   | "SessionEnd"
-  | "EndOfData";
+  | "EndOfData"
+  | "RiskHalt";
 
 export interface Trade {
   entry_idx: number;
@@ -186,6 +187,97 @@ export interface SavedRun {
   trades: Trade[];
 }
 
+export type AgentStatus = "draft" | "running" | "stopped";
+export type HaltLimit = "DailyLoss" | "Drawdown" | "KillSwitch";
+
+export interface RiskLimits {
+  max_position_pct: number;
+  max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+}
+
+export interface AgentSummary {
+  id: string;
+  name: string;
+  status: AgentStatus;
+  symbol: string;
+  interval: string;
+  run_id: number | null;
+  created_at: number;
+  started_at: number | null;
+  stopped_at: number | null;
+  equity: number;
+  last_price: number | null;
+  last_ts: number | null;
+  last_error: string | null;
+}
+
+export interface AgentPosition {
+  side: Side;
+  entry_ts: number;
+  entry_price: number;
+  qty: number;
+  stop: number | null;
+  target: number | null;
+  trailing: number | null;
+}
+
+export interface AgentDetail {
+  agent: AgentSummary;
+  strategy: Strategy;
+  initial_equity: number;
+  risk: RiskLimits;
+  halt: HaltLimit | null;
+  candle_count: number;
+  position: AgentPosition | null;
+  trades: Trade[];
+  equity_curve: number[];
+}
+
+export interface CreateAgentRequest {
+  name: string;
+  strategy: Strategy;
+  initial_equity?: number;
+  risk?: RiskLimits;
+}
+
+export interface StartAgentRequest {
+  start_ms?: number;
+  end_ms?: number;
+}
+
+export interface AdvanceAgentRequest {
+  end_ms?: number;
+}
+
+export interface AgentDecision {
+  bar_ts: number;
+  kind: string;
+  seq: number;
+  reason: string | null;
+  price: number | null;
+  qty: number | null;
+  requested_qty: number | null;
+  configured: number | null;
+  observed: number | null;
+  equity: number;
+}
+
+export interface AgentEquityPoint {
+  bar_ts: number;
+  equity: number;
+}
+
+export interface AgentDecisionPage {
+  decisions: AgentDecision[];
+  next_before: string | null;
+}
+
+export interface AgentEquityPage {
+  equity: AgentEquityPoint[];
+  next_since: number | null;
+}
+
 interface ErrorBody {
   error?: string;
 }
@@ -264,4 +356,89 @@ export async function listRuns(): Promise<RunSummary[]> {
 
 export function getRun(id: number): Promise<SavedRun> {
   return request<SavedRun>(`/runs/${id}`);
+}
+
+export async function listAgents(): Promise<AgentSummary[]> {
+  const body = await request<{ agents: AgentSummary[] }>("/agents");
+  return body.agents;
+}
+
+export function createAgent(body: CreateAgentRequest): Promise<AgentDetail> {
+  return request<AgentDetail>("/agents", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function getAgent(id: string): Promise<AgentDetail> {
+  return request<AgentDetail>(`/agents/${encodeURIComponent(id)}`);
+}
+
+export function startAgent(
+  id: string,
+  body: StartAgentRequest,
+): Promise<AgentDetail> {
+  return request<AgentDetail>(`/agents/${encodeURIComponent(id)}/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function stopAgent(id: string): Promise<AgentDetail> {
+  return request<AgentDetail>(`/agents/${encodeURIComponent(id)}/stop`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+}
+
+export function advanceAgent(
+  id: string,
+  body: AdvanceAgentRequest = {},
+): Promise<AgentDetail> {
+  return request<AgentDetail>(`/agents/${encodeURIComponent(id)}/advance`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function getAgentDecisions(
+  id: string,
+  options: { limit?: number; before?: string } = {},
+): Promise<AgentDecisionPage> {
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.before !== undefined) query.set("before", options.before);
+  const suffix = query.size === 0 ? "" : `?${query.toString()}`;
+  return request<AgentDecisionPage>(
+    `/agents/${encodeURIComponent(id)}/decisions${suffix}`,
+  );
+}
+
+export function getAgentEquity(
+  id: string,
+  options: { limit?: number; since?: number } = {},
+): Promise<AgentEquityPage> {
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.since !== undefined) query.set("since", String(options.since));
+  const suffix = query.size === 0 ? "" : `?${query.toString()}`;
+  return request<AgentEquityPage>(
+    `/agents/${encodeURIComponent(id)}/equity${suffix}`,
+  );
+}
+
+export async function getAllAgentEquity(id: string): Promise<AgentEquityPoint[]> {
+  const points: AgentEquityPoint[] = [];
+  let since: number | undefined;
+  for (let pageCount = 0; pageCount < 5; pageCount += 1) {
+    const page = await getAgentEquity(id, { limit: 5_000, since });
+    points.push(...page.equity);
+    if (page.next_since === null || page.equity.length === 0) break;
+    since = page.next_since;
+  }
+  return points;
 }

@@ -242,11 +242,13 @@ export default function EquityCharts({
   split,
   startMs,
   endMs,
+  mode = "backtest",
 }: {
   equity: number[];
   split: number | null;
   startMs: number | null;
   endMs: number | null;
+  mode?: "backtest" | "agent";
 }) {
   const total = equity.length;
   const curve = downsample(equity, MAX_CHART_POINTS);
@@ -258,20 +260,24 @@ export default function EquityCharts({
   return (
     <div className="grid gap-4 md:grid-cols-2">
       <LineChart
-        title="Account growth"
-        sub="Test account value over time; the dashed line marks where held-back checking data starts."
-        yLabel="account value, 1.00 = starting value"
+        title={mode === "agent" ? "Agent equity" : "Account growth"}
+        sub={
+          mode === "agent"
+            ? "Account value at each processed closed bar."
+            : "Test account value over time; the dashed line marks where held-back checking data starts."
+        }
+        yLabel={mode === "agent" ? "account equity" : "account value, 1.00 = starting value"}
         points={curve}
         total={total}
-        split={split}
-        splitMs={splitMs}
+        split={mode === "agent" ? null : split}
+        splitMs={mode === "agent" ? null : splitMs}
         startMs={startMs}
         endMs={endMs}
         color="var(--verdict-holds)"
         fill={false}
       />
       <LineChart
-        title="Losing stretches"
+        title={mode === "agent" ? "Drawdown" : "Losing stretches"}
         sub="How far the account fell from its last peak, in percent."
         yLabel="percent below peak"
         points={dd}

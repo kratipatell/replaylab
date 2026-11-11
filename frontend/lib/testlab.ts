@@ -59,6 +59,12 @@ const STEP_MS: Record<Timeframe, number> = {
   "1d": 86_400_000,
 };
 
+export function timeframeStepMs(timeframe: string): number | null {
+  return Object.hasOwn(STEP_MS, timeframe)
+    ? STEP_MS[timeframe as Timeframe]
+    : null;
+}
+
 export function holdBackToSplit(pct: number): number {
   return 1 - pct / 100;
 }
@@ -684,6 +690,8 @@ export function exitReasonLabel(reason: ExitReason): string {
       return "End of session";
     case "EndOfData":
       return "End of data";
+    case "RiskHalt":
+      return "Risk limit";
   }
 }
 
@@ -701,6 +709,8 @@ export function exitReasonHelp(reason: ExitReason): string {
       return "The holding window ended before any other exit fired.";
     case "EndOfData":
       return "The data ran out while the trade was still open.";
+    case "RiskHalt":
+      return "A risk limit was reached; the agent flattened at the next bar's open.";
   }
 }
 
