@@ -1,7 +1,6 @@
 pub const MS_PER_DAY: i64 = 86_400_000;
 pub const MS_PER_MIN: i64 = 60_000;
 
-#[cfg(test)]
 pub fn day_id(ts_ms: i64) -> i64 {
     ts_ms.div_euclid(MS_PER_DAY)
 }

@@ -10,6 +10,7 @@ pub enum ExitReason {
     Trailing,
     SessionEnd,
     EndOfData,
+    RiskHalt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

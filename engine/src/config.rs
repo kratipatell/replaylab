@@ -13,6 +13,7 @@ pub struct Config {
     pub optimize_per_min: u32,
     pub max_optimizer_jobs: usize,
     pub backtest_timeout_secs: u64,
+    pub admin_token: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +61,9 @@ impl Config {
         let origins_raw =
             get("ALLOWED_ORIGINS").unwrap_or_else(|| "http://localhost:3000".to_string());
         parse_origins(&origins_raw).map_err(ConfigError::BadOrigins)?;
+        let admin_token = get("ADMIN_TOKEN")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         Ok(Config {
             host,
             port,
@@ -71,6 +75,7 @@ impl Config {
             optimize_per_min: parse_or(get("OPTIMIZE_RATE_PER_MIN"), 5),
             max_optimizer_jobs: parse_or(get("MAX_OPTIMIZER_JOBS"), 2),
             backtest_timeout_secs: parse_u64_in(get("BACKTEST_TIMEOUT_SECS"), 60, 5, 600),
+            admin_token,
         })
     }
 }
@@ -100,6 +105,7 @@ mod tests {
         assert_eq!(cfg.backtest_per_min, 30);
         assert_eq!(cfg.optimize_per_min, 5);
         assert_eq!(cfg.max_optimizer_jobs, 2);
+        assert_eq!(cfg.admin_token, None);
     }
 
     #[test]
@@ -114,6 +120,7 @@ mod tests {
             ("BACKTEST_RATE_PER_MIN", "7"),
             ("OPTIMIZE_RATE_PER_MIN", "3"),
             ("MAX_OPTIMIZER_JOBS", "4"),
+            ("ADMIN_TOKEN", "s3cret"),
         ]))
         .expect("overrides");
         assert_eq!(cfg.host, "0.0.0.0");
@@ -125,6 +132,15 @@ mod tests {
         assert_eq!(cfg.backtest_per_min, 7);
         assert_eq!(cfg.optimize_per_min, 3);
         assert_eq!(cfg.max_optimizer_jobs, 4);
+        assert_eq!(cfg.admin_token.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn a_blank_admin_token_means_no_admin_access() {
+        for raw in ["", "   "] {
+            let cfg = Config::from_lookup(lookup(&[("ADMIN_TOKEN", raw)])).expect("blank");
+            assert_eq!(cfg.admin_token, None, "raw = {raw:?}");
+        }
     }
 
     #[test]

@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backtest::{BacktestConfig, PositionView, Simulator, Trade};
+#[cfg(test)]
+use crate::risk::RiskState;
+use crate::risk::{HaltLimit, RiskLimits};
 use crate::strategy::{RulesStrategy, Strategy};
 use crate::types::Candle;
 
@@ -113,12 +116,13 @@ impl AgentSnapshot {
         candles: &[Candle],
         cfg: &BacktestConfig,
         initial_equity: f64,
+        risk: RiskLimits,
     ) -> Result<AgentSnapshot, AgentError> {
         if candles.is_empty() {
             return Err(AgentError::NoCandles);
         }
         ensure_ordered(candles)?;
-        let mut simulator = Simulator::from_strategy(spec, cfg, initial_equity)?;
+        let mut simulator = Simulator::from_strategy(spec, cfg, initial_equity, Some(risk))?;
         let mut strategy = RulesStrategy::new(spec);
         for i in 0..candles.len() {
             simulator.step_live(i, candles, &mut strategy)?;
@@ -211,6 +215,40 @@ impl AgentSnapshot {
     pub fn position(&self) -> Option<PositionView> {
         self.simulator.position()
     }
+
+    pub fn risk_limits(&self) -> Option<RiskLimits> {
+        self.simulator.risk_limits()
+    }
+
+    /// Rehydrate caps on a snapshot written before agents enforced risk.
+    pub fn set_risk_limits(&mut self, limits: RiskLimits) {
+        self.simulator.set_risk(limits);
+    }
+
+    #[cfg(test)]
+    pub fn risk_state(&self) -> RiskState {
+        self.simulator.risk_state()
+    }
+
+    pub fn halt(&self) -> Option<HaltLimit> {
+        self.simulator.halt()
+    }
+
+    /// Re-baseline the peak and the day at the current equity, and clear the
+    /// halt, so the agent can trade again from here.
+    pub fn reset_risk(&mut self) {
+        let equity = self.equity();
+        let ts = self.last_ts();
+        self.simulator.reset_risk(equity, ts);
+    }
+
+    pub fn kill_switch(&mut self) {
+        self.simulator.kill_switch();
+    }
+
+    pub fn clear_kill_switch(&mut self) {
+        self.simulator.clear_kill_switch();
+    }
 }
 
 fn ensure_ordered(candles: &[Candle]) -> Result<(), AgentError> {
@@ -277,6 +315,29 @@ mod tests {
             .collect()
     }
 
+    fn limits() -> RiskLimits {
+        RiskLimits {
+            max_position_pct: 100.0,
+            max_daily_loss_pct: 10.0,
+            max_drawdown_pct: 20.0,
+        }
+    }
+
+    /// Enters long on the first bar that closes above 101.5 and keeps the
+    /// position, so a later crash is a mark-to-market drawdown.
+    fn agent_up_then_crash() -> (AgentSnapshot, Vec<Candle>) {
+        let all = bars(&[100.0, 102.0, 104.0, 130.0, 52.0, 52.0]);
+        let agent = AgentSnapshot::warm_up(
+            &spec(101.5),
+            &all[..4],
+            &BacktestConfig::default(),
+            10_000.0,
+            limits(),
+        )
+        .expect("warm up");
+        (agent, all)
+    }
+
     #[test]
     fn warm_up_then_advance_matches_one_full_run() {
         let closes = [100.0, 102.0, 101.0, 104.0, 103.0, 106.0, 105.0, 108.0];
@@ -284,7 +345,8 @@ mod tests {
         let spec = spec(101.5);
         let cfg = BacktestConfig::default();
 
-        let mut agent = AgentSnapshot::warm_up(&spec, &all[..4], &cfg, 10_000.0).expect("warm up");
+        let mut agent =
+            AgentSnapshot::warm_up(&spec, &all[..4], &cfg, 10_000.0, limits()).expect("warm up");
         let first = agent.advance(&all[4..]).expect("advance");
         assert!(first.new_candles > 0);
 
@@ -306,9 +368,14 @@ mod tests {
     fn a_signal_on_the_newest_bar_fills_at_the_next_open() {
         let all = bars(&[100.0, 102.0, 105.0, 105.0]);
         let spec = spec(101.5);
-        let mut agent =
-            AgentSnapshot::warm_up(&spec, &all[..2], &BacktestConfig::default(), 10_000.0)
-                .expect("warm up");
+        let mut agent = AgentSnapshot::warm_up(
+            &spec,
+            &all[..2],
+            &BacktestConfig::default(),
+            10_000.0,
+            limits(),
+        )
+        .expect("warm up");
         // The second bar closed above the threshold, so the entry is pending
         // and must fill at the third bar's open, never at the signal close.
         assert_eq!(agent.trades().len(), 0);
@@ -328,6 +395,7 @@ mod tests {
             &all[..2],
             &BacktestConfig::default(),
             10_000.0,
+            limits(),
         )
         .expect("warm up");
         let before = agent.candle_count();
@@ -347,6 +415,7 @@ mod tests {
             &all[..2],
             &BacktestConfig::default(),
             10_000.0,
+            limits(),
         )
         .expect("warm up");
         let err = agent
@@ -360,7 +429,8 @@ mod tests {
         let all = bars(&[100.0, 102.0, 101.0, 104.0, 103.0, 106.0, 105.0, 108.0]);
         let spec = spec(101.5);
         let cfg = BacktestConfig::default();
-        let mut agent = AgentSnapshot::warm_up(&spec, &all[..5], &cfg, 10_000.0).expect("warm up");
+        let mut agent =
+            AgentSnapshot::warm_up(&spec, &all[..5], &cfg, 10_000.0, limits()).expect("warm up");
 
         let text = agent.to_json().expect("serialize");
         let mut resumed = AgentSnapshot::from_json(&text).expect("deserialize");
@@ -396,5 +466,163 @@ mod tests {
             Err(AgentError::BadTimeframe(_))
         ));
         assert!(validate_new("agent", &good, 10_000.0).is_ok());
+    }
+
+    #[test]
+    fn resumed_snapshot_keeps_its_peak_and_still_trips_drawdown() {
+        let (agent, all) = agent_up_then_crash();
+        let peak = agent.risk_state().peak();
+        assert!(peak > 12_000.0, "the warm-up must run up to a peak: {peak}");
+        assert_eq!(agent.halt(), None);
+
+        let text = agent.to_json().expect("serialize");
+        let mut resumed = AgentSnapshot::from_json(&text).expect("deserialize");
+        assert_eq!(
+            resumed.risk_state().peak(),
+            peak,
+            "peak must survive the snapshot"
+        );
+
+        // The crash bar closes 60% below the peak, well past the 20% drawdown.
+        // The halt is decided on that close, so the position flattens at the
+        // next bar's open, never on the bar that decided it.
+        let out = resumed.advance(&all[4..]).expect("advance");
+        assert_eq!(out.trades.len(), 1, "the halt must flatten the position");
+        assert_eq!(out.trades[0].reason, crate::backtest::ExitReason::RiskHalt);
+        assert_eq!(out.trades[0].exit_price, all[5].open);
+        assert_eq!(resumed.halt(), Some(HaltLimit::Drawdown));
+    }
+
+    #[test]
+    fn a_halt_with_an_open_position_flattens_on_the_next_advance_then_stays_halted() {
+        // Warm up on history whose last bar crashes through the drawdown cap
+        // while a long is open: the halt is decided on that close, so the
+        // flatten is left pending across the snapshot round-trip.
+        let all = bars(&[100.0, 102.0, 104.0, 130.0, 52.0, 52.0, 52.0]);
+        let agent = AgentSnapshot::warm_up(
+            &spec(101.5),
+            &all[..5],
+            &BacktestConfig::default(),
+            10_000.0,
+            limits(),
+        )
+        .expect("warm up");
+        assert!(
+            agent.position().is_some(),
+            "the crash leaves a position open"
+        );
+        assert_eq!(agent.halt(), Some(HaltLimit::Drawdown));
+
+        let text = agent.to_json().expect("serialize");
+        let mut resumed = AgentSnapshot::from_json(&text).expect("deserialize");
+        assert!(
+            resumed.position().is_some(),
+            "the scheduled flatten survives the snapshot"
+        );
+        assert_eq!(resumed.halt(), Some(HaltLimit::Drawdown));
+
+        // The next advance still executes the scheduled flatten at the next
+        // open, even though the agent is already halted.
+        let out = resumed
+            .advance(&all[5..6])
+            .expect("advance must drain the scheduled flatten");
+        assert_eq!(out.trades.len(), 1, "the halt flattens the open position");
+        assert_eq!(out.trades[0].reason, crate::backtest::ExitReason::RiskHalt);
+        assert_eq!(out.trades[0].exit_price, all[5].open);
+        assert!(resumed.position().is_none());
+
+        // Only after the flatten is drained do further advances leave the
+        // agent halted: no new entry, no new trade, halt stays in force.
+        let out = resumed
+            .advance(&all[6..])
+            .expect("an advance on a halted agent is a no-op");
+        assert_eq!(out.new_candles, 1);
+        assert!(out.trades.is_empty(), "no trades while halted");
+        assert!(resumed.position().is_none());
+        assert_eq!(resumed.halt(), Some(HaltLimit::Drawdown));
+        assert_eq!(resumed.trades().len(), 1, "only the RiskHalt trade stands");
+    }
+
+    #[test]
+    fn reset_re_baselines_and_does_not_immediately_re_trip() {
+        let (mut agent, all) = agent_up_then_crash();
+        agent.advance(&all[4..5]).expect("crash");
+        assert_eq!(agent.halt(), Some(HaltLimit::Drawdown));
+
+        agent.reset_risk();
+        assert_eq!(agent.halt(), None);
+        let state = agent.risk_state();
+        assert_eq!(state.peak(), agent.equity());
+        assert_eq!(state.day_start(), agent.equity());
+
+        // The next bar closes at the same crushed price and must not re-halt.
+        let out = agent.advance(&all[5..]).expect("advance");
+        assert_eq!(out.new_candles, 1);
+        assert_eq!(agent.halt(), None);
+        assert!(!agent.trades().is_empty());
+    }
+
+    #[test]
+    fn kill_switch_cancels_a_pending_entry_and_schedules_the_flatten() {
+        // The last warm-up bar closes above the entry threshold, so an entry
+        // is queued for the next open.
+        let all = bars(&[100.0, 102.0, 104.0]);
+        let mut agent = AgentSnapshot::warm_up(
+            &spec(101.5),
+            &all[..2],
+            &BacktestConfig::default(),
+            10_000.0,
+            limits(),
+        )
+        .expect("warm up");
+        assert!(agent.position().is_none());
+
+        agent.kill_switch();
+        assert_eq!(agent.halt(), Some(HaltLimit::KillSwitch));
+        let out = agent.advance(&all[2..]).expect("advance");
+        assert!(out.position.is_none(), "the queued entry must be cancelled");
+        assert!(
+            out.trades.is_empty(),
+            "nothing was open, nothing to flatten"
+        );
+
+        // A signal while halted must not re-arm an entry.
+        let more = bars(&[100.0, 102.0, 104.0, 120.0]);
+        let out = agent.advance(&more[3..]).expect("advance");
+        assert!(out.position.is_none());
+        assert_eq!(agent.halt(), Some(HaltLimit::KillSwitch));
+    }
+
+    #[test]
+    fn kill_switch_flattens_an_open_position_at_the_next_open() {
+        let (mut agent, all) = agent_up_then_crash();
+        assert!(agent.position().is_some());
+        agent.kill_switch();
+        let out = agent.advance(&all[4..5]).expect("advance");
+        assert_eq!(out.trades.len(), 1);
+        assert_eq!(out.trades[0].reason, crate::backtest::ExitReason::RiskHalt);
+        // Flat at the next open, so the fill price is that bar's open.
+        assert_eq!(out.trades[0].exit_price, all[4].open);
+        assert!(out.position.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_from_before_risk_state_still_loads() {
+        let (agent, _) = agent_up_then_crash();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&agent.to_json().expect("serialize")).expect("json");
+        let state = value
+            .get_mut("simulator")
+            .and_then(|s| s.get_mut("state"))
+            .expect("simulator state");
+        let state = state.as_object_mut().expect("state object");
+        state.remove("risk");
+        // Older snapshots stored the pending exit as a bare bool.
+        state.insert("pending_exit".to_string(), serde_json::Value::Bool(true));
+
+        let loaded = AgentSnapshot::from_json(&value.to_string()).expect("old snapshot loads");
+        assert_eq!(loaded.risk_state(), RiskState::default());
+        assert_eq!(loaded.halt(), None);
+        assert_eq!(loaded.simulator.risk_limits(), Some(limits()));
     }
 }

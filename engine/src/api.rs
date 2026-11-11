@@ -3,7 +3,7 @@ use axum::{
         rejection::JsonRejection, rejection::QueryRejection, ConnectInfo, DefaultBodyLimit,
         Extension, Path, Query, State,
     },
-    http::{request::Parts, HeaderValue, Method, StatusCode},
+    http::{request::Parts, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -25,6 +25,7 @@ use crate::ratelimit::RateLimiter;
 
 const DEFAULT_BACKTEST_TIMEOUT_SECS: u64 = 60;
 const BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const ADMIN_HEADER: &str = "x-admin-token";
 
 #[derive(Clone)]
 pub struct Limits {
@@ -99,6 +100,8 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub jobs: Arc<JobStore>,
     pub db: Arc<crate::db::Db>,
+    /// When unset, admin endpoints refuse every request rather than allow all.
+    pub admin_token: Option<String>,
 }
 
 pub struct JobStore {
@@ -231,7 +234,10 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            HeaderName::from_static(ADMIN_HEADER),
+        ]);
     Router::new()
         .route("/health", get(health))
         .route("/candles", get(get_candles))
@@ -246,6 +252,9 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/agents/{id}/start", post(start_agent))
         .route("/agents/{id}/stop", post(stop_agent))
         .route("/agents/{id}/advance", post(advance_agent))
+        .route("/agents/{id}/reset", post(reset_agent))
+        .route("/kill-switch", post(kill_switch))
+        .route("/kill-switch/clear", post(clear_kill_switch))
         .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(Extension(Arc::new(limits)))
@@ -286,6 +295,40 @@ impl ApiFailure {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Compare without returning early on the first differing byte.
+fn tokens_match(expected: &str, given: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), given.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Admin-only routes. Fail closed: no configured token means no access, not
+/// open access.
+fn admin_gate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiFailure> {
+    let Some(expected) = state.admin_token.as_deref() else {
+        return Err(ApiFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin actions are disabled; set ADMIN_TOKEN",
+        ));
+    };
+    let given = headers
+        .get(ADMIN_HEADER)
+        .and_then(|value| value.to_str().ok());
+    match given {
+        Some(given) if tokens_match(expected, given) => Ok(()),
+        _ => Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "admin token required",
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +415,7 @@ struct BacktestBody {
     fee_bps: Option<f64>,
     slippage_bps: Option<f64>,
     split: Option<f64>,
+    risk: Option<crate::risk::RiskLimits>,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,6 +430,7 @@ struct BacktestResponse {
     verdict: crate::verdict::Verdict,
     trades: Vec<crate::backtest::Trade>,
     equity_curve: Vec<f64>,
+    risk_halt: Option<crate::risk::HaltLimit>,
 }
 
 struct SimRequest {
@@ -398,6 +443,7 @@ struct SimRequest {
     fee_bps: f64,
     slippage_bps: f64,
     bars_per_year: f64,
+    risk: Option<crate::risk::RiskLimits>,
 }
 
 struct BacktestParts {
@@ -410,6 +456,7 @@ struct BacktestParts {
     verdict: crate::verdict::Verdict,
     trades: Vec<crate::backtest::Trade>,
     equity_curve: Vec<f64>,
+    risk_halt: Option<crate::risk::HaltLimit>,
 }
 
 enum BacktestFailure {
@@ -459,6 +506,7 @@ impl SimParams {
             fee_bps: self.fee_bps,
             slippage_bps: self.slippage_bps,
             bars_per_year: self.bars_per_year,
+            risk: None,
         }
     }
 }
@@ -533,8 +581,9 @@ fn run_backtest(
         fee_bps: req.fee_bps,
         slippage_bps: req.slippage_bps,
     };
-    let result = crate::backtest::backtest_strategy(strategy, &candles, &cfg)
+    let outcome = crate::backtest::backtest_strategy_with_risk(strategy, &candles, &cfg, req.risk)
         .map_err(|e| BacktestFailure::BadRequest(e.to_string()))?;
+    let result = outcome.result;
     let stats = crate::stats::compute_stats(&result, &candles, req.bars_per_year);
     let verdict_split = req.split.unwrap_or(crate::verdict::DEFAULT_VERDICT_SPLIT);
     let split_idx = (candles.len() as f64 * verdict_split).floor() as usize;
@@ -564,6 +613,7 @@ fn run_backtest(
         verdict,
         trades: result.trades,
         equity_curve: result.equity_curve,
+        risk_halt: outcome.halt,
     })
 }
 
@@ -661,6 +711,11 @@ async fn post_backtest(
     if let Err(e) = req.strategy.validate() {
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Some(limits) = &req.risk {
+        if let Err(e) = limits.validate() {
+            return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    }
     let symbol = req.strategy.asset.clone();
     if let Err(e) = crate::feeds::validate_symbol(&symbol) {
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -676,7 +731,8 @@ async fn post_backtest(
         Ok(p) => p,
         Err(msg) => return err_json(StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let sim = params.request_for(&symbol);
+    let mut sim = params.request_for(&symbol);
+    sim.risk = req.risk;
     let source = state.source.clone();
     let cache_dir = state.cache_dir.clone();
     let strategy = req.strategy.clone();
@@ -735,6 +791,7 @@ async fn post_backtest(
         verdict: parts.verdict,
         trades: parts.trades,
         equity_curve: parts.equity_curve,
+        risk_halt: parts.risk_halt,
     };
     (
         StatusCode::OK,
@@ -1028,6 +1085,7 @@ struct CreateAgentBody {
     strategy: Option<crate::strategy::Strategy>,
     run_id: Option<i64>,
     initial_equity: Option<f64>,
+    risk: Option<crate::risk::RiskLimits>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1048,6 +1106,8 @@ struct AgentDetail {
     agent: crate::db::AgentSummary,
     strategy: crate::strategy::Strategy,
     initial_equity: f64,
+    risk: crate::risk::RiskLimits,
+    halt: Option<crate::risk::HaltLimit>,
     candle_count: usize,
     position: Option<crate::backtest::PositionView>,
     trades: Vec<crate::backtest::Trade>,
@@ -1057,7 +1117,7 @@ struct AgentDetail {
 fn agent_detail(row: crate::db::AgentRow) -> Result<AgentDetail, ApiFailure> {
     let strategy: crate::strategy::Strategy = serde_json::from_value(row.strategy)
         .map_err(|e| ApiFailure::internal(format!("agent strategy is corrupt: {e}")))?;
-    let (candle_count, position, trades, equity_curve) = match row.snapshot.as_deref() {
+    let (candle_count, position, trades, equity_curve, halt) = match row.snapshot.as_deref() {
         Some(text) => {
             let snapshot = crate::agent::AgentSnapshot::from_json(text)
                 .map_err(|e| ApiFailure::internal(e.to_string()))?;
@@ -1066,14 +1126,17 @@ fn agent_detail(row: crate::db::AgentRow) -> Result<AgentDetail, ApiFailure> {
                 snapshot.position(),
                 snapshot.trades().to_vec(),
                 snapshot.equity_curve().to_vec(),
+                snapshot.halt(),
             )
         }
-        None => (0, None, Vec::new(), Vec::new()),
+        None => (0, None, Vec::new(), Vec::new(), None),
     };
     Ok(AgentDetail {
         agent: row.summary,
         strategy,
         initial_equity: row.initial_equity,
+        risk: row.risk,
+        halt,
         candle_count,
         position,
         trades,
@@ -1202,6 +1265,11 @@ async fn post_agent(
     if let Err(e) = crate::agent::validate_new(&body.name, &spec, equity) {
         return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    // An agent always has caps. A backtest opts in; an agent never runs bare.
+    let risk = body.risk.unwrap_or_default();
+    if let Err(e) = risk.validate() {
+        return err_json(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
     let strategy = match serde_json::to_value(&spec) {
         Ok(v) => v,
         Err(e) => {
@@ -1211,7 +1279,7 @@ async fn post_agent(
     let id = crate::agent::new_agent_id();
     if let Err(e) = state
         .db
-        .create_agent(&id, body.name.trim(), &strategy, run_id, equity)
+        .create_agent(&id, body.name.trim(), &strategy, run_id, equity, &risk)
     {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -1250,9 +1318,44 @@ async fn start_agent(
         )
         .into_response();
     }
+    // The global flag covers agents created after the switch was flipped;
+    // the column covers agents that already existed when it was flipped.
+    let global_kill = match state.db.global_kill_switch_on() {
+        Ok(on) => on,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    if global_kill || row.kill_switch {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} is halted by the kill switch; clear it first"),
+        )
+        .into_response();
+    }
     // A stopped agent keeps its snapshot: start resumes it rather than
     // replaying history and rewriting decisions already taken.
-    if row.snapshot.is_some() {
+    if let Some(text) = row.snapshot.as_deref() {
+        let mut snapshot = match crate::agent::AgentSnapshot::from_json(text) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        // Snapshots written before agents enforced risk get the caps now.
+        if snapshot.risk_limits().is_none() {
+            snapshot.set_risk_limits(row.risk);
+            let json = match snapshot.to_json() {
+                Ok(json) => json,
+                Err(e) => {
+                    return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                        .into_response()
+                }
+            };
+            if let Err(e) = state.db.set_agent_snapshot(&id, &json) {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
         match state.db.start_agent(&id, now_secs()) {
             Ok(true) => {}
             Ok(false) => {
@@ -1349,6 +1452,7 @@ async fn start_agent(
         &candles,
         &crate::backtest::BacktestConfig::default(),
         row.initial_equity,
+        row.risk,
     ) {
         Ok(snapshot) => snapshot,
         Err(e) => {
@@ -1445,6 +1549,29 @@ async fn advance_agent(
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     };
+    // Keep the stored snapshot in step with the source of truth: caps added
+    // after this snapshot was written, and a kill switch flipped while the
+    // agent was stopped.
+    let mut reconciled = false;
+    if snapshot.risk_limits().is_none() {
+        snapshot.set_risk_limits(row.risk);
+        reconciled = true;
+    }
+    if row.kill_switch && snapshot.halt() != Some(crate::risk::HaltLimit::KillSwitch) {
+        snapshot.kill_switch();
+        reconciled = true;
+    }
+    if reconciled {
+        let json = match snapshot.to_json() {
+            Ok(json) => json,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        if let Err(e) = state.db.set_agent_snapshot(&id, &json) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
     let step = match crate::feeds::interval_ms(&spec.timeframe) {
         Some(step) => step,
         None => {
@@ -1506,6 +1633,147 @@ async fn advance_agent(
         ) {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
+    }
+    match agent_or_404(&state, &id).and_then(agent_detail) {
+        Ok(detail) => agent_json(detail),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Apply one change to an agent's stored snapshot. `Ok(false)` means the agent
+/// has no snapshot yet, so only its database flag applies to it.
+fn update_snapshot(
+    state: &AppState,
+    id: &str,
+    change: impl FnOnce(&mut crate::agent::AgentSnapshot),
+) -> Result<bool, ApiFailure> {
+    let row = agent_or_404(state, id)?;
+    let Some(text) = row.snapshot.as_deref() else {
+        return Ok(false);
+    };
+    let mut snapshot = crate::agent::AgentSnapshot::from_json(text)
+        .map_err(|e| ApiFailure::internal(e.to_string()))?;
+    change(&mut snapshot);
+    let json = snapshot
+        .to_json()
+        .map_err(|e| ApiFailure::internal(e.to_string()))?;
+    state
+        .db
+        .set_agent_snapshot(id, &json)
+        .map_err(|e| ApiFailure::internal(e.to_string()))?;
+    Ok(true)
+}
+
+/// Operator stop for every agent. Open positions flatten at the next open:
+/// a frozen position is risk the operator cannot see or close.
+async fn kill_switch(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = admin_gate(&state, &headers) {
+        return e.into_response();
+    }
+    if let Err(e) = state.db.set_global_kill_switch(true) {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let agents = match state.db.list_agents() {
+        Ok(agents) => agents,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    let mut snapshots = 0usize;
+    for agent in &agents {
+        if let Err(e) = state.db.set_kill_switch(&agent.id, true) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        match update_snapshot(&state, &agent.id, |snapshot| snapshot.kill_switch()) {
+            Ok(true) => snapshots += 1,
+            Ok(false) => {}
+            Err(e) => return e.into_response(),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"agents": agents.len(), "snapshots": snapshots})),
+    )
+        .into_response()
+}
+
+/// Lift the kill switch. Other halts (daily loss, drawdown) keep their state.
+async fn clear_kill_switch(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = admin_gate(&state, &headers) {
+        return e.into_response();
+    }
+    if let Err(e) = state.db.set_global_kill_switch(false) {
+        return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let agents = match state.db.list_agents() {
+        Ok(agents) => agents,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    let mut snapshots = 0usize;
+    for agent in &agents {
+        if let Err(e) = state.db.set_kill_switch(&agent.id, false) {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        match update_snapshot(&state, &agent.id, |snapshot| snapshot.clear_kill_switch()) {
+            Ok(true) => snapshots += 1,
+            Ok(false) => {}
+            Err(e) => return e.into_response(),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"agents": agents.len(), "snapshots": snapshots})),
+    )
+        .into_response()
+}
+
+/// Re-baseline one agent's peak and day at its current equity and clear the
+/// halt. A scheduled flatten is left alone.
+async fn reset_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = admin_gate(&state, &headers) {
+        return e.into_response();
+    }
+    let row = match agent_or_404(&state, &id) {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
+    };
+    // Same rule as start: the global flag also covers agents created after
+    // the switch, whose per-agent column was never set.
+    let global_kill = match state.db.global_kill_switch_on() {
+        Ok(on) => on,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    };
+    if global_kill || row.kill_switch {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} is halted by the kill switch; clear it first"),
+        )
+        .into_response();
+    }
+    if row.snapshot.is_none() {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!("agent {id} has no snapshot; start it first"),
+        )
+        .into_response();
+    }
+    let risk = row.risk;
+    match update_snapshot(&state, &id, |snapshot| {
+        if snapshot.risk_limits().is_none() {
+            snapshot.set_risk_limits(risk);
+        }
+        snapshot.reset_risk();
+    }) {
+        Ok(_) => {}
+        Err(e) => return e.into_response(),
     }
     match agent_or_404(&state, &id).and_then(agent_detail) {
         Ok(detail) => agent_json(detail),
@@ -1600,6 +1868,7 @@ mod tests {
             cache_dir: dir,
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         }
     }
 
@@ -1970,6 +2239,7 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         };
         let uri = format!(
             "/candles?symbol=BTCUSDT&interval=1h&start={}&end={}",
@@ -2387,6 +2657,7 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         };
         let strategy = serde_json::json!({
             "asset": "BTCUSDT",
@@ -2414,38 +2685,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         let http_trades = v["trades"].as_array().expect("trades array").clone();
-        let expected: &[(u64, u64, &str, &str, f64)] = &[
-            (11, 19, "long", "Signal", -0.401493474054),
-            (22, 25, "long", "Signal", -0.715596149886),
-            (30, 43, "long", "Signal", 1.88843928444),
-            (57, 58, "long", "Signal", -1.06232875268),
-            (60, 62, "long", "Signal", -0.596422628339),
-            (72, 81, "long", "TakeProfit", 3.85450184871),
-            (100, 103, "long", "Signal", -1.10159430335),
-            (111, 112, "long", "Signal", -0.624996388311),
-            (115, 132, "long", "Signal", 2.05385235154),
-            (136, 137, "long", "Signal", -0.894993537614),
-            (157, 166, "long", "Signal", 0.193611397899),
-            (169, 171, "long", "Signal", -0.278895497595),
-            (200, 203, "long", "Signal", -1.28746706694),
-            (210, 212, "long", "Signal", -0.922409687215),
-            (233, 234, "long", "Signal", -0.420704686326),
-            (237, 239, "long", "Signal", -1.44601270581),
-            (250, 262, "long", "Signal", 0.159021699174),
-            (280, 290, "long", "Signal", 1.14275005542),
-            (294, 295, "long", "Signal", -0.849477570347),
-            (298, 299, "long", "Signal", -0.937764035768),
-            (305, 309, "long", "Signal", -0.435180520864),
-            (316, 328, "long", "Signal", 1.11643781473),
-            (330, 335, "long", "Signal", -0.758668240302),
-            (344, 346, "long", "Signal", -0.555094138935),
-            (350, 353, "long", "Signal", -0.719543300924),
-            (365, 367, "long", "Signal", -0.988517974601),
-            (381, 383, "long", "Signal", -0.630664625468),
-            (385, 386, "long", "Signal", -1.00960544666),
-            (389, 393, "long", "Signal", -0.395705332889),
-            (407, 408, "long", "Signal", -0.398128443874),
-        ];
+        let expected = frozen_golden_trades();
         assert_eq!(http_trades.len(), 226, "frozen trade count");
         assert!(http_trades.len() >= 20, "need >=20 trades");
         for (h, e) in http_trades.iter().take(expected.len()).zip(expected.iter()) {
@@ -2462,6 +2702,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backtest_without_a_risk_block_matches_the_frozen_golden() {
+        let dir = temp_dir("bt_no_risk_golden");
+        let candles = seeded_walk(3000, 42);
+        let start = candles.first().map(|c| c.ts).unwrap_or(0);
+        let end = candles.last().map(|c| c.ts).unwrap_or(0);
+        let state = AppState {
+            source: Arc::new(WalkSource {
+                data: candles.clone(),
+            }),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
+        };
+        let body = serde_json::json!({
+            "strategy": seeded_strategy(),
+            "start_ms": start,
+            "end_ms": end,
+        });
+        let res = app(state)
+            .oneshot(json_req("/backtest", &body))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert!(v["risk_halt"].is_null(), "no risk block means no halt");
+
+        // Bytes on the wire must equal the plain simulator run.
+        let spec: crate::strategy::Strategy =
+            serde_json::from_value(seeded_strategy()).expect("strategy");
+        let direct = crate::backtest::backtest_strategy_with_risk(
+            &spec,
+            &candles,
+            &crate::backtest::BacktestConfig::default(),
+            None,
+        )
+        .expect("direct run")
+        .result;
+        assert_eq!(
+            v["trades"],
+            serde_json::to_value(&direct.trades).expect("trades")
+        );
+        assert_eq!(
+            v["equity_curve"],
+            serde_json::to_value(&direct.equity_curve).expect("equity")
+        );
+
+        // And both are the frozen golden, trade for trade.
+        let http_trades = v["trades"].as_array().expect("trades");
+        assert_eq!(http_trades.len(), 226, "frozen trade count");
+        for (h, e) in http_trades.iter().zip(frozen_golden_trades().iter()) {
+            assert_eq!(h["entry_idx"].as_u64().unwrap(), e.0);
+            assert_eq!(h["exit_idx"].as_u64().unwrap(), e.1);
+            assert_eq!(h["side"].as_str().unwrap(), e.2);
+            assert_eq!(h["reason"].as_str().unwrap(), e.3);
+            let hr = h["return_pct"].as_f64().unwrap();
+            assert!((hr - e.4).abs() <= 0.05, "return_pct {hr} vs {}", e.4);
+        }
+        let equity = v["equity_curve"].as_array().expect("equity");
+        assert_eq!(equity.len(), 3000);
+        let last = equity
+            .last()
+            .expect("last equity")
+            .as_f64()
+            .expect("number");
+        assert_eq!(last, 0.676222700666094, "frozen final equity");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn backtest_verdict_on_seeded_walk() {
         let dir = temp_dir("bt_verdict_walk");
         let candles = seeded_walk(3000, 42);
@@ -2474,6 +2784,7 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         };
         let strategy = serde_json::json!({
             "asset": "BTCUSDT",
@@ -2498,6 +2809,7 @@ mod tests {
                 cache_dir: dir.clone(),
                 jobs: Arc::new(JobStore::default()),
                 db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+                admin_token: None,
             });
             let res = router
                 .oneshot(
@@ -2540,6 +2852,43 @@ mod tests {
             "stop_loss_pct": 2.0,
             "take_profit_pct": 4.0,
         })
+    }
+
+    /// The first trades of the frozen 226-trade golden on `seeded_walk(3000, 42)`.
+    /// Any change here means the shared simulator changed behaviour.
+    fn frozen_golden_trades() -> &'static [(u64, u64, &'static str, &'static str, f64)] {
+        &[
+            (11, 19, "long", "Signal", -0.401493474054),
+            (22, 25, "long", "Signal", -0.715596149886),
+            (30, 43, "long", "Signal", 1.88843928444),
+            (57, 58, "long", "Signal", -1.06232875268),
+            (60, 62, "long", "Signal", -0.596422628339),
+            (72, 81, "long", "TakeProfit", 3.85450184871),
+            (100, 103, "long", "Signal", -1.10159430335),
+            (111, 112, "long", "Signal", -0.624996388311),
+            (115, 132, "long", "Signal", 2.05385235154),
+            (136, 137, "long", "Signal", -0.894993537614),
+            (157, 166, "long", "Signal", 0.193611397899),
+            (169, 171, "long", "Signal", -0.278895497595),
+            (200, 203, "long", "Signal", -1.28746706694),
+            (210, 212, "long", "Signal", -0.922409687215),
+            (233, 234, "long", "Signal", -0.420704686326),
+            (237, 239, "long", "Signal", -1.44601270581),
+            (250, 262, "long", "Signal", 0.159021699174),
+            (280, 290, "long", "Signal", 1.14275005542),
+            (294, 295, "long", "Signal", -0.849477570347),
+            (298, 299, "long", "Signal", -0.937764035768),
+            (305, 309, "long", "Signal", -0.435180520864),
+            (316, 328, "long", "Signal", 1.11643781473),
+            (330, 335, "long", "Signal", -0.758668240302),
+            (344, 346, "long", "Signal", -0.555094138935),
+            (350, 353, "long", "Signal", -0.719543300924),
+            (365, 367, "long", "Signal", -0.988517974601),
+            (381, 383, "long", "Signal", -0.630664625468),
+            (385, 386, "long", "Signal", -1.00960544666),
+            (389, 393, "long", "Signal", -0.395705332889),
+            (407, 408, "long", "Signal", -0.398128443874),
+        ]
     }
 
     #[tokio::test]
@@ -2663,6 +3012,7 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         };
         let body = validate_body(valid_strategy(), fake.start(), fake.end());
         let res = app(state)
@@ -2730,6 +3080,7 @@ mod tests {
             cache_dir: dir.clone(),
             jobs: Arc::new(JobStore::default()),
             db: Arc::new(crate::db::Db::open_in_memory().expect("mem db")),
+            admin_token: None,
         };
         let body = validate_body(seeded_strategy(), start, end);
         let res = app(state)
@@ -2776,6 +3127,459 @@ mod tests {
             .unwrap();
         let status = res.status();
         (status, body_json(res).await)
+    }
+
+    fn admin_state(dir: PathBuf, token: Option<&str>) -> AppState {
+        AppState {
+            admin_token: token.map(str::to_string),
+            ..test_state(dir)
+        }
+    }
+
+    fn admin_req(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::post(uri);
+        if let Some(token) = token {
+            builder = builder.header("x-admin-token", token);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_risk_limits_are_rejected_with_400() {
+        let dir = temp_dir("bad_risk");
+        let router = app(test_state(dir.clone()));
+        let fake = FakeSource::new();
+        let cases = [
+            serde_json::json!({
+                "max_position_pct": 0.0,
+                "max_daily_loss_pct": 10.0,
+                "max_drawdown_pct": 20.0,
+            }),
+            serde_json::json!({
+                "max_position_pct": 100.0,
+                "max_daily_loss_pct": 101.0,
+                "max_drawdown_pct": 20.0,
+            }),
+            serde_json::json!({
+                "max_position_pct": 100.0,
+                "max_daily_loss_pct": 10.0,
+                "max_drawdown_pct": -1.0,
+            }),
+        ];
+        for risk in cases {
+            let body = serde_json::json!({
+                "strategy": valid_strategy(),
+                "start_ms": fake.start(),
+                "end_ms": fake.end(),
+                "risk": risk.clone(),
+            });
+            let res = router
+                .clone()
+                .oneshot(json_req("/backtest", &body))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "backtest {risk}");
+
+            let (status, _) = create_agent(
+                &router,
+                serde_json::json!({
+                    "name": "Bad risk",
+                    "strategy": valid_strategy(),
+                    "risk": risk,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "agent {risk}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_a_risk_block_gets_the_default_caps() {
+        let dir = temp_dir("default_risk");
+        let router = app(test_state(dir.clone()));
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({ "name": "Default", "strategy": valid_strategy() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        assert_eq!(created["risk"]["max_position_pct"], 100.0);
+        assert_eq!(created["risk"]["max_daily_loss_pct"], 10.0);
+        assert_eq!(created["risk"]["max_drawdown_pct"], 20.0);
+        assert!(created["halt"].is_null());
+
+        let (status, tight) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Tight",
+                "strategy": valid_strategy(),
+                "risk": {
+                    "max_position_pct": 25.0,
+                    "max_daily_loss_pct": 5.0,
+                    "max_drawdown_pct": 15.0,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {tight}");
+        assert_eq!(tight["risk"]["max_position_pct"], 25.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_fail_closed() {
+        let dir = temp_dir("admin_gate");
+        let uris = ["/kill-switch", "/kill-switch/clear", "/agents/x/reset"];
+
+        // No token configured: refuse even a correct-looking header.
+        let disabled = app(admin_state(dir.clone(), None));
+        for uri in uris {
+            let res = disabled
+                .clone()
+                .oneshot(admin_req(uri, Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+
+        let router = app(admin_state(dir.clone(), Some("secret")));
+        for uri in uris {
+            let res = router.clone().oneshot(admin_req(uri, None)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{uri} without token");
+            let res = router
+                .clone()
+                .oneshot(admin_req(uri, Some("wrong")))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{uri} wrong token");
+        }
+
+        let res = router
+            .clone()
+            .oneshot(admin_req("/kill-switch", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = router
+            .clone()
+            .oneshot(admin_req("/kill-switch/clear", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = router
+            .oneshot(admin_req("/agents/nope/reset", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_an_agent_created_after_it_was_flipped() {
+        let dir = temp_dir("kill_new_agent");
+        let router = app(admin_state(dir.clone(), Some("secret")));
+        let fake = FakeSource::new();
+
+        // Flip the global switch before any agent exists.
+        let res = router
+            .clone()
+            .oneshot(admin_req("/kill-switch", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // A brand-new agent is created afterwards; its per-agent column was
+        // never set by the (empty) sweep over existing agents.
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Created after the switch",
+                "strategy": valid_strategy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": fake.end() }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(msg.contains("kill switch"), "message: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_survives_a_restart_and_clear_lifts_it() {
+        let dir = temp_dir("kill_restart");
+        let db_path = dir.join("runs.db");
+        let fake = FakeSource::new();
+        let open_state = || AppState {
+            source: Arc::new(FakeSource::new()),
+            cache_dir: dir.clone(),
+            jobs: Arc::new(JobStore::default()),
+            db: Arc::new(crate::db::Db::open(&db_path).expect("file db")),
+            admin_token: Some("secret".to_string()),
+        };
+
+        let router = app(open_state());
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Guarded",
+                "strategy": valid_strategy(),
+                "initial_equity": 10_000.0,
+                // Wide enough that the warm-up itself never halts.
+                "risk": {
+                    "max_position_pct": 100.0,
+                    "max_daily_loss_pct": 100.0,
+                    "max_drawdown_pct": 100.0,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": fake.end() }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_json(res).await["halt"].is_null(), "starts unhalted");
+
+        let res = router
+            .clone()
+            .oneshot(admin_req("/kill-switch", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["agents"], 1);
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/agents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(res).await["halt"], "KillSwitch");
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/stop"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        drop(router);
+
+        // A fresh process opens the same database.
+        let restarted = app(open_state());
+        let res = restarted
+            .clone()
+            .oneshot(
+                Request::get(format!("/agents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(res).await["halt"],
+            "KillSwitch",
+            "the halt must survive a restart"
+        );
+
+        let res = restarted
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(msg.contains("kill switch"), "message: {msg}");
+
+        let res = restarted
+            .clone()
+            .oneshot(admin_req("/kill-switch/clear", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = restarted
+            .clone()
+            .oneshot(
+                Request::get(format!("/agents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_json(res).await["halt"].is_null());
+        let res = restarted
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "clear lets it resume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reset_is_admin_only_and_clears_the_halt() {
+        let dir = temp_dir("agent_reset");
+        let router = app(admin_state(dir.clone(), Some("secret")));
+        let fake = FakeSource::new();
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Tight",
+                "strategy": valid_strategy(),
+                "risk": {
+                    "max_position_pct": 100.0,
+                    "max_daily_loss_pct": 100.0,
+                    // A sine walk always draws down more than this.
+                    "max_drawdown_pct": 0.5,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+
+        let res = router
+            .clone()
+            .oneshot(admin_req(&format!("/agents/{id}/reset"), Some("wrong")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Nothing to re-baseline before the agent has a snapshot.
+        let res = router
+            .clone()
+            .oneshot(admin_req(&format!("/agents/{id}/reset"), Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": fake.end() }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let started = body_json(res).await;
+        assert_eq!(
+            started["halt"], "Drawdown",
+            "the tight cap must trip during warm-up"
+        );
+
+        let res = router
+            .clone()
+            .oneshot(admin_req(&format!("/agents/{id}/reset"), Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let reset = body_json(res).await;
+        assert!(reset["halt"].is_null(), "reset clears the halt");
+        assert_eq!(reset["risk"]["max_drawdown_pct"], 0.5);
+
+        let res = router
+            .oneshot(
+                Request::get(format!("/agents/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(body_json(res).await["halt"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reset_is_blocked_while_the_global_kill_switch_is_on() {
+        let dir = temp_dir("reset_global_kill");
+        let state = admin_state(dir.clone(), Some("secret"));
+        let db = state.db.clone();
+        let router = app(state);
+        let fake = FakeSource::new();
+
+        let (status, created) = create_agent(
+            &router,
+            serde_json::json!({
+                "name": "Wide caps",
+                "strategy": valid_strategy(),
+                // Wide enough that the warm-up itself never halts.
+                "risk": {
+                    "max_position_pct": 100.0,
+                    "max_daily_loss_pct": 100.0,
+                    "max_drawdown_pct": 100.0,
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create: {created}");
+        let id = created["agent"]["id"].as_str().expect("id").to_string();
+
+        // Start gives the agent a snapshot, so without the global check the
+        // reset would succeed instead of returning 409.
+        let res = router
+            .clone()
+            .oneshot(json_req(
+                &format!("/agents/{id}/start"),
+                &serde_json::json!({ "start_ms": fake.start(), "end_ms": fake.end() }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "start gives a snapshot");
+
+        // Flip only the global flag: this agent's per-agent column stays off,
+        // so the global state alone must block the reset.
+        db.set_global_kill_switch(true).expect("flip global");
+        assert!(db.global_kill_switch_on().expect("read global"));
+        assert!(!db.get_agent(&id).expect("get").expect("exists").kill_switch);
+
+        let res = router
+            .clone()
+            .oneshot(admin_req(&format!("/agents/{id}/reset"), Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let msg = body_json(res).await["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(msg.contains("kill switch"), "message: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -1,3 +1,7 @@
+/// Smallest order the venue accepts, in base units. Venue step sizes are not
+/// modelled yet, so this is one satoshi of the base asset.
+pub const DEFAULT_MIN_QTY: f64 = 1e-8;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Instrument {
     pub symbol: String,
@@ -5,6 +9,8 @@ pub struct Instrument {
     pub point_value: f64,
     pub fee_bps: f64,
     pub slippage_bps: f64,
+    #[serde(default)]
+    pub min_qty: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -17,6 +23,9 @@ pub enum InstrumentError {
     BadPointValue(f64),
     #[error("{0} must be between 0 and 1000, got {1}")]
     BadCost(String, f64),
+    #[cfg(test)]
+    #[error("min_qty must be >= 0, got {0}")]
+    BadMinQty(f64),
 }
 
 impl Instrument {
@@ -47,7 +56,17 @@ impl Instrument {
             point_value,
             fee_bps,
             slippage_bps,
+            min_qty: DEFAULT_MIN_QTY,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_min_qty(mut self, min_qty: f64) -> Result<Instrument, InstrumentError> {
+        if !min_qty.is_finite() || min_qty < 0.0 {
+            return Err(InstrumentError::BadMinQty(min_qty));
+        }
+        self.min_qty = min_qty;
+        Ok(self)
     }
 
     pub fn cost_rate(&self) -> f64 {
@@ -77,5 +96,15 @@ mod tests {
         assert!(Instrument::new("X", 0.0, 1.0, 5.0, 2.0).is_err());
         assert!(Instrument::new("X", 0.5, -1.0, 5.0, 2.0).is_err());
         assert!(Instrument::new("X", 0.5, 1.0, 5000.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn min_qty_defaults_to_one_satoshi_and_rejects_negatives() {
+        let inst = Instrument::new("BTCUSDT", 0.01, 1.0, 5.0, 2.0).expect("valid");
+        assert_eq!(inst.min_qty, DEFAULT_MIN_QTY);
+        assert!(inst.clone().with_min_qty(2.5).is_ok());
+        assert_eq!(inst.clone().with_min_qty(2.5).expect("qty").min_qty, 2.5);
+        assert!(inst.clone().with_min_qty(-1.0).is_err());
+        assert!(inst.with_min_qty(f64::NAN).is_err());
     }
 }

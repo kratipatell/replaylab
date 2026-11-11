@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::risk::RiskLimits;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedRun {
     pub id: i64,
@@ -41,6 +43,8 @@ pub struct AgentRow {
     pub strategy: serde_json::Value,
     pub initial_equity: f64,
     pub snapshot: Option<String>,
+    pub risk: RiskLimits,
+    pub kill_switch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,7 +101,13 @@ CREATE TABLE IF NOT EXISTS agents (
     last_ts INTEGER,
     snapshot TEXT,
     last_error TEXT,
-    owner_id TEXT NOT NULL DEFAULT 'local'
+    owner_id TEXT NOT NULL DEFAULT 'local',
+    risk TEXT NOT NULL DEFAULT '',
+    kill_switch INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
 )";
 
 const ADD_OWNER_ID: &str = "ALTER TABLE runs ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local'";
@@ -107,6 +117,9 @@ const ADD_AGENTS_EQUITY: &str =
     "ALTER TABLE agents ADD COLUMN initial_equity REAL NOT NULL DEFAULT 10000.0";
 const ADD_AGENTS_SNAPSHOT: &str = "ALTER TABLE agents ADD COLUMN snapshot TEXT";
 const ADD_AGENTS_ERROR: &str = "ALTER TABLE agents ADD COLUMN last_error TEXT";
+const ADD_AGENTS_RISK: &str = "ALTER TABLE agents ADD COLUMN risk TEXT NOT NULL DEFAULT ''";
+const ADD_AGENTS_KILL: &str =
+    "ALTER TABLE agents ADD COLUMN kill_switch INTEGER NOT NULL DEFAULT 0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -135,6 +148,8 @@ pub enum DbError {
     GetAgent(String),
     #[error("update agent: {0}")]
     UpdateAgent(String),
+    #[error("kill switch: {0}")]
+    KillSwitch(String),
 }
 
 fn add_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<(), DbError> {
@@ -165,6 +180,23 @@ impl Db {
         add_column(conn, "agents", "initial_equity", ADD_AGENTS_EQUITY)?;
         add_column(conn, "agents", "snapshot", ADD_AGENTS_SNAPSHOT)?;
         add_column(conn, "agents", "last_error", ADD_AGENTS_ERROR)?;
+        add_column(conn, "agents", "risk", ADD_AGENTS_RISK)?;
+        add_column(conn, "agents", "kill_switch", ADD_AGENTS_KILL)?;
+        // Every existing agent trades under the default caps.
+        let default_risk = serde_json::to_string(&RiskLimits::default())
+            .map_err(|e| DbError::Init(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents SET risk = ?1 WHERE risk = ''",
+            params![default_risk],
+        )
+        .map_err(|e| DbError::Init(e.to_string()))?;
+        // The platform-wide kill switch is a single persisted row. IGNORE
+        // keeps its value across restarts instead of resetting it on open.
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('kill_switch', 0)",
+            [],
+        )
+        .map_err(|e| DbError::Init(e.to_string()))?;
         Ok(())
     }
 
@@ -310,20 +342,24 @@ impl Db {
         strategy: &serde_json::Value,
         run_id: Option<i64>,
         initial_equity: f64,
+        risk: &RiskLimits,
     ) -> Result<(), DbError> {
+        let risk_json =
+            serde_json::to_string(risk).map_err(|e| DbError::CreateAgent(e.to_string()))?;
         let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         conn.execute(
             // owner_id stays 'local' until accounts exist.
             "INSERT INTO agents
-                (id, name, status, strategy, run_id, created_at, equity, initial_equity, owner_id)
-             VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6, ?6, 'local')",
+                (id, name, status, strategy, run_id, created_at, equity, initial_equity, owner_id, risk)
+             VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6, ?6, 'local', ?7)",
             params![
                 id,
                 name,
                 strategy.to_string(),
                 run_id,
                 now_secs(),
-                initial_equity
+                initial_equity,
+                risk_json
             ],
         )
         .map_err(|e| DbError::CreateAgent(e.to_string()))?;
@@ -384,7 +420,7 @@ impl Db {
             .prepare(
                 "SELECT id, name, status, strategy, run_id, created_at, started_at,
                         stopped_at, equity, last_price, last_ts, last_error,
-                        initial_equity, snapshot
+                        initial_equity, snapshot, risk, kill_switch
                  FROM agents WHERE id = ?1",
             )
             .map_err(|e| DbError::GetAgent(e.to_string()))?;
@@ -392,12 +428,15 @@ impl Db {
             .query_map(params![id], |row| {
                 let summary = Self::agent_summary_from_row(row)?;
                 let strategy_txt: String = row.get(3)?;
+                let risk_txt: String = row.get(14)?;
                 Ok(AgentRow {
                     summary,
                     strategy: serde_json::from_str(&strategy_txt)
                         .unwrap_or(serde_json::Value::Null),
                     initial_equity: row.get(12)?,
                     snapshot: row.get(13)?,
+                    risk: serde_json::from_str(&risk_txt).unwrap_or_default(),
+                    kill_switch: row.get::<_, i64>(15)? != 0,
                 })
             })
             .map_err(|e| DbError::GetAgent(e.to_string()))?;
@@ -482,6 +521,51 @@ impl Db {
         .map(|n| n > 0)
         .map_err(|e| DbError::UpdateAgent(e.to_string()))
     }
+
+    /// Replace only the snapshot, leaving status, equity and last_error alone.
+    pub fn set_agent_snapshot(&self, id: &str, snapshot: &str) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents SET snapshot = ?2 WHERE id = ?1",
+            params![id, snapshot],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    pub fn set_kill_switch(&self, id: &str, on: bool) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "UPDATE agents SET kill_switch = ?2 WHERE id = ?1",
+            params![id, on as i64],
+        )
+        .map(|n| n > 0)
+        .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    /// Platform-wide kill switch. New agents inherit it even when they are
+    /// created after the switch was flipped, so `start` must read it too.
+    pub fn set_global_kill_switch(&self, on: bool) -> Result<(), DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('kill_switch', ?1)",
+            params![on as i64],
+        )
+        .map_err(|e| DbError::KillSwitch(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn global_kill_switch_on(&self) -> Result<bool, DbError> {
+        let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        let value: i64 = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'kill_switch'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| DbError::KillSwitch(e.to_string()))?;
+        Ok(value != 0)
+    }
 }
 
 #[cfg(test)]
@@ -523,8 +607,15 @@ mod tests {
     #[test]
     fn agent_lifecycle_roundtrip() {
         let db = Db::open_in_memory().expect("mem db");
-        db.create_agent("ag-1", "Paper BTC", &strategy_json(), None, 10_000.0)
-            .expect("create");
+        db.create_agent(
+            "ag-1",
+            "Paper BTC",
+            &strategy_json(),
+            None,
+            10_000.0,
+            &RiskLimits::default(),
+        )
+        .expect("create");
 
         let agents = db.list_agents().expect("list");
         assert_eq!(agents.len(), 1);
@@ -538,6 +629,8 @@ mod tests {
         assert_eq!(row.strategy, strategy_json());
         assert_eq!(row.initial_equity, 10_000.0);
         assert!(row.snapshot.is_none());
+        assert_eq!(row.risk, RiskLimits::default());
+        assert!(!row.kill_switch);
 
         assert!(db.start_agent("ag-1", 10).expect("start"));
         assert!(db
@@ -578,6 +671,34 @@ mod tests {
             .expect("missing"));
     }
 
+    #[test]
+    fn custom_risk_and_kill_switch_persist() {
+        let db = Db::open_in_memory().expect("mem db");
+        let risk = RiskLimits {
+            max_position_pct: 25.0,
+            max_daily_loss_pct: 5.0,
+            max_drawdown_pct: 15.0,
+        };
+        db.create_agent("ag", "Tight", &strategy_json(), None, 1_000.0, &risk)
+            .expect("create");
+        assert_eq!(db.get_agent("ag").expect("get").expect("exists").risk, risk);
+
+        assert!(db.set_kill_switch("ag", true).expect("kill"));
+        assert!(
+            db.get_agent("ag")
+                .expect("get")
+                .expect("exists")
+                .kill_switch
+        );
+        assert!(db.set_kill_switch("ag", false).expect("clear"));
+        assert!(
+            !db.get_agent("ag")
+                .expect("get")
+                .expect("exists")
+                .kill_switch
+        );
+    }
+
     const OLD_AGENTS_SCHEMA: &str = "CREATE TABLE agents (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -612,8 +733,57 @@ mod tests {
         assert_eq!(row.initial_equity, 10_000.0);
         assert!(row.snapshot.is_none());
         assert!(row.summary.last_error.is_none());
+        // An agent that predates risk caps gets the defaults and can trade.
+        assert_eq!(row.risk, RiskLimits::default());
+        assert!(!row.kill_switch);
         drop(db);
         let _ = Db::open(&path).expect("reopen");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn migration_creates_the_settings_table_for_an_old_db() {
+        let path = temp_db_path("settings_migrate");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        {
+            let conn = Connection::open(&path).expect("open old");
+            conn.execute_batch(OLD_AGENTS_SCHEMA).expect("old agents");
+            conn.execute(
+                "INSERT INTO agents (id, name, status, strategy, created_at)
+                 VALUES ('old', 'Old agent', 'draft', '{}', 1)",
+                [],
+            )
+            .expect("old row");
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("no settings table");
+            assert_eq!(tables, 0, "the old DB predates the settings table");
+        }
+
+        // CREATE TABLE IF NOT EXISTS creates it on an existing database.
+        let db = Db::open(&path).expect("migrate");
+        assert!(
+            !db.global_kill_switch_on().expect("global defaults off"),
+            "the settings table is created and seeded"
+        );
+        assert!(
+            db.get_agent("old").expect("get").is_some(),
+            "the old row survives migration"
+        );
+        db.set_global_kill_switch(true).expect("flip global");
+        drop(db);
+
+        // Reopening is idempotent: the flag is not reset by a second open.
+        let db = Db::open(&path).expect("reopen");
+        assert!(
+            db.global_kill_switch_on().expect("global stays on"),
+            "CREATE TABLE IF NOT EXISTS must not reset the flag"
+        );
+        drop(db);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 

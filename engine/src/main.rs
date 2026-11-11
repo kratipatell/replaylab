@@ -9,6 +9,7 @@ mod instrument;
 mod optimizer;
 mod orders;
 mod ratelimit;
+mod risk;
 mod session;
 mod sizing;
 mod stats;
@@ -49,6 +50,7 @@ async fn main() {
         cache_dir: cfg.cache_dir.clone(),
         jobs: Arc::new(JobStore::default()),
         db: Arc::new(db),
+        admin_token: cfg.admin_token.clone(),
     };
     let router = match app_with_limits(
         state,
