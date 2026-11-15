@@ -34,8 +34,17 @@ import SavedRuns from "@/components/SavedRuns";
 import StatsTable from "@/components/StatsTable";
 import TradesTable from "@/components/TradesTable";
 import VerdictCard from "@/components/VerdictCard";
+import WalkForwardPanel from "@/components/WalkForwardPanel";
+
+type TestMode = "single" | "walk-forward";
+
+const MODE_TABS: { key: TestMode; label: string }[] = [
+  { key: "single", label: "Single test" },
+  { key: "walk-forward", label: "Walk-forward" },
+];
 
 export default function TestLab() {
+  const [mode, setMode] = useState<TestMode>("single");
   const [form, setForm] = useState<TestLabForm>(defaultForm);
   const [attempted, setAttempted] = useState(false);
   const [clientErrors, setClientErrors] = useState<string[]>([]);
@@ -159,6 +168,7 @@ export default function TestLab() {
   };
 
   const selectRun = useCallback(async (id: number): Promise<void> => {
+    setMode("single");
     setSelectedId(id);
     setSavedLoading(true);
     setSavedError(null);
@@ -231,139 +241,178 @@ export default function TestLab() {
         </p>
       )}
 
-      <BacktestForm
-        form={form}
-        onChange={handleFormChange}
-        onSubmit={() => void submit()}
-        loading={loading}
-      />
+      <div role="tablist" aria-label="Test type" className="flex gap-2 border-b border-[var(--border)]">
+        {MODE_TABS.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            role="tab"
+            id={`tab-${tab.key}`}
+            aria-selected={mode === tab.key}
+            onClick={() => setMode(tab.key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              mode === tab.key
+                ? "border-[var(--accent)] text-[var(--accent)]"
+                : "border-transparent text-[var(--muted)]"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
 
-      {attempted && clientErrors.length > 0 && (
-        <div role="alert" className="rounded border border-[var(--verdict-fails)] p-3 text-sm">
-          <p className="font-semibold">Fix these before running:</p>
-          <ul className="list-disc pl-5">
-            {clientErrors.map((e) => (
-              <li key={e}>{e}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {/* Kept mounted while hidden so a running walk-forward survives a tab switch. */}
+      <div
+        role="tabpanel"
+        id="panel-walk-forward"
+        aria-labelledby="tab-walk-forward"
+        hidden={mode !== "walk-forward"}
+      >
+        <WalkForwardPanel form={form} onFormChange={handleFormChange} />
+      </div>
 
-      {loading && <p className="text-sm text-[var(--muted)]">Running test…</p>}
+      {mode === "single" && (
+        <div
+          role="tabpanel"
+          id="panel-single"
+          aria-labelledby="tab-single"
+          className="flex flex-col gap-6"
+        >
+          <BacktestForm
+            form={form}
+            onChange={handleFormChange}
+            onSubmit={() => void submit()}
+            loading={loading}
+          />
 
-      {engineError !== null && !loading && (
-        <div role="alert" className="flex flex-col gap-1 rounded border border-[var(--verdict-fails)] p-3 text-sm">
-          <p className="font-semibold">The test engine rejected this idea:</p>
-          <p>{engineError}</p>
-          <p className="text-[var(--muted)]">{fixHint(engineError)}</p>
-        </div>
-      )}
+          {attempted && clientErrors.length > 0 && (
+            <div role="alert" className="rounded border border-[var(--verdict-fails)] p-3 text-sm">
+              <p className="font-semibold">Fix these before running:</p>
+              <ul className="list-disc pl-5">
+                {clientErrors.map((e) => (
+                  <li key={e}>{e}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
-      {result !== null && !loading && (
-        <div className="flex flex-col gap-4">
-          {staleInputs.length > 0 && (
-            <p
-              role="status"
-              className="rounded border border-[var(--verdict-fragile)] bg-[var(--surface)] p-3 text-sm"
-            >
-              Results are for earlier inputs: {staleInputs.join(", ")}. Run test to update.
+          {loading && <p className="text-sm text-[var(--muted)]">Running test…</p>}
+
+          {engineError !== null && !loading && (
+            <div role="alert" className="flex flex-col gap-1 rounded border border-[var(--verdict-fails)] p-3 text-sm">
+              <p className="font-semibold">The test engine rejected this idea:</p>
+              <p>{engineError}</p>
+              <p className="text-[var(--muted)]">{fixHint(engineError)}</p>
+            </div>
+          )}
+
+          {result !== null && !loading && (
+            <div className="flex flex-col gap-4">
+              {staleInputs.length > 0 && (
+                <p
+                  role="status"
+                  className="rounded border border-[var(--verdict-fragile)] bg-[var(--surface)] p-3 text-sm"
+                >
+                  Results are for earlier inputs: {staleInputs.join(", ")}. Run test to update.
+                </p>
+              )}
+              <p className="text-xs text-[var(--muted)]">
+                Run {result.run_id === null ? "" : `#${result.run_id} · `}
+                {plural(result.candle_count, "candle")}
+              </p>
+              <VerdictCard
+                verdict={result.verdict}
+                onUseLongRange={() => handleFormChange({ ...form, preset: "5y" })}
+              />
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => void checkOtherMarkets()}
+                  disabled={crossMarketLoading || submittedRequest === null}
+                  className="w-fit rounded border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-medium disabled:opacity-60"
+                >
+                  {crossMarketLoading
+                    ? "Checking other markets…"
+                    : crossMarket === null
+                      ? "Check this rule on other markets"
+                      : "Run the cross-market check again"}
+                </button>
+                <p className="text-xs text-[var(--muted)]">
+                  Runs the same rule on BTC, ETH and SOL with the costs the results
+                  used: fees {submittedRequest?.fee_bps} bps, slippage{" "}
+                  {submittedRequest?.slippage_bps} bps.
+                </p>
+                {crossMarketError !== null && !crossMarketLoading && (
+                  <div
+                    role="alert"
+                    className="rounded border border-[var(--verdict-fails)] p-3 text-sm"
+                  >
+                    <p className="font-semibold">Could not check other markets:</p>
+                    <p>{crossMarketError}</p>
+                  </div>
+                )}
+                {crossMarket !== null && !crossMarketLoading && (
+                  <CrossMarketCard result={crossMarket} />
+                )}
+              </div>
+              <StatsTable
+                full={result.stats}
+                inSample={result.in_sample}
+                outOfSample={result.out_of_sample}
+              />
+              <EquityCharts
+                equity={result.equity_curve}
+                split={submittedSplit}
+                startMs={submittedStart}
+                endMs={submittedEnd}
+              />
+              <MonthlyTable monthly={result.metrics.monthly} />
+              <TradesTable trades={result.trades} />
+              <p className="text-xs text-[var(--muted)]">
+                These are simulated results on past data. Past results do not
+                predict future results.
+              </p>
+            </div>
+          )}
+
+          {!loading && result === null && engineError === null && saved === null && !savedLoading && savedError === null && (
+            <p className="text-sm text-[var(--muted)]">
+              No test yet. Fill in the idea above and press Run test, or open a saved test below.
             </p>
           )}
-          <p className="text-xs text-[var(--muted)]">
-            Run {result.run_id === null ? "" : `#${result.run_id} · `}
-            {plural(result.candle_count, "candle")}
-          </p>
-          <VerdictCard
-            verdict={result.verdict}
-            onUseLongRange={() => handleFormChange({ ...form, preset: "5y" })}
-          />
-          <div className="flex flex-col gap-2">
-            <button
-              type="button"
-              onClick={() => void checkOtherMarkets()}
-              disabled={crossMarketLoading || submittedRequest === null}
-              className="w-fit rounded border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-medium disabled:opacity-60"
-            >
-              {crossMarketLoading
-                ? "Checking other markets…"
-                : crossMarket === null
-                  ? "Check this rule on other markets"
-                  : "Run the cross-market check again"}
-            </button>
-            <p className="text-xs text-[var(--muted)]">
-              Runs the same rule on BTC, ETH and SOL with the costs the results
-              used: fees {submittedRequest?.fee_bps} bps, slippage{" "}
-              {submittedRequest?.slippage_bps} bps.
-            </p>
-            {crossMarketError !== null && !crossMarketLoading && (
-              <div
-                role="alert"
-                className="rounded border border-[var(--verdict-fails)] p-3 text-sm"
-              >
-                <p className="font-semibold">Could not check other markets:</p>
-                <p>{crossMarketError}</p>
-              </div>
-            )}
-            {crossMarket !== null && !crossMarketLoading && (
-              <CrossMarketCard result={crossMarket} />
-            )}
-          </div>
-          <StatsTable
-            full={result.stats}
-            inSample={result.in_sample}
-            outOfSample={result.out_of_sample}
-          />
-          <EquityCharts
-            equity={result.equity_curve}
-            split={submittedSplit}
-            startMs={submittedStart}
-            endMs={submittedEnd}
-          />
-          <MonthlyTable monthly={result.metrics.monthly} />
-          <TradesTable trades={result.trades} />
-          <p className="text-xs text-[var(--muted)]">
-            These are simulated results on past data. Past results do not
-            predict future results.
-          </p>
-        </div>
-      )}
 
-      {!loading && result === null && engineError === null && saved === null && !savedLoading && savedError === null && (
-        <p className="text-sm text-[var(--muted)]">
-          No test yet. Fill in the idea above and press Run test, or open a saved test below.
-        </p>
-      )}
+          {savedLoading && <p className="text-sm text-[var(--muted)]">Loading saved test…</p>}
 
-      {savedLoading && <p className="text-sm text-[var(--muted)]">Loading saved test…</p>}
+          {savedError !== null && !savedLoading && (
+            <div role="alert" className="rounded border border-[var(--verdict-fails)] p-3 text-sm">
+              <p className="font-semibold">Could not load that saved test:</p>
+              <p>{savedError}</p>
+            </div>
+          )}
 
-      {savedError !== null && !savedLoading && (
-        <div role="alert" className="rounded border border-[var(--verdict-fails)] p-3 text-sm">
-          <p className="font-semibold">Could not load that saved test:</p>
-          <p>{savedError}</p>
-        </div>
-      )}
-
-      {saved !== null && !savedLoading && (
-        <div className="flex flex-col gap-4">
-          <p className="text-xs text-[var(--muted)]">
-            Saved test #{saved.id} · {saved.symbol} {saved.interval}
-          </p>
-          <p className="rounded border border-[var(--border)] bg-[var(--surface)] p-3 text-sm text-[var(--muted)]">
-            Verdict is not stored for older runs.
-          </p>
-          <StatsTable full={saved.stats} inSample={null} outOfSample={null} />
-          <EquityCharts
-            equity={saved.equity_curve}
-            split={null}
-            startMs={saved.start_ms}
-            endMs={saved.end_ms}
-          />
-          <MonthlyTable monthly={saved.metrics.monthly} />
-          <TradesTable trades={saved.trades} />
-          <p className="text-xs text-[var(--muted)]">
-            These are simulated results on past data. Past results do not
-            predict future results.
-          </p>
+          {saved !== null && !savedLoading && (
+            <div className="flex flex-col gap-4">
+              <p className="text-xs text-[var(--muted)]">
+                Saved test #{saved.id} · {saved.symbol} {saved.interval}
+              </p>
+              <p className="rounded border border-[var(--border)] bg-[var(--surface)] p-3 text-sm text-[var(--muted)]">
+                Verdict is not stored for older runs.
+              </p>
+              <StatsTable full={saved.stats} inSample={null} outOfSample={null} />
+              <EquityCharts
+                equity={saved.equity_curve}
+                split={null}
+                startMs={saved.start_ms}
+                endMs={saved.end_ms}
+              />
+              <MonthlyTable monthly={saved.metrics.monthly} />
+              <TradesTable trades={saved.trades} />
+              <p className="text-xs text-[var(--muted)]">
+                These are simulated results on past data. Past results do not
+                predict future results.
+              </p>
+            </div>
+          )}
         </div>
       )}
 

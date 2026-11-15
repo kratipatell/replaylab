@@ -1,0 +1,45 @@
+{
+  "strategy": {
+    "asset": "BTCUSDT",
+    "timeframe": "1h",
+    "side": "long",
+    "entry": {
+      "all": [
+        {
+          "left": {
+            "ind": "close"
+          },
+          "op": "crosses_above",
+          "right": {
+            "ind": "sma",
+            "period": 20
+          }
+        }
+      ],
+      "any": []
+    }
+  },
+  "start_ms": 1787799600000,
+  "end_ms": 1793196000000,
+  "fee_bps": 5,
+  "slippage_bps": 2,
+  "windows": 3,
+  "is_bars": 300,
+  "oos_bars": 150,
+  "mode": "rolling",
+  "params": [
+    {
+      "target": "entry.all.0.right.period",
+      "kind": "int",
+      "values": [
+        14,
+        20,
+        26
+      ]
+    }
+  ],
+  "search": {
+    "method": "grid"
+  },
+  "objective": "sharpe"
+}

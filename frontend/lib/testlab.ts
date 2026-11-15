@@ -286,8 +286,9 @@ function toOperand(o: RuleOperandState): Operand {
   return { ind: o.ind };
 }
 
-// Mirrors Strategy::validate plus the range/fee/split checks in post_backtest.
-export function validateForm(form: TestLabForm, nowMs: number): string[] {
+// Mirrors Strategy::validate plus the range and fee checks shared by every
+// run mode. The single-test hold-back is checked in validateForm.
+export function validateCore(form: TestLabForm, nowMs: number): string[] {
   const errors: string[] = [];
   const entryCount = form.entry.all.length + form.entry.any.length;
   if (entryCount === 0) {
@@ -329,12 +330,6 @@ export function validateForm(form: TestLabForm, nowMs: number): string[] {
       );
     }
   }
-  const pct = Number(form.split);
-  if (!Number.isFinite(pct) || pct < HOLD_BACK_MIN_PCT || pct > HOLD_BACK_MAX_PCT) {
-    errors.push(
-      `Hold back the last ${HOLD_BACK_MIN_PCT} to ${HOLD_BACK_MAX_PCT}% to check the idea (30 means the last 30% of data is held back).`,
-    );
-  }
   for (const [raw, name] of [
     [form.feeBps, "Fees"],
     [form.slippageBps, "Slippage"],
@@ -343,6 +338,17 @@ export function validateForm(form: TestLabForm, nowMs: number): string[] {
     if (!Number.isFinite(v) || v < 0 || v > 1000) {
       errors.push(`${name} must be between 0 and 1000.`);
     }
+  }
+  return errors;
+}
+
+export function validateForm(form: TestLabForm, nowMs: number): string[] {
+  const errors = validateCore(form, nowMs);
+  const pct = Number(form.split);
+  if (!Number.isFinite(pct) || pct < HOLD_BACK_MIN_PCT || pct > HOLD_BACK_MAX_PCT) {
+    errors.push(
+      `Hold back the last ${HOLD_BACK_MIN_PCT} to ${HOLD_BACK_MAX_PCT}% to check the idea (30 means the last 30% of data is held back).`,
+    );
   }
   return errors;
 }

@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiError,
   createAgent,
   getAgentDecisions,
   getAllAgentEquity,
   listAgents,
+  postWalkForward,
+  type WalkForwardRequest,
 } from "./api";
+import { sampleWalkForwardReport } from "./walkforward.fixture";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -123,5 +127,61 @@ describe("agent API client", () => {
       status: 409,
       message: "kill switch is on",
     });
+  });
+});
+
+describe("walk-forward API client", () => {
+  const body: WalkForwardRequest = {
+    strategy: {
+      asset: "BTCUSDT",
+      timeframe: "1h",
+      side: "long",
+      entry: { all: [], any: [] },
+    },
+    start_ms: 1,
+    end_ms: 2,
+    windows: 4,
+    is_bars: 1000,
+    oos_bars: 500,
+    mode: "rolling",
+    params: [{ target: "entry.all.0.right", kind: "float", values: [99, 100] }],
+    search: { method: "grid" },
+    objective: "sharpe",
+  };
+
+  it("posts the request to /walk-forward and parses the report", async () => {
+    const report = sampleWalkForwardReport();
+    const fetchMock = stubFetch(async () => jsonResponse(report));
+
+    await expect(postWalkForward(body)).resolves.toEqual(report);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(String(url)).toMatch(/\/walk-forward$/);
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual(body);
+  });
+
+  it("preserves the engine's 400 message for rejected settings", async () => {
+    const message = "not enough candles (10) for 4 windows of 1000 IS and 500 OOS bars (need 3000)";
+    stubFetch(async () => jsonResponse({ error: message }, 400));
+    await expect(postWalkForward(body)).rejects.toMatchObject({ status: 400, message });
+  });
+
+  it("keeps the 429 status so the UI can explain the rate limit", async () => {
+    stubFetch(async () => jsonResponse({ error: "too many optimizer requests; try again shortly" }, 429));
+    const error = await postWalkForward(body).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 429 });
+  });
+
+  it("rejects with an AbortError when the caller cancels", async () => {
+    stubFetch(async (_url, init) => {
+      if (init?.signal?.aborted) {
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      }
+      return jsonResponse(sampleWalkForwardReport());
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(postWalkForward(body, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
   });
 });

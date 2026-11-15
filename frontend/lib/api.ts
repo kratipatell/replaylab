@@ -160,6 +160,91 @@ export interface ValidateRequest extends BacktestRequest {
   symbols?: string[];
 }
 
+// Mirrors engine/src/walk_forward.rs (WalkForwardRequest, WalkForwardReport)
+// and engine/src/optimizer.rs (ParamSpec, SearchSpec, Objective).
+export type WalkForwardMode = "rolling" | "anchored";
+
+export type Objective = "sharpe" | "total_return" | "expectancy" | "profit_factor";
+
+export interface ParamSpec {
+  target: string;
+  kind: "int" | "float";
+  values: number[];
+}
+
+export interface WalkForwardRequest {
+  strategy: Strategy;
+  start_ms: number;
+  end_ms: number;
+  fee_bps?: number;
+  slippage_bps?: number;
+  windows: number;
+  is_bars: number;
+  oos_bars: number;
+  mode: WalkForwardMode;
+  params: ParamSpec[];
+  search: { method: "grid" };
+  objective?: Objective;
+}
+
+export interface SegmentRange {
+  start_ms: number;
+  end_ms: number;
+  bars: number;
+}
+
+export interface SegmentResult {
+  range: SegmentRange;
+  return_pct: number;
+  drawdown_pct: number;
+  trade_count: number;
+  too_few_trades_to_judge: boolean;
+}
+
+export interface WalkForwardWindow {
+  window: number;
+  in_sample: SegmentResult;
+  out_of_sample: SegmentResult;
+  chosen_parameters: Record<string, number>;
+  optimizer_score: number;
+  oos_starting_equity: number;
+  oos_ending_equity: number;
+}
+
+export interface WalkForwardEquityPoint {
+  bar_ts: number;
+  equity: number;
+}
+
+export interface ParameterStability {
+  parameter: string;
+  modal_value: number;
+  modal_windows: number;
+  windows: number;
+  modal_share_pct: number;
+  unstable: boolean;
+}
+
+export interface WalkForwardReport {
+  mode: WalkForwardMode;
+  objective: string;
+  window_count: number;
+  total_optimizer_evaluations: number;
+  windows: WalkForwardWindow[];
+  stitched_oos_equity_curve: WalkForwardEquityPoint[];
+  total_oos_return_pct: number;
+  max_oos_drawdown_pct: number;
+  profitable_oos_windows: number;
+  profitable_oos_share_pct: number;
+  mean_is_return_per_bar_pct: number;
+  mean_oos_return_per_bar_pct: number;
+  efficiency_ratio: number | null;
+  efficiency_ratio_definition: string;
+  parameter_stability: ParameterStability[];
+  stability_measure: string;
+  verdict: Verdict;
+}
+
 export interface RunSummary {
   id: number;
   created_at: number;
@@ -342,6 +427,18 @@ export function postValidate(
   signal?: AbortSignal,
 ): Promise<CrossMarket> {
   return request<CrossMarket>("/validate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export function postWalkForward(
+  body: WalkForwardRequest,
+  signal?: AbortSignal,
+): Promise<WalkForwardReport> {
+  return request<WalkForwardReport>("/walk-forward", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

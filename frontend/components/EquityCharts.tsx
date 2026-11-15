@@ -36,7 +36,7 @@ function points(points: SeriesPoint[], total: number, min: number, max: number):
     .join(" ");
 }
 
-function LineChart({
+export function LineChart({
   title,
   sub,
   yLabel,
@@ -48,6 +48,7 @@ function LineChart({
   endMs,
   color,
   fill,
+  markers = [],
 }: {
   title: string;
   sub: string;
@@ -60,6 +61,7 @@ function LineChart({
   endMs: number | null;
   color: string;
   fill: boolean;
+  markers?: { index: number; label: string }[];
 }) {
   if (pts.length === 0) {
     return (
@@ -92,6 +94,25 @@ function LineChart({
       >
         {fill && <path d={area} fill={color} opacity={0.25} />}
         <path d={d} fill="none" stroke={color} strokeWidth={1.5} />
+        {markers.map((m) => {
+          const x = PAD_L + seriesX(m.index, total) * plotW;
+          return (
+            <g key={`${m.label}-${m.index}`}>
+              <line
+                x1={x}
+                y1={PAD_T}
+                x2={x}
+                y2={baseY}
+                stroke="var(--muted)"
+                strokeDasharray="2 3"
+                strokeWidth={1}
+              />
+              <text x={x} y={PAD_T - 6} fontSize={11} fill="var(--muted)" textAnchor="middle">
+                {m.label}
+              </text>
+            </g>
+          );
+        })}
         {splitX !== null && (
           <g>
             <line
