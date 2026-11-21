@@ -11,6 +11,7 @@ pub enum ExitReason {
     SessionEnd,
     EndOfData,
     RiskHalt,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

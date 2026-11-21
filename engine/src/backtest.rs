@@ -319,6 +319,7 @@ fn exit_reason_code(reason: ExitReason) -> &'static str {
         ExitReason::SessionEnd => "session_end",
         ExitReason::EndOfData => "end_of_data",
         ExitReason::RiskHalt => "risk_halt",
+        ExitReason::Stopped => "stopped",
     }
 }
 
@@ -395,15 +396,18 @@ impl SimState {
     /// `live` means another bar is expected but not known yet, so a decision
     /// taken on this bar's close is kept for the next call instead of being
     /// dropped at the end of a finished series.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         i: usize,
+        trade_idx: usize,
         candles: &[Candle],
         strategy: &mut dyn BarStrategy,
         ctx: &SimCtx,
         live: bool,
         mut events: Option<&mut Vec<DecisionEvent>>,
     ) -> Result<(), BacktestError> {
+        strategy.on_step(i, candles);
         let bar = &candles[i];
         let next = candles.get(i + 1);
         if let Some(limit) = self.pending_halt_event.take() {
@@ -437,7 +441,7 @@ impl SimState {
                 let raw_exit = bar.open;
                 let reason = self.pending_exit.reason();
                 let (after, trade) =
-                    close_position(ctx, &pos, raw_exit, bar.ts, i, reason, self.equity);
+                    close_position(ctx, &pos, raw_exit, bar.ts, trade_idx, reason, self.equity);
                 self.equity = after;
                 self.trades.push(trade);
                 emit(&mut events, || {
@@ -474,7 +478,7 @@ impl SimState {
                         }
                         let entry_cost = ctx.cost_rate * qty * ctx.pv * entry_raw;
                         self.position = Some(OpenPos {
-                            entry_idx: i,
+                            entry_idx: trade_idx,
                             entry_ts: bar.ts,
                             entry_raw,
                             side: entry.side,
@@ -541,7 +545,7 @@ impl SimState {
             let exit = orders::resolve_exit(bar, pos.side, fixed_stop, target, &pos.trail);
             if let Some((raw_exit, reason)) = exit {
                 let (after, trade) =
-                    close_position(ctx, &pos, raw_exit, bar.ts, i, reason, self.equity);
+                    close_position(ctx, &pos, raw_exit, bar.ts, trade_idx, reason, self.equity);
                 self.equity = after;
                 self.trades.push(trade);
                 emit(&mut events, || {
@@ -570,7 +574,7 @@ impl SimState {
                         &pos,
                         raw_exit,
                         bar.ts,
-                        i,
+                        trade_idx,
                         ExitReason::SessionEnd,
                         self.equity,
                     );
@@ -802,7 +806,7 @@ impl Simulator {
             self.exit_at_session_end,
             self.risk.as_ref(),
         );
-        self.state.step(i, candles, strategy, &ctx, false, None)
+        self.state.step(i, i, candles, strategy, &ctx, false, None)
     }
 
     pub fn step_live(
@@ -821,12 +825,23 @@ impl Simulator {
             self.exit_at_session_end,
             self.risk.as_ref(),
         );
-        self.state.step(i, candles, strategy, &ctx, true, None)
+        self.state.step(i, i, candles, strategy, &ctx, true, None)
     }
 
+    #[cfg(test)]
     pub fn step_live_with_events(
         &mut self,
         i: usize,
+        candles: &[Candle],
+        strategy: &mut dyn BarStrategy,
+    ) -> Result<Vec<DecisionEvent>, BacktestError> {
+        self.step_live_with_events_at(i, i, candles, strategy)
+    }
+
+    pub fn step_live_with_events_at(
+        &mut self,
+        i: usize,
+        trade_idx: usize,
         candles: &[Candle],
         strategy: &mut dyn BarStrategy,
     ) -> Result<Vec<DecisionEvent>, BacktestError> {
@@ -841,9 +856,54 @@ impl Simulator {
             self.risk.as_ref(),
         );
         let mut events = Vec::new();
-        self.state
-            .step(i, candles, strategy, &ctx, true, Some(&mut events))?;
+        self.state.step(
+            i,
+            trade_idx,
+            candles,
+            strategy,
+            &ctx,
+            true,
+            Some(&mut events),
+        )?;
         Ok(events)
+    }
+
+    pub fn stop_at_close(&mut self, trade_idx: usize, bar: &Candle) -> Option<DecisionEvent> {
+        self.state.pending = None;
+        self.state.pending_exit = PendingExit::Legacy(false);
+        let pos = self.state.position.take()?;
+        let ctx = sim_ctx(
+            &self.instrument,
+            self.cost_rate,
+            self.pv,
+            self.sizing,
+            &self.bracket,
+            &self.session,
+            self.exit_at_session_end,
+            self.risk.as_ref(),
+        );
+        let (equity, trade) = close_position(
+            &ctx,
+            &pos,
+            bar.close,
+            bar.ts,
+            trade_idx,
+            ExitReason::Stopped,
+            self.state.equity,
+        );
+        self.state.equity = equity;
+        self.state.trades.push(trade);
+        if let Some(last) = self.state.equity_curve.last_mut() {
+            *last = equity;
+        } else {
+            self.state.equity_curve.push(equity);
+        }
+        self.state.last_bar_equity = Some(equity);
+        let mut logged = event(bar.ts, "exit_filled", Some("stopped".to_string()));
+        logged.price = Some(bar.close);
+        logged.qty = Some(pos.qty);
+        logged.equity = equity;
+        Some(logged)
     }
 
     pub fn finish(&mut self, i: usize, bar: &Candle) {
@@ -1027,6 +1087,10 @@ struct ActiveWindowStrategy<'a> {
 }
 
 impl BarStrategy for ActiveWindowStrategy<'_> {
+    fn on_step(&mut self, idx: usize, candles: &[Candle]) {
+        self.inner.on_step(idx, candles);
+    }
+
     fn on_bar(&mut self, idx: usize, candles: &[Candle]) -> Option<Side> {
         let signal = self.inner.on_bar(idx, candles);
         (idx >= self.start).then_some(signal).flatten()
@@ -2975,7 +3039,7 @@ mod resume_tests {
         ctx: &SimCtx,
     ) -> Result<(), BacktestError> {
         for i in from..candles.len() {
-            state.step(i, candles, strategy, ctx, false, None)?;
+            state.step(i, i, candles, strategy, ctx, false, None)?;
         }
         let last = candles.len() - 1;
         state.finish(last, &candles[last], ctx);
@@ -3093,7 +3157,7 @@ mod resume_tests {
             let mut head_strategy = RulesStrategy::new(&spec);
             for i in 0..k {
                 head_state
-                    .step(i, &candles, &mut head_strategy, &ctx, false, None)
+                    .step(i, i, &candles, &mut head_strategy, &ctx, false, None)
                     .expect("head step");
             }
             coverage.observe(&head_state);
@@ -3219,7 +3283,7 @@ mod resume_tests {
             let mut head_state = SimState::new(run_cfg.initial_equity, candles.len());
             for i in 0..k {
                 head_state
-                    .step(i, &candles, &mut head, &ctx, false, None)
+                    .step(i, i, &candles, &mut head, &ctx, false, None)
                     .expect("head step");
             }
             // Before the opening range is complete the ORB keeps its bounds as

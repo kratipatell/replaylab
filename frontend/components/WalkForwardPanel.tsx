@@ -176,7 +176,7 @@ export default function WalkForwardPanel({
         </div>
         <p className="text-xs text-[var(--muted)]">
           Walk-forward runs the optimizer once per window, so it can take a while.
-          Cancel stops waiting here; the engine may keep working on the run.
+          Cancel stops the walk-forward run on the engine.
         </p>
       </form>
 

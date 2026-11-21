@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub fn sma(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {
@@ -21,6 +22,7 @@ pub fn sma(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+#[cfg(test)]
 pub fn ema(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {
@@ -42,6 +44,7 @@ pub fn ema(x: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+#[cfg(test)]
 pub fn rsi(x: &[f64], n: usize) -> Vec<f64> {
     let len = x.len();
     if len == 0 {

@@ -68,6 +68,8 @@ pub enum AgentError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSnapshot {
     candles: Vec<Candle>,
+    #[serde(default)]
+    candle_offset: usize,
     strategy: RulesStrategy,
     #[serde(serialize_with = "serialize_agent_simulator")]
     simulator: Simulator,
@@ -88,6 +90,17 @@ pub struct Advance {
     pub last_ts: i64,
     pub trades: Vec<Trade>,
     pub position: Option<PositionView>,
+    #[serde(skip)]
+    pub events: Vec<crate::backtest::DecisionEvent>,
+    #[serde(skip)]
+    pub equity_points: Vec<EquityPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Stop {
+    pub equity: f64,
+    pub last_price: f64,
+    pub last_ts: i64,
     #[serde(skip)]
     pub events: Vec<crate::backtest::DecisionEvent>,
     #[serde(skip)]
@@ -145,17 +158,33 @@ impl AgentSnapshot {
         for i in 0..candles.len() {
             simulator.step_live(i, candles, &mut strategy)?;
         }
-        Ok(AgentSnapshot {
+        let mut snapshot = AgentSnapshot {
             candles: candles.to_vec(),
+            candle_offset: 0,
             strategy,
             simulator,
-        })
+        };
+        snapshot.prune_candles();
+        Ok(snapshot)
     }
 
     /// Append only candles the agent has not seen, then step each once. A
     /// candle at or before the last stored timestamp is ignored, which makes
     /// a retried advance idempotent.
     pub fn advance(&mut self, new_candles: &[Candle]) -> Result<Advance, AgentError> {
+        self.advance_inner(new_candles, true)
+    }
+
+    #[cfg(test)]
+    fn advance_unpruned(&mut self, new_candles: &[Candle]) -> Result<Advance, AgentError> {
+        self.advance_inner(new_candles, false)
+    }
+
+    fn advance_inner(
+        &mut self,
+        new_candles: &[Candle],
+        prune: bool,
+    ) -> Result<Advance, AgentError> {
         let last_ts = self.last_ts();
         let fresh: Vec<Candle> = new_candles
             .iter()
@@ -172,8 +201,9 @@ impl AgentSnapshot {
         let mut events = Vec::new();
         let mut equity_points = Vec::with_capacity(fresh.len());
         for i in start..self.candles.len() {
-            events.extend(self.simulator.step_live_with_events(
+            events.extend(self.simulator.step_live_with_events_at(
                 i,
+                self.candle_offset + i,
                 &self.candles,
                 &mut self.strategy,
             )?);
@@ -181,6 +211,9 @@ impl AgentSnapshot {
                 bar_ts: self.candles[i].ts,
                 equity: self.simulator.current_equity(),
             });
+        }
+        if prune {
+            self.prune_candles();
         }
         Ok(Advance {
             new_candles: fresh.len(),
@@ -215,6 +248,10 @@ impl AgentSnapshot {
         let mut snapshot: AgentSnapshot =
             serde_json::from_str(text).map_err(|e| AgentError::Snapshot(e.to_string()))?;
         snapshot.simulator.restore_last_bar_equity();
+        snapshot
+            .strategy
+            .prime_indicators_if_missing(&snapshot.candles);
+        snapshot.prune_candles();
         Ok(snapshot)
     }
 
@@ -231,7 +268,7 @@ impl AgentSnapshot {
     }
 
     pub fn candle_count(&self) -> usize {
-        self.candles.len()
+        self.candle_offset + self.candles.len()
     }
 
     pub fn trades(&self) -> &[Trade] {
@@ -243,9 +280,13 @@ impl AgentSnapshot {
     }
 
     pub fn equity_points(&self) -> Vec<EquityPoint> {
-        self.candles
+        let curve = self.simulator.equity_curve();
+        let count = self.candles.len().min(curve.len());
+        let candle_start = self.candles.len() - count;
+        let curve_start = curve.len() - count;
+        self.candles[candle_start..]
             .iter()
-            .zip(self.simulator.equity_curve())
+            .zip(&curve[curve_start..])
             .map(|(candle, &equity)| EquityPoint {
                 bar_ts: candle.ts,
                 equity,
@@ -289,6 +330,38 @@ impl AgentSnapshot {
 
     pub fn clear_kill_switch(&mut self) {
         self.simulator.clear_kill_switch();
+    }
+
+    pub fn stop(&mut self) -> Stop {
+        let last = self.candles.last().copied();
+        let mut events = Vec::new();
+        let mut equity_points = Vec::new();
+        if let Some(bar) = last {
+            let trade_idx = self.candle_offset + self.candles.len() - 1;
+            if let Some(event) = self.simulator.stop_at_close(trade_idx, &bar) {
+                events.push(event);
+                equity_points.push(EquityPoint {
+                    bar_ts: bar.ts,
+                    equity: self.equity(),
+                });
+            }
+        }
+        Stop {
+            equity: self.equity(),
+            last_price: self.last_price(),
+            last_ts: self.last_ts(),
+            events,
+            equity_points,
+        }
+    }
+
+    fn prune_candles(&mut self) {
+        let keep = self.strategy.maximum_lookback().saturating_add(1).max(2);
+        let remove = self.candles.len().saturating_sub(keep);
+        if remove > 0 {
+            self.candles.drain(..remove);
+            self.candle_offset += remove;
+        }
     }
 }
 
@@ -337,6 +410,122 @@ mod tests {
             take_profit_pct: None,
             claim: None,
         }
+    }
+
+    fn sma_spec(period: usize) -> Strategy {
+        let mut strategy = spec(0.0);
+        strategy.entry.all[0].left = Operand::Indicator(IndicatorRef {
+            ind: IndicatorKind::Close,
+            period: None,
+        });
+        strategy.entry.all[0].right = Operand::Indicator(IndicatorRef {
+            ind: IndicatorKind::Sma,
+            period: Some(period),
+        });
+        strategy.entry.all[0].op = Op::Gt;
+        strategy
+    }
+
+    fn indicator_spec(ind: crate::strategy::IndicatorKind) -> Strategy {
+        let period = matches!(
+            ind,
+            crate::strategy::IndicatorKind::Sma
+                | crate::strategy::IndicatorKind::Ema
+                | crate::strategy::IndicatorKind::Rsi
+        )
+        .then_some(4);
+        let threshold = match ind {
+            crate::strategy::IndicatorKind::Low => 90.0,
+            crate::strategy::IndicatorKind::Rsi => 50.0,
+            _ => 100.0,
+        };
+        let mut strategy = spec(0.0);
+        strategy.entry.all[0] = Condition {
+            left: Operand::Indicator(IndicatorRef { ind, period }),
+            op: Op::Gt,
+            right: Operand::Number(threshold),
+        };
+        strategy.exit = Some(Rules {
+            all: Vec::new(),
+            any: vec![Condition {
+                left: Operand::Indicator(IndicatorRef {
+                    ind: crate::strategy::IndicatorKind::Close,
+                    period: None,
+                }),
+                op: Op::Lt,
+                right: Operand::Number(100.0),
+            }],
+        });
+        strategy
+    }
+
+    fn combined_indicator_spec() -> Strategy {
+        let reference = |ind, period| {
+            Operand::Indicator(IndicatorRef {
+                ind,
+                period: Some(period),
+            })
+        };
+        let close = Operand::Indicator(IndicatorRef {
+            ind: crate::strategy::IndicatorKind::Close,
+            period: None,
+        });
+        let mut strategy = spec(0.0);
+        strategy.entry = Rules {
+            all: vec![
+                Condition {
+                    left: close,
+                    op: Op::Gt,
+                    right: reference(crate::strategy::IndicatorKind::Sma, 5),
+                },
+                Condition {
+                    left: reference(crate::strategy::IndicatorKind::Ema, 3),
+                    op: Op::Gt,
+                    right: reference(crate::strategy::IndicatorKind::Sma, 5),
+                },
+                Condition {
+                    left: reference(crate::strategy::IndicatorKind::Rsi, 4),
+                    op: Op::Gt,
+                    right: Operand::Number(45.0),
+                },
+                Condition {
+                    left: Operand::Indicator(IndicatorRef {
+                        ind: crate::strategy::IndicatorKind::High,
+                        period: None,
+                    }),
+                    op: Op::Gt,
+                    right: Operand::Indicator(IndicatorRef {
+                        ind: crate::strategy::IndicatorKind::Open,
+                        period: None,
+                    }),
+                },
+                Condition {
+                    left: Operand::Indicator(IndicatorRef {
+                        ind: crate::strategy::IndicatorKind::Low,
+                        period: None,
+                    }),
+                    op: Op::Lt,
+                    right: Operand::Number(120.0),
+                },
+            ],
+            any: Vec::new(),
+        };
+        strategy.exit = Some(Rules {
+            all: Vec::new(),
+            any: vec![
+                Condition {
+                    left: close,
+                    op: Op::Lt,
+                    right: reference(crate::strategy::IndicatorKind::Ema, 3),
+                },
+                Condition {
+                    left: reference(crate::strategy::IndicatorKind::Rsi, 4),
+                    op: Op::Lt,
+                    right: Operand::Number(45.0),
+                },
+            ],
+        });
+        strategy
     }
 
     fn bars(closes: &[f64]) -> Vec<Candle> {
@@ -483,6 +672,196 @@ mod tests {
         assert_eq!(agent.trades(), resumed.trades());
         assert_eq!(agent.equity(), resumed.equity());
         assert_eq!(resumed.equity_curve().len(), all.len() - 5);
+    }
+
+    #[test]
+    fn stop_closes_open_position_at_last_close_and_records_costed_exit() {
+        let (mut agent, all) = agent_up_then_crash();
+        let before = agent.equity();
+        let quantity = agent.position().expect("open position").qty;
+
+        let stopped = agent.stop();
+
+        assert!(agent.position().is_none());
+        assert_eq!(agent.trades().len(), 1);
+        let trade = &agent.trades()[0];
+        assert_eq!(trade.reason, crate::backtest::ExitReason::Stopped);
+        assert_eq!(trade.exit_price, all[3].close);
+        let gross_equity = 10_000.0 + quantity * (all[3].close - trade.entry_price);
+        assert!(
+            stopped.equity < gross_equity,
+            "fees and slippage must be charged"
+        );
+        assert_eq!(stopped.equity, before, "close equals the existing mark");
+        assert_eq!(agent.equity_curve().last().copied(), Some(stopped.equity));
+        assert_eq!(stopped.events.len(), 1);
+        assert_eq!(stopped.events[0].reason.as_deref(), Some("stopped"));
+        assert_eq!(stopped.events[0].bar_ts, all[3].ts);
+        assert_eq!(stopped.events[0].price, Some(all[3].close));
+        assert_eq!(stopped.equity_points.len(), 1);
+        assert_eq!(stopped.equity_points[0].bar_ts, all[3].ts);
+        assert_eq!(stopped.equity_points[0].equity, stopped.equity);
+
+        let repeated = agent.stop();
+        assert!(repeated.events.is_empty());
+        assert!(repeated.equity_points.is_empty());
+        assert_eq!(agent.trades().len(), 1);
+    }
+
+    #[test]
+    fn stop_when_flat_does_not_create_exit_history() {
+        let all = bars(&[100.0, 99.0]);
+        let mut agent = AgentSnapshot::warm_up(
+            &spec(101.5),
+            &all,
+            &BacktestConfig::default(),
+            10_000.0,
+            limits(),
+        )
+        .expect("warm up flat agent");
+        assert!(agent.position().is_none());
+
+        let stopped = agent.stop();
+
+        assert!(stopped.events.is_empty());
+        assert!(stopped.equity_points.is_empty());
+        assert!(agent.trades().is_empty());
+    }
+
+    #[test]
+    fn snapshot_candles_stay_bounded_and_pruned_run_matches_unpruned() {
+        let all = bars(&[
+            100.0, 101.0, 102.0, 99.0, 103.0, 97.0, 104.0, 100.0, 105.0, 98.0, 106.0, 99.0, 107.0,
+            100.0, 108.0, 97.0, 109.0, 99.0, 110.0, 98.0, 111.0,
+        ]);
+        let strategy = sma_spec(4);
+        let cfg = BacktestConfig::default();
+        let mut pruned = AgentSnapshot::warm_up(&strategy, &all[..8], &cfg, 10_000.0, limits())
+            .expect("warm up pruned agent");
+        let mut unpruned = pruned.clone();
+        unpruned.candles = all[..8].to_vec();
+        unpruned.candle_offset = 0;
+
+        let mut pruned_events = Vec::new();
+        let mut pruned_equity = Vec::new();
+        let mut unpruned_events = Vec::new();
+        let mut unpruned_equity = Vec::new();
+        for batch in all[8..].chunks(3) {
+            let a = pruned.advance(batch).expect("pruned advance");
+            let b = unpruned.advance_unpruned(batch).expect("unpruned advance");
+            pruned_events.extend(a.events);
+            unpruned_events.extend(b.events);
+            pruned_equity.extend(a.equity_points);
+            unpruned_equity.extend(b.equity_points);
+            assert!(pruned.candle_count() > pruned.candles.len());
+            assert!(pruned.candles.len() <= 5, "period plus prior candle");
+            let json = pruned.to_json().expect("serialize bounded snapshot");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("snapshot json");
+            assert!(value["candles"].as_array().expect("candles").len() <= 5);
+        }
+
+        assert_eq!(pruned.trades(), unpruned.trades());
+        assert_eq!(pruned_events, unpruned_events);
+        assert_eq!(pruned_equity, unpruned_equity);
+        assert_eq!(pruned.equity(), unpruned.equity());
+    }
+
+    #[test]
+    fn each_builder_indicator_has_exact_pruned_resume_parity() {
+        use crate::strategy::IndicatorKind::*;
+
+        let pattern = [
+            100.0, 108.0, 114.0, 110.0, 98.0, 90.0, 94.0, 103.0, 112.0, 106.0, 96.0, 88.0,
+        ];
+        let closes: Vec<f64> = (0..120).map(|i| pattern[i % pattern.len()]).collect();
+        let all = bars(&closes);
+        let cfg = BacktestConfig::default();
+        let risk = RiskLimits {
+            max_position_pct: 100.0,
+            max_daily_loss_pct: 100.0,
+            max_drawdown_pct: 100.0,
+        };
+
+        for ind in [Close, Open, High, Low, Sma, Ema, Rsi] {
+            let strategy = indicator_spec(ind);
+            assert_pruned_parity(&strategy, &all, 16, &cfg, risk);
+        }
+
+        assert_pruned_parity(&combined_indicator_spec(), &all, 16, &cfg, risk);
+    }
+
+    fn assert_pruned_parity(
+        strategy: &Strategy,
+        all: &[Candle],
+        warmup: usize,
+        cfg: &BacktestConfig,
+        risk: RiskLimits,
+    ) {
+        let mut pruned =
+            AgentSnapshot::warm_up(strategy, &all[..warmup], cfg, 10_000.0, risk).expect("warmup");
+        let mut unpruned = pruned.clone();
+        unpruned.candles = all[..warmup].to_vec();
+        unpruned.candle_offset = 0;
+        let max_history = pruned.strategy.maximum_lookback() + 1;
+        let mut pruned_events = Vec::new();
+        let mut pruned_equity = Vec::new();
+        let mut unpruned_events = Vec::new();
+        let mut unpruned_equity = Vec::new();
+
+        for batch in all[warmup..].chunks(5) {
+            let actual = pruned.advance(batch).expect("pruned advance");
+            let expected = unpruned.advance_unpruned(batch).expect("unpruned advance");
+            pruned_events.extend(actual.events);
+            pruned_equity.extend(actual.equity_points);
+            unpruned_events.extend(expected.events);
+            unpruned_equity.extend(expected.equity_points);
+            assert!(pruned.candles.len() <= max_history);
+            pruned = AgentSnapshot::from_json(&pruned.to_json().expect("serialize"))
+                .expect("resume pruned snapshot");
+        }
+
+        assert!(!pruned_events.is_empty(), "fixture must make decisions");
+        assert!(!pruned.trades().is_empty(), "fixture must trade");
+        assert_eq!(pruned.trades(), unpruned.trades());
+        assert_eq!(pruned_events, unpruned_events);
+        assert_eq!(pruned_equity, unpruned_equity);
+        assert_eq!(pruned.equity(), unpruned.equity());
+    }
+
+    #[test]
+    fn old_unpruned_indicator_snapshot_rebuilds_exact_continuation_state() {
+        let all = bars(&[
+            100.0, 101.0, 102.0, 99.0, 103.0, 97.0, 104.0, 100.0, 105.0, 98.0, 106.0, 99.0,
+        ]);
+        let strategy = sma_spec(3);
+        let cfg = BacktestConfig::default();
+        let original = AgentSnapshot::warm_up(&strategy, &all[..7], &cfg, 10_000.0, limits())
+            .expect("warm up");
+        let mut old_json: serde_json::Value =
+            serde_json::from_str(&original.to_json().expect("serialize")).expect("json");
+        old_json["candles"] = serde_json::to_value(&all[..7]).expect("full old candle history");
+        old_json
+            .as_object_mut()
+            .expect("snapshot")
+            .remove("candle_offset");
+        let stored_strategy = old_json["strategy"].as_object_mut().expect("strategy");
+        stored_strategy.remove("indicators");
+        stored_strategy.remove("last_prepared_ts");
+
+        let mut restored = AgentSnapshot::from_json(&old_json.to_string()).expect("old snapshot");
+        let mut reference = original.clone();
+        reference.candles = all[..7].to_vec();
+        reference.candle_offset = 0;
+        let resumed = restored.advance(&all[7..]).expect("restore continuation");
+        let unpruned = reference
+            .advance_unpruned(&all[7..])
+            .expect("reference continuation");
+
+        assert_eq!(restored.trades(), reference.trades());
+        assert_eq!(resumed.events, unpruned.events);
+        assert_eq!(resumed.equity_points, unpruned.equity_points);
+        assert_eq!(restored.equity(), reference.equity());
+        assert!(restored.candles.len() <= 4);
     }
 
     #[test]
@@ -662,6 +1041,14 @@ mod tests {
         state.remove("risk");
         // Older snapshots stored the pending exit as a bare bool.
         state.insert("pending_exit".to_string(), serde_json::Value::Bool(true));
+        value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("candle_offset");
+        if let Some(strategy) = value.get_mut("strategy").and_then(|s| s.as_object_mut()) {
+            strategy.remove("indicators");
+            strategy.remove("last_prepared_ts");
+        }
 
         let loaded = AgentSnapshot::from_json(&value.to_string()).expect("old snapshot loads");
         assert_eq!(loaded.risk_state(), RiskState::default());

@@ -58,6 +58,7 @@ describe("WalkForwardPanel before the first run", () => {
     expect(html).toContain("No walk-forward run yet.");
     expect(html).toContain("Run walk-forward");
     expect(html).toContain("runs the optimizer once per window, so it can take a while");
+    expect(html).toContain("Cancel stops the walk-forward run on the engine.");
     expect(html).not.toContain("Cancel run");
   });
 });

@@ -39,6 +39,14 @@ pub struct Limits {
     pub backtest_timeout: Duration,
 }
 
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Limits {
     pub fn new(backtest_per_min: u32, optimize_per_min: u32, max_optimizer_jobs: usize) -> Self {
         Self {
@@ -167,6 +175,7 @@ pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -936,6 +945,8 @@ async fn post_walk_forward(
     };
     let bars_per_year = sim.bars_per_year;
     let timeout = limits.backtest_timeout;
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
     let computed = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || {
@@ -953,8 +964,14 @@ async fn post_walk_forward(
                     "no candles in range".to_string(),
                 ));
             }
-            crate::walk_forward::run(&req, &candles, &cfg, bars_per_year)
-                .map_err(|error| BacktestFailure::BadRequest(error.to_string()))
+            crate::walk_forward::run_cancellable(
+                &req,
+                &candles,
+                &cfg,
+                bars_per_year,
+                Some(&cancelled),
+            )
+            .map_err(|error| BacktestFailure::BadRequest(error.to_string()))
         }),
     )
     .await;
@@ -1097,12 +1114,20 @@ async fn post_optimize(
 
     let jobs = state.jobs.clone();
     let reply_id = job_id.clone();
-    tokio::task::spawn_blocking(move || {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let worker = tokio::task::spawn_blocking(move || {
         let cfg = crate::backtest::BacktestConfig {
             fee_bps,
             slippage_bps,
         };
-        match crate::optimizer::sweep(&req, &candles, &cfg, bars_per_year) {
+        match crate::optimizer::sweep_cancellable(
+            &req,
+            &candles,
+            &cfg,
+            bars_per_year,
+            Some(&cancelled),
+        ) {
             Ok(report) => jobs.update(&reply_id, |job| {
                 job.status = JobStatus::Completed;
                 job.completed_trials = report.total_trials;
@@ -1110,12 +1135,21 @@ async fn post_optimize(
                 job.results = Some(report.trials);
                 job.warnings = report.warnings;
             }),
-            Err(e) => jobs.update(&reply_id, |job| {
+            Err(crate::optimizer::OptimizerError::Cancelled) => {
+                jobs.update(&reply_id, |job| job.status = JobStatus::Cancelled)
+            }
+            Err(error) => jobs.update(&reply_id, |job| {
                 job.status = JobStatus::Failed;
-                job.error = Some(e.to_string());
+                job.error = Some(error.to_string());
             }),
         }
     });
+    if let Err(error) = worker.await {
+        state.jobs.update(&job_id, |job| {
+            job.status = JobStatus::Failed;
+            job.error = Some(error.to_string());
+        });
+    }
 
     (
         StatusCode::ACCEPTED,
@@ -1700,7 +1734,14 @@ async fn start_agent(
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
-    let equity_points = snapshot.equity_points();
+    let equity_points: Vec<crate::agent::EquityPoint> = candles
+        .iter()
+        .zip(snapshot.equity_curve())
+        .map(|(candle, &equity)| crate::agent::EquityPoint {
+            bar_ts: candle.ts,
+            equity,
+        })
+        .collect();
     if let Err(e) = state.db.start_agent_with_snapshot(
         &id,
         now_secs(),
@@ -1732,7 +1773,39 @@ async fn stop_agent(State(state): State<AppState>, Path(id): Path<String>) -> Re
             .into_response();
     }
     if status == crate::agent::AgentStatus::Running {
-        if let Err(e) = state.db.stop_agent(&id, now_secs()) {
+        let Some(text) = row.snapshot.as_deref() else {
+            return err_json(
+                StatusCode::CONFLICT,
+                format!("agent {id} has no snapshot; start it first"),
+            )
+            .into_response();
+        };
+        let mut snapshot = match crate::agent::AgentSnapshot::from_json(text) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        let stopped = snapshot.stop();
+        let snapshot_json = match snapshot.to_json() {
+            Ok(text) => text,
+            Err(e) => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        };
+        if let Err(e) = state
+            .db
+            .stop_agent_with_snapshot(crate::db::AgentStopWrite {
+                id: &id,
+                stopped_at: now_secs(),
+                equity: stopped.equity,
+                last_price: stopped.last_price,
+                last_ts: stopped.last_ts,
+                snapshot: &snapshot_json,
+                decisions: &stopped.events,
+                equity_points: &stopped.equity_points,
+            })
+        {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     }
@@ -2798,6 +2871,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn dropped_optimizer_request_cancels_work_and_releases_job_capacity() {
+        fn job(id: &str) -> Job {
+            Job {
+                job_id: id.to_string(),
+                status: JobStatus::Running,
+                total_trials: 4,
+                completed_trials: 0,
+                objective: "sharpe".to_string(),
+                validation: String::new(),
+                results: None,
+                warnings: Vec::new(),
+                error: None,
+            }
+        }
+
+        let fake = FakeSource::new();
+        let spec: crate::optimizer::OptimizeSpec =
+            serde_json::from_value(optimize_body(&fake, 4)).expect("optimizer request");
+        let cfg = crate::backtest::BacktestConfig::default();
+        let store = JobStore::default();
+        assert!(store.try_insert_running(1, job("cancelled")));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request_guard = CancelOnDrop(cancelled.clone());
+        drop(request_guard);
+
+        assert!(matches!(
+            crate::optimizer::sweep_cancellable(
+                &spec,
+                &fake.data,
+                &cfg,
+                8_760.0,
+                Some(cancelled.as_ref()),
+            ),
+            Err(crate::optimizer::OptimizerError::Cancelled)
+        ));
+        store.update("cancelled", |job| job.status = JobStatus::Cancelled);
+        assert!(store.try_insert_running(1, job("retry")));
+
+        let retried = crate::optimizer::sweep(&spec, &fake.data, &cfg, 8_760.0)
+            .expect("identical request runs after cancellation");
+        assert_eq!(retried.total_trials, 4);
+    }
+
     fn optimize_body(fake: &FakeSource, trials: usize) -> serde_json::Value {
         serde_json::json!({
             "strategy": valid_strategy(),
@@ -2868,6 +2985,73 @@ mod tests {
             let b = w[1]["score"].as_f64().unwrap();
             assert!(a >= b, "ranked table must be score-descending");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn disconnecting_optimizer_request_cancels_job_and_allows_same_retry() {
+        let dir = temp_dir("opt_disconnect");
+        let state = test_state(dir.clone());
+        let jobs = state.jobs.clone();
+        let router =
+            app_with_limits(state, DEFAULT_ORIGIN, Limits::new(30, 30, 1)).expect("router");
+        let fake = FakeSource::new();
+        let body = optimize_body(&fake, crate::optimizer::MAX_TRIALS).to_string();
+        let first_body = body.clone();
+
+        let pending = tokio::spawn({
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(
+                        Request::post("/optimize")
+                            .header("content-type", "application/json")
+                            .body(Body::from(first_body))
+                            .expect("request"),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while jobs.get("opt-1").is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("optimizer job admitted");
+        pending.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if jobs
+                    .get("opt-1")
+                    .is_some_and(|job| job.status == JobStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled worker should release its job slot");
+
+        let res = router
+            .oneshot(
+                Request::post("/optimize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("retry request"),
+            )
+            .await
+            .expect("retry response");
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let retried = body_json(res).await;
+        assert_eq!(retried["total_trials"], crate::optimizer::MAX_TRIALS);
+        let retry_id = retried["job_id"].as_str().expect("retry job id");
+        assert_eq!(
+            jobs.get(retry_id).expect("retried job").status,
+            JobStatus::Completed
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4056,6 +4240,117 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(body_json(res).await["agent"]["status"], "running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stopping_open_agent_flattens_once_and_replaces_the_last_equity_point() {
+        let dir = temp_dir("agent_stop_flatten");
+        let state = test_state(dir.clone());
+        let db = state.db.clone();
+        let router = app(state);
+        let fake = FakeSource::new();
+        let warm = &fake.data[..4];
+        let strategy: crate::strategy::Strategy =
+            serde_json::from_value(valid_strategy()).expect("valid strategy");
+        let risk = crate::risk::RiskLimits::default();
+        let snapshot = crate::agent::AgentSnapshot::warm_up(
+            &strategy,
+            warm,
+            &crate::backtest::BacktestConfig::default(),
+            10_000.0,
+            risk,
+        )
+        .expect("warm up");
+        assert!(
+            snapshot.position().is_some(),
+            "fixture must end in a position"
+        );
+        db.create_agent(
+            "agent-stop",
+            "Stop test",
+            &serde_json::to_value(&strategy).expect("strategy json"),
+            None,
+            10_000.0,
+            &risk,
+        )
+        .expect("create agent");
+        let json = snapshot.to_json().expect("snapshot json");
+        let initial_points: Vec<crate::agent::EquityPoint> = warm
+            .iter()
+            .zip(snapshot.equity_curve())
+            .map(|(candle, &equity)| crate::agent::EquityPoint {
+                bar_ts: candle.ts,
+                equity,
+            })
+            .collect();
+        assert!(db
+            .start_agent_with_snapshot(
+                "agent-stop",
+                1,
+                snapshot.equity(),
+                snapshot.last_price(),
+                snapshot.last_ts(),
+                &json,
+                &initial_points,
+            )
+            .expect("start"));
+
+        let res = router
+            .clone()
+            .oneshot(json_req("/agents/agent-stop/stop", &serde_json::json!({})))
+            .await
+            .expect("stop response");
+        assert_eq!(res.status(), StatusCode::OK);
+        let detail = body_json(res).await;
+        assert_eq!(detail["agent"]["status"], "stopped");
+        assert!(detail["position"].is_null());
+        assert_eq!(detail["trades"].as_array().expect("trades").len(), 1);
+        assert_eq!(detail["trades"][0]["reason"], "Stopped");
+
+        let decisions = db
+            .list_agent_decisions("agent-stop", 10, None)
+            .expect("decisions");
+        let stopped = decisions
+            .iter()
+            .find(|decision| decision.reason.as_deref() == Some("stopped"))
+            .expect("stopped exit decision");
+        assert_eq!(stopped.kind, "exit_filled");
+        assert_eq!(stopped.price, Some(warm[3].close));
+
+        let equity = db
+            .list_agent_equity("agent-stop", 10, None)
+            .expect("equity history");
+        let final_point = equity
+            .iter()
+            .find(|point| point.bar_ts == warm[3].ts)
+            .expect("last equity point");
+        assert_eq!(
+            final_point.equity,
+            detail["agent"]["equity"].as_f64().unwrap()
+        );
+
+        let stopped_at = db
+            .get_agent("agent-stop")
+            .expect("get")
+            .expect("agent")
+            .summary
+            .stopped_at;
+        let res = router
+            .oneshot(json_req("/agents/agent-stop/stop", &serde_json::json!({})))
+            .await
+            .expect("repeat stop response");
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = body_json(res).await;
+        let row = db.get_agent("agent-stop").expect("get").expect("agent");
+        assert_eq!(row.summary.stopped_at, stopped_at);
+        assert_eq!(row.summary.equity, final_point.equity);
+        assert_eq!(
+            db.list_agent_decisions("agent-stop", 10, None)
+                .expect("decisions after repeat")
+                .len(),
+            decisions.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -20,6 +21,8 @@ pub enum OptimizerError {
     Backtest(#[from] crate::backtest::BacktestError),
     #[error(transparent)]
     Stats(#[from] crate::stats::StatsError),
+    #[error("optimization cancelled")]
+    Cancelled,
 }
 
 impl From<String> for OptimizerError {
@@ -795,6 +798,7 @@ struct WindowCandidate {
 
 /// Pick parameters using only the active IS range; earlier candles are passed
 /// to the shared simulator only as indicator warm-up.
+#[cfg(test)]
 pub(crate) fn optimize_window(
     spec: &OptimizeSpec,
     candles: &[Candle],
@@ -802,6 +806,41 @@ pub(crate) fn optimize_window(
     bars_per_year: f64,
     is_start: usize,
     is_end: usize,
+) -> Result<WindowOptimization, OptimizerError> {
+    optimize_window_cancellable(spec, candles, cfg, bars_per_year, is_start, is_end, None)
+}
+
+pub(crate) fn optimize_window_cancellable(
+    spec: &OptimizeSpec,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    is_start: usize,
+    is_end: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<WindowOptimization, OptimizerError> {
+    optimize_window_cancellable_with_hook(
+        spec,
+        candles,
+        cfg,
+        bars_per_year,
+        is_start,
+        is_end,
+        cancelled,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_window_cancellable_with_hook(
+    spec: &OptimizeSpec,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    is_start: usize,
+    is_end: usize,
+    cancelled: Option<&AtomicBool>,
+    on_trial_start: Option<&(dyn Fn() + Sync)>,
 ) -> Result<WindowOptimization, OptimizerError> {
     if is_start >= is_end || is_end > candles.len() {
         return Err(OptimizerError::Msg(format!(
@@ -821,6 +860,15 @@ pub(crate) fn optimize_window(
     let evaluated: Vec<Result<WindowCandidate, OptimizerError>> = combos
         .par_iter()
         .map(|combo| {
+            if cancellation_requested(cancelled) {
+                return Err(OptimizerError::Cancelled);
+            }
+            if let Some(on_trial_start) = on_trial_start {
+                on_trial_start();
+            }
+            if cancellation_requested(cancelled) {
+                return Err(OptimizerError::Cancelled);
+            }
             let mut strategy = spec.strategy.clone();
             apply_params(&mut strategy, &targets, combo)?;
             let result = crate::backtest::backtest_strategy_window(
@@ -841,6 +889,9 @@ pub(crate) fn optimize_window(
         })
         .collect();
     let mut evaluated: Vec<WindowCandidate> = evaluated.into_iter().collect::<Result<_, _>>()?;
+    if cancellation_requested(cancelled) {
+        return Err(OptimizerError::Cancelled);
+    }
     evaluated.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -1043,11 +1094,22 @@ fn resolve_validation(
     Ok((ResolvedValidation::Split { idx }, format!("split({split})")))
 }
 
+#[cfg(test)]
 pub fn sweep(
     spec: &OptimizeSpec,
     candles: &[Candle],
     cfg: &BacktestConfig,
     bars_per_year: f64,
+) -> Result<SweepReport, OptimizerError> {
+    sweep_cancellable(spec, candles, cfg, bars_per_year, None)
+}
+
+pub(crate) fn sweep_cancellable(
+    spec: &OptimizeSpec,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<SweepReport, OptimizerError> {
     if candles.is_empty() {
         return Err(OptimizerError::Msg("no candles in range".to_string()));
@@ -1071,9 +1133,18 @@ pub fn sweep(
     };
     let evaluated: Vec<Result<Evaluated, OptimizerError>> = combos
         .par_iter()
-        .map(|combo| evaluate_combo(&spec.strategy, &ctx, combo))
+        .map(|combo| {
+            if cancellation_requested(cancelled) {
+                Err(OptimizerError::Cancelled)
+            } else {
+                evaluate_combo(&spec.strategy, &ctx, combo)
+            }
+        })
         .collect();
     let mut evaluated: Vec<Evaluated> = evaluated.into_iter().collect::<Result<_, _>>()?;
+    if cancellation_requested(cancelled) {
+        return Err(OptimizerError::Cancelled);
+    }
 
     // Stable sort keeps sweep deterministic.
     evaluated.sort_by(|a, b| {
@@ -1126,6 +1197,10 @@ pub fn sweep(
         trials,
         warnings,
     })
+}
+
+fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -1325,6 +1400,32 @@ mod tests {
         for t in &report.trials {
             assert!(t.in_sample.trades + t.out_of_sample.trades >= t.in_sample.trades);
         }
+    }
+
+    #[test]
+    fn cancelled_sweep_drops_results_and_identical_retry_completes() {
+        let candles = wave_candles(120);
+        let mut spec = base_spec();
+        spec.params = vec![param(
+            "entry.all.0.right",
+            ParamKind::Float,
+            vec![20.0, 25.0, 30.0, 35.0],
+        )];
+        let cfg = BacktestConfig::default();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(matches!(
+            sweep_cancellable(&spec, &candles, &cfg, 8_760.0, Some(&cancelled)),
+            Err(OptimizerError::Cancelled)
+        ));
+
+        let retried = sweep(&spec, &candles, &cfg, 8_760.0).expect("retry");
+        let expected = sweep(&spec, &candles, &cfg, 8_760.0).expect("deterministic run");
+        assert_eq!(retried.total_trials, 4);
+        assert_eq!(
+            serde_json::to_value(retried).expect("retry json"),
+            serde_json::to_value(expected).expect("expected json")
+        );
     }
 
     #[test]

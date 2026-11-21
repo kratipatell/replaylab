@@ -201,6 +201,8 @@ use crate::types::Candle;
 pub trait BarStrategy {
     fn on_bar(&mut self, idx: usize, candles: &[Candle]) -> Option<Side>;
 
+    fn on_step(&mut self, _idx: usize, _candles: &[Candle]) {}
+
     fn exit_on_bar(&mut self, _idx: usize, _candles: &[Candle]) -> bool {
         false
     }
@@ -331,6 +333,122 @@ pub struct RulesStrategy {
     exit: Option<Rules>,
     armed: bool,
     was_open: bool,
+    #[serde(default)]
+    indicators: Vec<IndicatorProgress>,
+    #[serde(default)]
+    last_prepared_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndicatorProgress {
+    ind: IndicatorKind,
+    period: usize,
+    seen: usize,
+    last_ts: Option<i64>,
+    previous_close: Option<f64>,
+    previous_value: Option<f64>,
+    value: Option<f64>,
+    sum: f64,
+    window: std::collections::VecDeque<f64>,
+    seed_sum: f64,
+    delta_count: usize,
+    average_gain: f64,
+    average_loss: f64,
+}
+
+impl IndicatorProgress {
+    fn new(ind: IndicatorKind, period: usize) -> Self {
+        Self {
+            ind,
+            period,
+            seen: 0,
+            last_ts: None,
+            previous_close: None,
+            previous_value: None,
+            value: None,
+            sum: 0.0,
+            window: std::collections::VecDeque::new(),
+            seed_sum: 0.0,
+            delta_count: 0,
+            average_gain: 0.0,
+            average_loss: 0.0,
+        }
+    }
+
+    fn advance(&mut self, candle: &Candle) {
+        if self.last_ts == Some(candle.ts) {
+            return;
+        }
+        self.previous_value = self.value;
+        match self.ind {
+            IndicatorKind::Sma => {
+                self.window.push_back(candle.close);
+                self.sum += candle.close;
+                if self.window.len() > self.period {
+                    if let Some(oldest) = self.window.pop_front() {
+                        self.sum -= oldest;
+                    }
+                }
+                self.value =
+                    (self.window.len() == self.period).then_some(self.sum / self.period as f64);
+            }
+            IndicatorKind::Ema => {
+                if self.seen < self.period {
+                    self.seed_sum += candle.close;
+                    if self.seen + 1 == self.period {
+                        self.value = Some(self.seed_sum / self.period as f64);
+                    }
+                } else if let Some(previous) = self.value {
+                    let alpha = 2.0 / (self.period as f64 + 1.0);
+                    self.value = Some(candle.close * alpha + previous * (1.0 - alpha));
+                }
+            }
+            IndicatorKind::Rsi => {
+                if let Some(previous) = self.previous_close {
+                    let delta = candle.close - previous;
+                    let gain = delta.max(0.0);
+                    let loss = (-delta).max(0.0);
+                    if self.delta_count < self.period {
+                        self.average_gain += gain;
+                        self.average_loss += loss;
+                        self.delta_count += 1;
+                        if self.delta_count == self.period {
+                            self.average_gain /= self.period as f64;
+                            self.average_loss /= self.period as f64;
+                            self.value =
+                                Some(rsi_from_averages(self.average_gain, self.average_loss));
+                        }
+                    } else {
+                        self.average_gain = (self.average_gain * (self.period as f64 - 1.0) + gain)
+                            / self.period as f64;
+                        self.average_loss = (self.average_loss * (self.period as f64 - 1.0) + loss)
+                            / self.period as f64;
+                        self.value = Some(rsi_from_averages(self.average_gain, self.average_loss));
+                    }
+                }
+                self.previous_close = Some(candle.close);
+            }
+            IndicatorKind::Open
+            | IndicatorKind::High
+            | IndicatorKind::Low
+            | IndicatorKind::Close => {}
+        }
+        self.seen += 1;
+        self.last_ts = Some(candle.ts);
+    }
+}
+
+fn rsi_from_averages(average_gain: f64, average_loss: f64) -> f64 {
+    if average_loss == 0.0 {
+        if average_gain == 0.0 {
+            50.0
+        } else {
+            100.0
+        }
+    } else {
+        let relative_strength = average_gain / average_loss;
+        100.0 - 100.0 / (1.0 + relative_strength)
+    }
 }
 
 impl RulesStrategy {
@@ -341,102 +459,159 @@ impl RulesStrategy {
             exit: spec.exit.clone(),
             armed: true,
             was_open: false,
+            indicators: indicator_refs(&spec.entry, spec.exit.as_ref())
+                .into_iter()
+                .filter_map(|reference| match (reference.ind, reference.period) {
+                    (
+                        IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi,
+                        Some(period),
+                    ) => Some(IndicatorProgress::new(reference.ind, period)),
+                    _ => None,
+                })
+                .collect(),
+            last_prepared_ts: None,
         }
     }
 
-    fn closes_prefix(candles: &[crate::types::Candle], idx: usize) -> Vec<f64> {
-        let mut out = Vec::with_capacity(idx + 1);
-        let mut i = 0;
-        while i <= idx {
-            match candles.get(i) {
-                Some(c) => out.push(c.close),
-                None => break,
+    pub fn maximum_lookback(&self) -> usize {
+        self.indicators
+            .iter()
+            .map(|indicator| indicator.period)
+            .max()
+            .unwrap_or(1)
+    }
+
+    pub fn prime_indicators(&mut self, candles: &[Candle]) {
+        self.indicators = indicator_refs(&self.entry, self.exit.as_ref())
+            .into_iter()
+            .filter_map(|reference| match (reference.ind, reference.period) {
+                (IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi, Some(period)) => {
+                    Some(IndicatorProgress::new(reference.ind, period))
+                }
+                _ => None,
+            })
+            .collect();
+        self.last_prepared_ts = None;
+        for candle in candles {
+            self.prepare(candle);
+        }
+    }
+
+    pub fn prime_indicators_if_missing(&mut self, candles: &[Candle]) {
+        if self.indicators.is_empty() && !indicator_refs(&self.entry, self.exit.as_ref()).is_empty()
+        {
+            self.prime_indicators(candles);
+        }
+    }
+
+    fn prepare(&mut self, candle: &Candle) {
+        if self.last_prepared_ts == Some(candle.ts) {
+            return;
+        }
+        for indicator in &mut self.indicators {
+            indicator.advance(candle);
+        }
+        self.last_prepared_ts = Some(candle.ts);
+    }
+
+    fn prepare_if_needed(&mut self, idx: usize, candles: &[Candle]) {
+        if let Some(candle) = candles.get(idx) {
+            self.prepare(candle);
+        }
+    }
+
+    fn entry_true(&self, idx: usize, candles: &[Candle]) -> bool {
+        eval_rules_cached(&self.entry, idx, candles, &self.indicators)
+    }
+
+    fn exit_true(&self, idx: usize, candles: &[Candle]) -> bool {
+        self.exit
+            .as_ref()
+            .is_some_and(|rules| eval_rules_cached(rules, idx, candles, &self.indicators))
+    }
+}
+
+fn indicator_refs(entry: &Rules, exit: Option<&Rules>) -> Vec<IndicatorRef> {
+    let mut refs = Vec::new();
+    for rules in std::iter::once(entry).chain(exit) {
+        for condition in rules.all.iter().chain(&rules.any) {
+            for operand in [condition.left, condition.right] {
+                if let Operand::Indicator(reference) = operand {
+                    if matches!(
+                        reference.ind,
+                        IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi
+                    ) && !refs.contains(&reference)
+                    {
+                        refs.push(reference);
+                    }
+                }
             }
-            i += 1;
         }
-        out
     }
-
-    fn entry_true(&self, idx: usize, candles: &[crate::types::Candle]) -> bool {
-        if idx >= candles.len() {
-            return false;
-        }
-        let closes = Self::closes_prefix(candles, idx);
-        rules_eval_rules(&self.entry, idx, candles, &closes)
-    }
-
-    fn exit_true(&self, idx: usize, candles: &[crate::types::Candle]) -> bool {
-        let rules = match &self.exit {
-            Some(r) => r,
-            None => return false,
-        };
-        if idx >= candles.len() {
-            return false;
-        }
-        let closes = Self::closes_prefix(candles, idx);
-        rules_eval_rules(rules, idx, candles, &closes)
-    }
+    refs
 }
 
-fn rules_series(ind: IndicatorKind, period: Option<usize>, closes: &[f64]) -> Vec<f64> {
-    let p = match period {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    match ind {
-        IndicatorKind::Sma => crate::indicators::sma(closes, p),
-        IndicatorKind::Ema => crate::indicators::ema(closes, p),
-        IndicatorKind::Rsi => crate::indicators::rsi(closes, p),
-        IndicatorKind::Open | IndicatorKind::High | IndicatorKind::Low | IndicatorKind::Close => {
-            Vec::new()
-        }
-    }
-}
-
-fn rules_operand(
+fn cached_operand(
     op: &Operand,
     idx: usize,
-    candles: &[crate::types::Candle],
-    closes: &[f64],
+    previous: bool,
+    candles: &[Candle],
+    indicators: &[IndicatorProgress],
 ) -> f64 {
+    let bar_idx = if previous {
+        match idx.checked_sub(1) {
+            Some(i) => i,
+            None => return f64::NAN,
+        }
+    } else {
+        idx
+    };
     match op {
         Operand::Number(v) => *v,
         Operand::Indicator(r) => match r.ind {
             IndicatorKind::Open => match candles.get(idx) {
-                Some(c) => c.open,
+                Some(c) if !previous => c.open,
+                Some(_) => candles[bar_idx].open,
                 None => f64::NAN,
             },
             IndicatorKind::High => match candles.get(idx) {
-                Some(c) => c.high,
+                Some(c) if !previous => c.high,
+                Some(_) => candles[bar_idx].high,
                 None => f64::NAN,
             },
             IndicatorKind::Low => match candles.get(idx) {
-                Some(c) => c.low,
+                Some(c) if !previous => c.low,
+                Some(_) => candles[bar_idx].low,
                 None => f64::NAN,
             },
             IndicatorKind::Close => match candles.get(idx) {
-                Some(c) => c.close,
+                Some(c) if !previous => c.close,
+                Some(_) => candles[bar_idx].close,
                 None => f64::NAN,
             },
-            IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi => {
-                let s = rules_series(r.ind, r.period, closes);
-                match s.get(idx) {
-                    Some(v) => *v,
-                    None => f64::NAN,
-                }
-            }
+            IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi => indicators
+                .iter()
+                .find(|state| state.ind == r.ind && Some(state.period) == r.period)
+                .and_then(|state| {
+                    if previous {
+                        state.previous_value
+                    } else {
+                        state.value
+                    }
+                })
+                .unwrap_or(f64::NAN),
         },
     }
 }
 
-fn rules_eval_condition(
+fn eval_condition_cached(
     c: &Condition,
     idx: usize,
-    candles: &[crate::types::Candle],
-    closes: &[f64],
+    candles: &[Candle],
+    indicators: &[IndicatorProgress],
 ) -> bool {
-    let l = rules_operand(&c.left, idx, candles, closes);
-    let r = rules_operand(&c.right, idx, candles, closes);
+    let l = cached_operand(&c.left, idx, false, candles, indicators);
+    let r = cached_operand(&c.right, idx, false, candles, indicators);
     if l.is_nan() || r.is_nan() {
         return false;
     }
@@ -444,22 +619,16 @@ fn rules_eval_condition(
         Op::Lt => l < r,
         Op::Gt => l > r,
         Op::CrossesAbove => {
-            if idx == 0 {
-                return false;
-            }
-            let lp = rules_operand(&c.left, idx - 1, candles, closes);
-            let rp = rules_operand(&c.right, idx - 1, candles, closes);
+            let lp = cached_operand(&c.left, idx, true, candles, indicators);
+            let rp = cached_operand(&c.right, idx, true, candles, indicators);
             if lp.is_nan() || rp.is_nan() {
                 return false;
             }
             lp <= rp && l > r
         }
         Op::CrossesBelow => {
-            if idx == 0 {
-                return false;
-            }
-            let lp = rules_operand(&c.left, idx - 1, candles, closes);
-            let rp = rules_operand(&c.right, idx - 1, candles, closes);
+            let lp = cached_operand(&c.left, idx, true, candles, indicators);
+            let rp = cached_operand(&c.right, idx, true, candles, indicators);
             if lp.is_nan() || rp.is_nan() {
                 return false;
             }
@@ -468,17 +637,20 @@ fn rules_eval_condition(
     }
 }
 
-fn rules_eval_rules(
+fn eval_rules_cached(
     rules: &Rules,
     idx: usize,
-    candles: &[crate::types::Candle],
-    closes: &[f64],
+    candles: &[Candle],
+    indicators: &[IndicatorProgress],
 ) -> bool {
+    if idx >= candles.len() {
+        return false;
+    }
     if rules.all.is_empty() && rules.any.is_empty() {
         return false;
     }
     for c in &rules.all {
-        if !rules_eval_condition(c, idx, candles, closes) {
+        if !eval_condition_cached(c, idx, candles, indicators) {
             return false;
         }
     }
@@ -486,7 +658,7 @@ fn rules_eval_rules(
         return true;
     }
     for c in &rules.any {
-        if rules_eval_condition(c, idx, candles, closes) {
+        if eval_condition_cached(c, idx, candles, indicators) {
             return true;
         }
     }
@@ -498,6 +670,7 @@ impl BarStrategy for RulesStrategy {
         if idx >= candles.len() {
             return None;
         }
+        self.prepare_if_needed(idx, candles);
         let e = self.entry_true(idx, candles);
         if self.was_open {
             self.was_open = false;
@@ -519,6 +692,7 @@ impl BarStrategy for RulesStrategy {
         if idx >= candles.len() {
             return false;
         }
+        self.prepare_if_needed(idx, candles);
         self.was_open = true;
         if !self.entry_true(idx, candles) {
             self.armed = true;
@@ -528,6 +702,10 @@ impl BarStrategy for RulesStrategy {
 
     fn on_fill(&mut self, _idx: usize) {
         self.was_open = true;
+    }
+
+    fn on_step(&mut self, idx: usize, candles: &[Candle]) {
+        self.prepare_if_needed(idx, candles);
     }
 }
 

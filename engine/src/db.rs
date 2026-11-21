@@ -68,6 +68,17 @@ pub struct AgentAdvanceWrite<'a> {
     pub equity_points: &'a [crate::agent::EquityPoint],
 }
 
+pub struct AgentStopWrite<'a> {
+    pub id: &'a str,
+    pub stopped_at: i64,
+    pub equity: f64,
+    pub last_price: f64,
+    pub last_ts: i64,
+    pub snapshot: &'a str,
+    pub decisions: &'a [DecisionEvent],
+    pub equity_points: &'a [crate::agent::EquityPoint],
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSummary {
     pub id: i64,
@@ -229,6 +240,50 @@ fn insert_agent_equity(
     for point in &points[start..] {
         insert.execute(params![id, point.bar_ts, point.equity])?;
     }
+    Ok(())
+}
+
+fn replace_agent_equity(
+    tx: &Transaction<'_>,
+    id: &str,
+    points: &[crate::agent::EquityPoint],
+) -> rusqlite::Result<()> {
+    for point in points {
+        tx.execute(
+            "INSERT INTO agent_equity (agent_id, bar_ts, equity)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, bar_ts) DO UPDATE SET equity = excluded.equity",
+            params![id, point.bar_ts, point.equity],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_agent_decision(
+    tx: &Transaction<'_>,
+    id: &str,
+    decision: &DecisionEvent,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO agent_decisions
+         (agent_id, bar_ts, kind, seq, reason, price, qty,
+          requested_qty, configured, observed, equity)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            decision.bar_ts,
+            decision.kind,
+            seq,
+            decision.reason,
+            decision.price,
+            decision.qty,
+            decision.requested_qty,
+            decision.configured,
+            decision.observed,
+            decision.equity,
+        ],
+    )?;
     Ok(())
 }
 
@@ -582,6 +637,7 @@ impl Db {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn stop_agent(&self, id: &str, stopped_at: i64) -> Result<bool, DbError> {
         let conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
         conn.execute(
@@ -590,6 +646,51 @@ impl Db {
         )
         .map(|n| n > 0)
         .map_err(|e| DbError::UpdateAgent(e.to_string()))
+    }
+
+    pub fn stop_agent_with_snapshot(&self, stop: AgentStopWrite<'_>) -> Result<bool, DbError> {
+        let mut conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        let updated = tx
+            .execute(
+                "UPDATE agents
+                 SET status = 'stopped', stopped_at = ?2, equity = ?3,
+                     last_price = ?4, last_ts = ?5, snapshot = ?6
+                 WHERE id = ?1 AND status = 'running'",
+                params![
+                    stop.id,
+                    stop.stopped_at,
+                    stop.equity,
+                    stop.last_price,
+                    stop.last_ts,
+                    stop.snapshot
+                ],
+            )
+            .map_err(|e| DbError::UpdateAgent(e.to_string()))?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        for decision in stop.decisions {
+            let previous_seq: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), -1) FROM agent_decisions
+                     WHERE agent_id = ?1 AND bar_ts = ?2",
+                    params![stop.id, decision.bar_ts],
+                    |row| row.get(0),
+                )
+                .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+            insert_agent_decision(&tx, stop.id, decision, previous_seq + 1)
+                .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        }
+        replace_agent_equity(&tx, stop.id, stop.equity_points)
+            .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        trim_agent_decisions(&tx, stop.id).map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        trim_agent_equity(&tx, stop.id).map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -638,32 +739,9 @@ impl Db {
         if updated == 0 {
             return Ok(false);
         }
-        {
-            let mut insert = tx
-                .prepare(
-                    "INSERT OR IGNORE INTO agent_decisions
-                     (agent_id, bar_ts, kind, seq, reason, price, qty,
-                      requested_qty, configured, observed, equity)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                )
+        for decision in advance.decisions {
+            insert_agent_decision(&tx, advance.id, decision, decision.seq)
                 .map_err(|e| DbError::AgentHistory(e.to_string()))?;
-            for decision in advance.decisions {
-                insert
-                    .execute(params![
-                        advance.id,
-                        decision.bar_ts,
-                        decision.kind,
-                        decision.seq,
-                        decision.reason,
-                        decision.price,
-                        decision.qty,
-                        decision.requested_qty,
-                        decision.configured,
-                        decision.observed,
-                        decision.equity,
-                    ])
-                    .map_err(|e| DbError::AgentHistory(e.to_string()))?;
-            }
         }
         insert_agent_equity(&tx, advance.id, advance.equity_points)
             .map_err(|e| DbError::AgentHistory(e.to_string()))?;
@@ -1011,6 +1089,75 @@ mod tests {
             .expect("decision count");
         let equity_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent_equity", [], |r| r.get(0))
+            .expect("equity count");
+        assert_eq!(decision_count, 0);
+        assert_eq!(equity_count, 0);
+    }
+
+    #[test]
+    fn stopping_agent_rolls_back_snapshot_status_and_exit_history_together() {
+        let db = Db::open_in_memory().expect("mem db");
+        db.create_agent(
+            "ag",
+            "Paper",
+            &strategy_json(),
+            None,
+            10_000.0,
+            &RiskLimits::default(),
+        )
+        .expect("create");
+        assert!(db
+            .start_agent_with_snapshot("ag", 1, 10_000.0, 100.0, 10, "before", &[])
+            .expect("start"));
+        {
+            let conn = db.conn.lock().expect("lock");
+            conn.execute_batch(
+                "CREATE TRIGGER reject_stop_equity BEFORE INSERT ON agent_equity
+                 BEGIN SELECT RAISE(ABORT, 'forced stop history failure'); END",
+            )
+            .expect("trigger");
+        }
+        let decision = DecisionEvent {
+            bar_ts: 10,
+            kind: "exit_filled".to_string(),
+            seq: 0,
+            reason: Some("stopped".to_string()),
+            price: Some(101.0),
+            qty: Some(1.0),
+            requested_qty: None,
+            configured: None,
+            observed: None,
+            equity: 9_999.0,
+        };
+        let point = crate::agent::EquityPoint {
+            bar_ts: 10,
+            equity: 9_999.0,
+        };
+
+        assert!(db
+            .stop_agent_with_snapshot(AgentStopWrite {
+                id: "ag",
+                stopped_at: 20,
+                equity: 9_999.0,
+                last_price: 101.0,
+                last_ts: 10,
+                snapshot: "after",
+                decisions: &[decision],
+                equity_points: &[point],
+            })
+            .is_err());
+
+        let row = db.get_agent("ag").expect("get").expect("exists");
+        assert_eq!(row.summary.status, "running");
+        assert_eq!(row.summary.stopped_at, None);
+        assert_eq!(row.summary.equity, 10_000.0);
+        assert_eq!(row.snapshot.as_deref(), Some("before"));
+        let conn = db.conn.lock().expect("lock");
+        let decision_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_decisions", [], |row| row.get(0))
+            .expect("decision count");
+        let equity_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_equity", [], |row| row.get(0))
             .expect("equity count");
         assert_eq!(decision_count, 0);
         assert_eq!(equity_count, 0);

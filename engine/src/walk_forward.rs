@@ -8,6 +8,7 @@ use crate::stats::{self, Stats};
 use crate::strategy::Strategy;
 use crate::types::Candle;
 use crate::verdict::{self, Grade, Verdict};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Resource and verdict gates: at most 10 windows and 2,000 total parameter
 // evaluations; Holds requires >=60% profitable OOS windows, >=60% modal
@@ -65,6 +66,8 @@ pub enum WalkForwardError {
     Optimizer(#[from] optimizer::OptimizerError),
     #[error(transparent)]
     Backtest(#[from] crate::backtest::BacktestError),
+    #[error("walk-forward cancelled")]
+    Cancelled,
     #[error(transparent)]
     Stats(#[from] crate::stats::StatsError),
 }
@@ -379,13 +382,38 @@ fn walk_forward_verdict(
     base
 }
 
+#[cfg(test)]
 pub fn run(
     request: &WalkForwardRequest,
     candles: &[Candle],
     cfg: &BacktestConfig,
     bars_per_year: f64,
 ) -> Result<WalkForwardReport, WalkForwardError> {
+    run_cancellable(request, candles, cfg, bars_per_year, None)
+}
+
+pub(crate) fn run_cancellable(
+    request: &WalkForwardRequest,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<WalkForwardReport, WalkForwardError> {
+    run_cancellable_with_hook(request, candles, cfg, bars_per_year, cancelled, None)
+}
+
+fn run_cancellable_with_hook(
+    request: &WalkForwardRequest,
+    candles: &[Candle],
+    cfg: &BacktestConfig,
+    bars_per_year: f64,
+    cancelled: Option<&AtomicBool>,
+    on_trial_start: Option<&(dyn Fn() + Sync)>,
+) -> Result<WalkForwardReport, WalkForwardError> {
     validate_request(request)?;
+    if cancellation_requested(cancelled) {
+        return Err(WalkForwardError::Cancelled);
+    }
     if candles.is_empty() {
         return Err(WalkForwardError::Invalid("no candles in range".to_string()));
     }
@@ -406,14 +434,37 @@ pub fn run(
     let mut total_optimizer_evaluations = 0;
 
     for (index, bounds) in boundaries.iter().enumerate() {
-        let optimized = optimizer::optimize_window(
-            &optimizer_spec,
-            &candles[..bounds.is_end],
-            cfg,
-            bars_per_year,
-            bounds.is_start,
-            bounds.is_end,
-        )?;
+        if cancellation_requested(cancelled) {
+            return Err(WalkForwardError::Cancelled);
+        }
+        let evaluated = match on_trial_start {
+            Some(on_trial_start) => optimizer::optimize_window_cancellable_with_hook(
+                &optimizer_spec,
+                &candles[..bounds.is_end],
+                cfg,
+                bars_per_year,
+                bounds.is_start,
+                bounds.is_end,
+                cancelled,
+                Some(on_trial_start),
+            ),
+            None => optimizer::optimize_window_cancellable(
+                &optimizer_spec,
+                &candles[..bounds.is_end],
+                cfg,
+                bars_per_year,
+                bounds.is_start,
+                bounds.is_end,
+                cancelled,
+            ),
+        };
+        let optimized = match evaluated {
+            Ok(optimized) => optimized,
+            Err(optimizer::OptimizerError::Cancelled) => {
+                return Err(WalkForwardError::Cancelled);
+            }
+            Err(error) => return Err(error.into()),
+        };
         total_optimizer_evaluations += optimized.trials;
         let oos_result = crate::backtest::backtest_strategy_window(
             &optimized.strategy,
@@ -474,6 +525,10 @@ pub fn run(
         starting_equity = ending_equity;
     }
 
+    if cancellation_requested(cancelled) {
+        return Err(WalkForwardError::Cancelled);
+    }
+
     let first_equity = equity_curve
         .first()
         .map(|point| point.equity)
@@ -531,6 +586,10 @@ pub fn run(
         stability_measure: "Per parameter, the share of windows selecting its modal exact value; lower shares indicate more parameter movement.",
         verdict,
     })
+}
+
+fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -902,5 +961,39 @@ mod tests {
         let first = run(&request, &candles, &cfg(), 8_760.0).expect("first run");
         let second = run(&request, &candles, &cfg(), 8_760.0).expect("second run");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cancellation_drops_walk_forward_result_and_retry_is_unchanged() {
+        let mut request = request(WalkForwardMode::Rolling, 2, 60, 30);
+        request.params[0].values = Some((0..128).map(|idx| 90.0 + idx as f64 * 0.25).collect());
+        let candles = candles(180);
+        let cancelled = AtomicBool::new(false);
+        let started_trials = std::sync::atomic::AtomicUsize::new(0);
+        let on_trial_start = || {
+            if started_trials.fetch_add(1, Ordering::Relaxed) == 0 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        };
+        assert!(matches!(
+            run_cancellable_with_hook(
+                &request,
+                &candles,
+                &cfg(),
+                8_760.0,
+                Some(&cancelled),
+                Some(&on_trial_start),
+            ),
+            Err(WalkForwardError::Cancelled)
+        ));
+        assert!(started_trials.load(Ordering::Relaxed) > 0);
+        assert!(
+            started_trials.load(Ordering::Relaxed) < 128,
+            "the inner search should stop before all trials start"
+        );
+
+        let retry = run(&request, &candles, &cfg(), 8_760.0).expect("retry");
+        let expected = run(&request, &candles, &cfg(), 8_760.0).expect("deterministic run");
+        assert_eq!(retry, expected);
     }
 }
