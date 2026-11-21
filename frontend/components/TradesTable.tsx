@@ -19,6 +19,7 @@ const EXIT_REASONS: ExitReason[] = [
   "SessionEnd",
   "EndOfData",
   "RiskHalt",
+  "Stopped",
 ];
 
 const PAGE = 50;

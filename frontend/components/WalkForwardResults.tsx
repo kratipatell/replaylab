@@ -16,11 +16,13 @@ import {
 import {
   MAX_CHART_POINTS,
   downsample,
+  downsampleNullable,
   fmtDate,
   fmtPct,
   plural,
 } from "@/lib/testlab";
-import { LineChart } from "./EquityCharts";
+import { LineChart, MonthlyTable } from "./EquityCharts";
+import StatsTable from "./StatsTable";
 import VerdictCard from "./VerdictCard";
 
 const cellClass = "border border-[var(--border)] p-2 align-top";
@@ -53,6 +55,10 @@ export default function WalkForwardResults({
   onUseLongRange: () => void;
 }) {
   const curve = report.stitched_oos_equity_curve;
+  const underwater = downsampleNullable(
+    report.analytics.underwater_curve.map((point) => point.drawdown_pct),
+    MAX_CHART_POINTS,
+  );
   const efficiency = formatEfficiency(report.efficiency_ratio);
   const objective =
     WF_OBJECTIVES.find((o) => o.value === report.objective)?.label ?? report.objective;
@@ -80,6 +86,32 @@ export default function WalkForwardResults({
           note="Largest drop from a peak in the chained out-of-sample equity."
         />
         <StatCard
+          label="Longest drawdown"
+          value={
+            report.analytics.longest_drawdown_duration_bars === null
+              ? "n/a"
+              : `${report.analytics.longest_drawdown_duration_bars} bars`
+          }
+          note={
+            report.analytics.longest_drawdown_duration_bars === null
+              ? "n/a because no positive equity peak was available."
+              : "Longest stretch from a peak until recovery, or the latest OOS bar."
+          }
+        />
+        <StatCard
+          label="Recovery from deepest drawdown"
+          value={
+            report.analytics.time_to_recover_max_drawdown_bars === null
+              ? "Not recovered / n/a"
+              : `${report.analytics.time_to_recover_max_drawdown_bars} bars`
+          }
+          note={
+            report.analytics.time_to_recover_max_drawdown_bars === null
+              ? "n/a means no positive baseline or the deepest drawdown remains open."
+              : "Bars from the deepest trough back to its prior peak."
+          }
+        />
+        <StatCard
           label="Profitable out-of-sample windows"
           value={`${report.profitable_oos_windows} of ${report.window_count}`}
           note={`${fmtPct(report.profitable_oos_share_pct, 0)} of windows made money. 60% or more is needed for holds.`}
@@ -104,6 +136,14 @@ export default function WalkForwardResults({
         />
       </div>
 
+      <StatsTable
+        full={report.out_of_sample_stats}
+        inSample={null}
+        outOfSample={null}
+        fullLabel="Stitched OOS"
+        hideBuyAndHold
+      />
+
       <LineChart
         title="Out-of-sample account value"
         sub="Every out-of-sample window in order, each starting where the last one ended. Dotted lines mark where each window starts."
@@ -118,6 +158,22 @@ export default function WalkForwardResults({
         fill={false}
         markers={windowMarkers(curve, report.windows)}
       />
+
+      <LineChart
+        title="Stitched OOS underwater curve"
+        sub="Drawdown at each stitched out-of-sample bar; null values have no positive high-water mark."
+        yLabel="percent below peak"
+        points={underwater}
+        total={report.analytics.underwater_curve.length}
+        split={null}
+        splitMs={null}
+        startMs={curve[0]?.bar_ts ?? null}
+        endMs={curve[curve.length - 1]?.bar_ts ?? null}
+        color="var(--verdict-fails)"
+        fill={true}
+      />
+
+      <MonthlyTable monthly={{}} analytics={report.analytics} />
 
       <div className="flex flex-col gap-1">
         <p className="text-sm font-medium">Windows</p>

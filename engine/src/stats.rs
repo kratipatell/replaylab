@@ -337,6 +337,52 @@ pub struct MetricsV2 {
     pub drawdown_periods: Vec<DrawdownPeriod>,
     pub monthly: std::collections::BTreeMap<String, f64>,
     pub by_weekday: std::collections::BTreeMap<String, f64>,
+    pub analytics: PerformanceAnalytics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnderwaterPoint {
+    pub bar_ts: i64,
+    /// `null` when no positive high-water mark exists.
+    pub drawdown_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MonthlyReturn {
+    pub year: i32,
+    pub month: u32,
+    /// `null` when a baseline is unavailable, non-positive equity is crossed,
+    /// or insufficient points exist to form a return.
+    pub return_pct: Option<f64>,
+    pub bars: usize,
+    /// True when the first or last observed month does not cover its full
+    /// calendar boundary in UTC.
+    pub partial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MonthSummary {
+    pub year: i32,
+    pub month: u32,
+    pub return_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PerformanceAnalytics {
+    pub underwater_curve: Vec<UnderwaterPoint>,
+    /// `null` when no positive peak makes a percentage drawdown meaningful.
+    pub longest_drawdown_duration_bars: Option<usize>,
+    /// `null` when the deepest drawdown has not recovered, or no positive
+    /// high-water mark exists; zero when valid history has no drawdown.
+    pub time_to_recover_max_drawdown_bars: Option<usize>,
+    pub monthly_returns: Vec<MonthlyReturn>,
+    /// `null` when no monthly return can be computed.
+    pub best_month: Option<MonthSummary>,
+    /// `null` when no monthly return can be computed.
+    pub worst_month: Option<MonthSummary>,
+    /// Share of computable months with a strictly positive return; `null`
+    /// when no monthly return can be computed.
+    pub positive_month_share_pct: Option<f64>,
 }
 
 pub const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -368,6 +414,279 @@ fn ymd(ts_ms: i64) -> (i32, u32, u32) {
 fn month_key(ts_ms: i64) -> String {
     let (y, m, _) = ymd(ts_ms);
     format!("{y:04}-{m:02}")
+}
+
+#[derive(Clone, Copy)]
+struct DrawdownSpan {
+    start_idx: usize,
+    trough_idx: usize,
+    end_idx: Option<usize>,
+    depth_pct: f64,
+}
+
+fn drawdown_analytics(
+    points: &[(i64, f64)],
+) -> (Vec<UnderwaterPoint>, Option<usize>, Option<usize>) {
+    let mut underwater = Vec::with_capacity(points.len());
+    let mut spans = Vec::new();
+    let mut peak: Option<(f64, usize)> = None;
+    let mut active: Option<DrawdownSpan> = None;
+
+    for (index, &(bar_ts, equity)) in points.iter().enumerate() {
+        if !equity.is_finite() {
+            underwater.push(UnderwaterPoint {
+                bar_ts,
+                drawdown_pct: None,
+            });
+            continue;
+        }
+
+        let Some((peak_equity, peak_idx)) = peak else {
+            if equity > 0.0 {
+                peak = Some((equity, index));
+                underwater.push(UnderwaterPoint {
+                    bar_ts,
+                    drawdown_pct: Some(0.0),
+                });
+            } else {
+                underwater.push(UnderwaterPoint {
+                    bar_ts,
+                    drawdown_pct: None,
+                });
+            }
+            continue;
+        };
+
+        if equity >= peak_equity {
+            if let Some(mut span) = active.take() {
+                span.end_idx = Some(index);
+                spans.push(span);
+            }
+            peak = Some((equity, index));
+            underwater.push(UnderwaterPoint {
+                bar_ts,
+                drawdown_pct: Some(0.0),
+            });
+            continue;
+        }
+
+        let drawdown_pct = if peak_equity > 0.0 {
+            let value = (peak_equity - equity) / peak_equity * 100.0;
+            value.is_finite().then_some(value)
+        } else {
+            None
+        };
+        if let Some(depth_pct) = drawdown_pct {
+            match active.as_mut() {
+                Some(span) if depth_pct > span.depth_pct => {
+                    span.trough_idx = index;
+                    span.depth_pct = depth_pct;
+                }
+                Some(_) => {}
+                None => {
+                    active = Some(DrawdownSpan {
+                        start_idx: peak_idx,
+                        trough_idx: index,
+                        end_idx: None,
+                        depth_pct,
+                    });
+                }
+            }
+        }
+        underwater.push(UnderwaterPoint {
+            bar_ts,
+            drawdown_pct,
+        });
+    }
+
+    if let Some(span) = active {
+        spans.push(span);
+    }
+    let Some((_, _)) = peak else {
+        return (underwater, None, None);
+    };
+    let last_idx = points.len().saturating_sub(1);
+    let longest_duration = spans
+        .iter()
+        .map(|span| {
+            span.end_idx
+                .unwrap_or(last_idx)
+                .saturating_sub(span.start_idx)
+        })
+        .max()
+        .unwrap_or(0);
+    let deepest = spans.iter().max_by(|a, b| {
+        a.depth_pct
+            .partial_cmp(&b.depth_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let recovery = match deepest {
+        Some(span) => span
+            .end_idx
+            .map(|end_idx| end_idx.saturating_sub(span.trough_idx)),
+        None => Some(0),
+    };
+    (underwater, Some(longest_duration), recovery)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn month_bounds(ts_ms: i64) -> (i64, i64) {
+    const DAY_MS: i64 = 86_400_000;
+    let (year, month, day) = ymd(ts_ms);
+    let month_start = (days_since_epoch(ts_ms) - i64::from(day - 1)).saturating_mul(DAY_MS);
+    let next_month_day = month_start.saturating_add(i64::from(days_in_month(year, month)) * DAY_MS);
+    (month_start, next_month_day)
+}
+
+fn monthly_analytics(
+    points: &[(i64, f64)],
+    bar_step_ms: i64,
+) -> (
+    Vec<MonthlyReturn>,
+    Option<MonthSummary>,
+    Option<MonthSummary>,
+    Option<f64>,
+) {
+    use std::collections::BTreeMap;
+
+    type IndexedEquity = (usize, i64, f64);
+    let mut grouped: BTreeMap<(i32, u32), Vec<IndexedEquity>> = BTreeMap::new();
+    for (index, &(bar_ts, equity)) in points.iter().enumerate() {
+        let (year, month, _) = ymd(bar_ts);
+        grouped
+            .entry((year, month))
+            .or_default()
+            .push((index, bar_ts, equity));
+    }
+    let groups: Vec<_> = grouped.into_iter().collect();
+    let mut monthly_returns = Vec::with_capacity(groups.len());
+    for (group_idx, ((year, month), bars)) in groups.iter().enumerate() {
+        let first_idx = bars.first().map(|point| point.0).unwrap_or(0);
+        let first_ts = bars.first().map(|point| point.1).unwrap_or(0);
+        let final_equity = bars.last().map(|point| point.2).unwrap_or(f64::NAN);
+        let base_equity = if group_idx == 0 {
+            (bars.len() > 1).then(|| bars.first().map(|point| point.2).unwrap_or(f64::NAN))
+        } else {
+            first_idx
+                .checked_sub(1)
+                .and_then(|idx| points.get(idx))
+                .map(|point| point.1)
+        };
+        let has_only_positive_finite_equity = bars
+            .iter()
+            .all(|(_, _, equity)| equity.is_finite() && *equity > 0.0);
+        let return_pct = base_equity
+            .filter(|base| base.is_finite() && *base > 0.0)
+            .filter(|_| has_only_positive_finite_equity && final_equity.is_finite())
+            .and_then(|base| {
+                let value = (final_equity / base - 1.0) * 100.0;
+                value.is_finite().then_some(value)
+            });
+
+        let (month_start, next_month_start) = month_bounds(first_ts);
+        let last_ts = bars.last().map(|point| point.1).unwrap_or(first_ts);
+        let partial_start = group_idx == 0 && first_ts > month_start;
+        let partial_end = group_idx + 1 == groups.len()
+            && (bar_step_ms <= 0 || last_ts.saturating_add(bar_step_ms) < next_month_start);
+        monthly_returns.push(MonthlyReturn {
+            year: *year,
+            month: *month,
+            return_pct,
+            bars: bars.len(),
+            partial: partial_start || partial_end,
+        });
+    }
+
+    let valid: Vec<&MonthlyReturn> = monthly_returns
+        .iter()
+        .filter(|month| month.return_pct.is_some())
+        .collect();
+    let best_month = valid
+        .iter()
+        .copied()
+        .reduce(|best, month| {
+            if month.return_pct > best.return_pct {
+                month
+            } else {
+                best
+            }
+        })
+        .and_then(month_summary);
+    let worst_month = valid
+        .iter()
+        .copied()
+        .reduce(|worst, month| {
+            if month.return_pct < worst.return_pct {
+                month
+            } else {
+                worst
+            }
+        })
+        .and_then(month_summary);
+    let positive_month_share_pct = if valid.is_empty() {
+        None
+    } else {
+        let positive = valid
+            .iter()
+            .filter(|month| month.return_pct.is_some_and(|value| value > 0.0))
+            .count();
+        Some(positive as f64 / valid.len() as f64 * 100.0)
+    };
+    (
+        monthly_returns,
+        best_month,
+        worst_month,
+        positive_month_share_pct,
+    )
+}
+
+fn month_summary(month: &MonthlyReturn) -> Option<MonthSummary> {
+    Some(MonthSummary {
+        year: month.year,
+        month: month.month,
+        return_pct: month.return_pct?,
+    })
+}
+
+pub fn compute_performance_analytics(
+    timestamped_equity: &[(i64, f64)],
+    bar_step_ms: i64,
+) -> PerformanceAnalytics {
+    let (underwater_curve, longest_drawdown_duration_bars, time_to_recover_max_drawdown_bars) =
+        drawdown_analytics(timestamped_equity);
+    let (monthly_returns, best_month, worst_month, positive_month_share_pct) =
+        monthly_analytics(timestamped_equity, bar_step_ms);
+    PerformanceAnalytics {
+        underwater_curve,
+        longest_drawdown_duration_bars,
+        time_to_recover_max_drawdown_bars,
+        monthly_returns,
+        best_month,
+        worst_month,
+        positive_month_share_pct,
+    }
+}
+
+fn bar_step_ms_from_annualization(bars_per_year: f64) -> i64 {
+    const YEAR_MS: f64 = 31_536_000_000.0;
+    if !bars_per_year.is_finite() || bars_per_year <= 0.0 {
+        return 0;
+    }
+    let step = (YEAR_MS / bars_per_year).round();
+    if !step.is_finite() || step <= 0.0 || step > i64::MAX as f64 {
+        0
+    } else {
+        step as i64
+    }
 }
 
 fn downside_deviation(equity: &[f64], bars_per_year: f64) -> f64 {
@@ -558,6 +877,11 @@ pub fn compute_v2(result: &BacktestResult, candles: &[Candle], bars_per_year: f6
     let (max_win_streak, max_loss_streak) = streaks(&result.trades);
     let dd = drawdown_periods(&result.equity_curve);
     let (monthly, by_weekday) = attribute_buckets(&result.equity_curve, candles);
+    let timestamped_equity: Vec<(i64, f64)> = candles
+        .iter()
+        .zip(&result.equity_curve)
+        .map(|(candle, &equity)| (candle.ts, equity))
+        .collect();
     MetricsV2 {
         sortino,
         calmar,
@@ -566,6 +890,10 @@ pub fn compute_v2(result: &BacktestResult, candles: &[Candle], bars_per_year: f6
         drawdown_periods: dd,
         monthly,
         by_weekday,
+        analytics: compute_performance_analytics(
+            &timestamped_equity,
+            bar_step_ms_from_annualization(bars_per_year),
+        ),
     }
 }
 
@@ -896,5 +1224,161 @@ mod tests {
         assert_eq!(ymd(0), (1970, 1, 1));
         assert_eq!(weekday_idx(0), 3);
         assert_eq!(weekday_idx(4 * 86_400_000), 0);
+    }
+
+    #[test]
+    fn performance_drawdown_tracks_depth_duration_and_recovery() {
+        let points: Vec<(i64, f64)> = [100.0, 120.0, 90.0, 110.0, 120.0, 110.0, 100.0]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, equity)| (idx as i64 * 3_600_000, equity))
+            .collect();
+        let analytics = compute_performance_analytics(&points, 3_600_000);
+
+        let expected = [0.0, 0.0, 25.0, 100.0 / 12.0, 0.0, 100.0 / 12.0, 100.0 / 6.0];
+        for (point, expected) in analytics.underwater_curve.iter().zip(expected) {
+            assert_approx(point.drawdown_pct.expect("positive peak"), expected, 1e-12);
+        }
+        assert_approx(
+            compute_stats(
+                &BacktestResult {
+                    trades: Vec::new(),
+                    equity_curve: points.iter().map(|point| point.1).collect(),
+                },
+                &[],
+                8_760.0,
+            )
+            .max_drawdown_pct,
+            25.0,
+            1e-12,
+        );
+        assert_eq!(analytics.longest_drawdown_duration_bars, Some(3));
+        assert_eq!(analytics.time_to_recover_max_drawdown_bars, Some(2));
+    }
+
+    #[test]
+    fn max_drawdown_recovery_is_null_when_the_deepest_drawdown_is_open() {
+        let points = [(0, 100.0), (1, 120.0), (2, 90.0), (3, 100.0)];
+        let analytics = compute_performance_analytics(&points, 1);
+
+        assert_eq!(analytics.longest_drawdown_duration_bars, Some(2));
+        assert_eq!(analytics.time_to_recover_max_drawdown_bars, None);
+    }
+
+    #[test]
+    fn monthly_returns_cross_year_boundaries_compound_and_mark_partial_months() {
+        let hour = 3_600_000;
+        let points = [
+            (1_704_060_000_000, 100.0), // 2023-12-31 22:00 UTC
+            (1_704_063_600_000, 110.0), // 2023-12-31 23:00 UTC
+            (1_704_067_200_000, 121.0), // 2024-01-01 00:00 UTC
+            (1_704_070_800_000, 133.1), // 2024-01-01 01:00 UTC
+        ];
+        let analytics = compute_performance_analytics(&points, hour);
+
+        assert_eq!(analytics.monthly_returns.len(), 2);
+        let december = &analytics.monthly_returns[0];
+        assert_eq!(
+            (december.year, december.month, december.bars),
+            (2023, 12, 2)
+        );
+        assert_approx(december.return_pct.expect("December return"), 10.0, 1e-12);
+        assert!(december.partial);
+
+        let january = &analytics.monthly_returns[1];
+        assert_eq!((january.year, january.month, january.bars), (2024, 1, 2));
+        assert_approx(january.return_pct.expect("January return"), 21.0, 1e-12);
+        assert!(january.partial);
+        let best = analytics.best_month.as_ref().expect("best month");
+        assert_eq!((best.year, best.month), (2024, 1));
+        assert_approx(best.return_pct, 21.0, 1e-12);
+        assert_eq!(
+            analytics.worst_month.as_ref().map(|month| month.year),
+            Some(2023)
+        );
+        assert_eq!(analytics.positive_month_share_pct, Some(100.0));
+    }
+
+    #[test]
+    fn complete_month_has_no_partial_marker() {
+        let day_ms = 86_400_000;
+        let points: Vec<(i64, f64)> = (0..31)
+            .map(|day| (1_704_067_200_000 + day * day_ms, 100.0 + day as f64))
+            .collect();
+        let analytics = compute_performance_analytics(&points, day_ms);
+        assert_eq!(analytics.monthly_returns.len(), 1);
+        assert!(!analytics.monthly_returns[0].partial);
+        assert_eq!(analytics.monthly_returns[0].bars, 31);
+    }
+
+    #[test]
+    fn one_point_history_is_partial_and_monthly_return_is_not_available() {
+        let points = [(1_704_067_200_000, 100.0)];
+        let analytics = compute_performance_analytics(&points, 3_600_000);
+        assert_eq!(analytics.monthly_returns.len(), 1);
+        assert_eq!(analytics.monthly_returns[0].return_pct, None);
+        assert_eq!(analytics.monthly_returns[0].bars, 1);
+        assert!(analytics.monthly_returns[0].partial);
+        assert_eq!(analytics.best_month, None);
+        assert_eq!(analytics.worst_month, None);
+        assert_eq!(analytics.positive_month_share_pct, None);
+    }
+
+    #[test]
+    fn flat_equity_has_zero_drawdown_and_no_positive_months() {
+        let points = [(1_704_067_200_000, 100.0), (1_704_070_800_000, 100.0)];
+        let analytics = compute_performance_analytics(&points, 3_600_000);
+        assert_eq!(analytics.longest_drawdown_duration_bars, Some(0));
+        assert_eq!(analytics.time_to_recover_max_drawdown_bars, Some(0));
+        assert_eq!(analytics.monthly_returns[0].return_pct, Some(0.0));
+        assert_eq!(analytics.positive_month_share_pct, Some(0.0));
+    }
+
+    #[test]
+    fn non_positive_equity_and_non_finite_values_serialize_as_nulls() {
+        let points = [
+            (1_704_067_200_000, 0.0),
+            (1_704_070_800_000, f64::NAN),
+            (1_704_074_400_000, f64::INFINITY),
+        ];
+        let analytics = compute_performance_analytics(&points, 3_600_000);
+        assert!(analytics
+            .underwater_curve
+            .iter()
+            .all(|point| point.drawdown_pct.is_none()));
+        assert_eq!(analytics.longest_drawdown_duration_bars, None);
+        assert_eq!(analytics.time_to_recover_max_drawdown_bars, None);
+        assert_eq!(analytics.monthly_returns[0].return_pct, None);
+        let json = serde_json::to_string(&analytics).expect("analytics serialize");
+        assert!(!json.contains("NaN"));
+        assert!(!json.contains("Infinity"));
+        assert!(json.contains("null"));
+    }
+
+    #[test]
+    fn compute_v2_keeps_trade_metrics_and_adds_analytics() {
+        let result = BacktestResult {
+            trades: Vec::new(),
+            equity_curve: vec![100.0, 100.0],
+        };
+        let candles = vec![
+            Candle {
+                ts: 1_704_067_200_000,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+            Candle {
+                ts: 1_704_070_800_000,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+            },
+        ];
+        let metrics = compute_v2(&result, &candles, 8_760.0);
+        assert_eq!(metrics.analytics.underwater_curve.len(), 2);
+        assert_eq!(metrics.monthly["2024-01"], 0.0);
     }
 }

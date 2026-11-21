@@ -905,14 +905,16 @@ export default function Check() {
             full={result.stats}
             inSample={result.in_sample}
             outOfSample={result.out_of_sample}
+            analytics={result.metrics.analytics}
           />
           <EquityCharts
             equity={result.equity_curve}
             split={0.7}
             startMs={range?.start ?? null}
             endMs={range?.end ?? null}
+            analytics={result.metrics.analytics}
           />
-          <MonthlyTable monthly={result.metrics.monthly} />
+          <MonthlyTable monthly={result.metrics.monthly} analytics={result.metrics.analytics} />
           <TradesTable trades={result.trades} />
           <p className="text-xs text-[var(--muted)]">
             These are simulated results on past data. Past results do not

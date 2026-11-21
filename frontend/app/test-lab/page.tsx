@@ -359,14 +359,16 @@ export default function TestLab() {
                 full={result.stats}
                 inSample={result.in_sample}
                 outOfSample={result.out_of_sample}
+                analytics={result.metrics.analytics}
               />
               <EquityCharts
                 equity={result.equity_curve}
                 split={submittedSplit}
                 startMs={submittedStart}
                 endMs={submittedEnd}
+                analytics={result.metrics.analytics}
               />
-              <MonthlyTable monthly={result.metrics.monthly} />
+              <MonthlyTable monthly={result.metrics.monthly} analytics={result.metrics.analytics} />
               <TradesTable trades={result.trades} />
               <p className="text-xs text-[var(--muted)]">
                 These are simulated results on past data. Past results do not
@@ -398,14 +400,20 @@ export default function TestLab() {
               <p className="rounded border border-[var(--border)] bg-[var(--surface)] p-3 text-sm text-[var(--muted)]">
                 Verdict is not stored for older runs.
               </p>
-              <StatsTable full={saved.stats} inSample={null} outOfSample={null} />
+              <StatsTable
+                full={saved.stats}
+                inSample={null}
+                outOfSample={null}
+                analytics={saved.metrics.analytics}
+              />
               <EquityCharts
                 equity={saved.equity_curve}
                 split={null}
                 startMs={saved.start_ms}
                 endMs={saved.end_ms}
+                analytics={saved.metrics.analytics}
               />
-              <MonthlyTable monthly={saved.metrics.monthly} />
+              <MonthlyTable monthly={saved.metrics.monthly} analytics={saved.metrics.analytics} />
               <TradesTable trades={saved.trades} />
               <p className="text-xs text-[var(--muted)]">
                 These are simulated results on past data. Past results do not

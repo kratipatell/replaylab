@@ -11,8 +11,10 @@ import {
   fmtNum,
   fmtPct,
   groupMonthly,
+  downsampleNullable,
   seriesX,
 } from "@/lib/testlab";
+import type { PerformanceAnalytics } from "@/lib/api";
 
 const W = 640;
 const H = 300;
@@ -180,7 +182,121 @@ export function LineChart({
   );
 }
 
-export function MonthlyTable({ monthly }: { monthly: Record<string, number> }) {
+export function MonthlyTable({
+  monthly,
+  analytics,
+}: {
+  monthly: Record<string, number>;
+  analytics?: PerformanceAnalytics;
+}) {
+  if (analytics !== undefined) {
+    const years = [...new Set(analytics.monthly_returns.map((month) => month.year))].sort(
+      (a, b) => a - b,
+    );
+    const months = new Map(
+      analytics.monthly_returns.map((month) => [`${month.year}-${month.month}`, month]),
+    );
+    const monthText = (month: { year: number; month: number; return_pct: number }): string =>
+      `${MONTH_NAMES[month.month - 1] ?? "Month"} ${month.year} · ${fmtPct(month.return_pct, 1)}`;
+    const summaryText = (month: typeof analytics.best_month): string =>
+      month === null ? "n/a" : monthText(month);
+
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-sm font-medium">Monthly returns</p>
+        <p className="text-xs text-[var(--muted)]">
+          Best: {summaryText(analytics.best_month)} · Worst: {summaryText(analytics.worst_month)} ·
+          Positive months:{" "}
+          {analytics.positive_month_share_pct === null
+            ? "n/a"
+            : fmtPct(analytics.positive_month_share_pct, 0)}
+        </p>
+        {years.length === 0 ? (
+          <p className="text-xs text-[var(--muted)]">No monthly returns to show.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr>
+                  <th className="border border-[var(--border)] bg-[var(--surface)] p-2 text-left font-medium">
+                    Year (UTC)
+                  </th>
+                  {MONTH_NAMES.map((name) => (
+                    <th
+                      key={name}
+                      className="border border-[var(--border)] bg-[var(--surface)] p-2 text-right font-medium"
+                    >
+                      {name}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {years.map((year) => (
+                  <tr key={year}>
+                    <td className="border border-[var(--border)] p-2 font-medium">{year}</td>
+                    {MONTH_NAMES.map((_, index) => {
+                      const month = months.get(`${year}-${index + 1}`);
+                      if (month === undefined) {
+                        return (
+                          <td
+                            key={`${year}-${index}`}
+                            className="border border-[var(--border)] p-2 text-center text-[var(--muted)]"
+                          >
+                            —
+                          </td>
+                        );
+                      }
+                      if (month.return_pct === null) {
+                        return (
+                          <td
+                            key={`${year}-${index}`}
+                            title={`${month.bars} bars; return unavailable`}
+                            className="border border-[var(--border)] p-2 text-center text-[var(--muted)]"
+                          >
+                            n/a{month.partial ? "*" : ""}
+                            <span className="block text-xs">{month.bars} bars</span>
+                          </td>
+                        );
+                      }
+                      const magnitude = Math.min(30, 6 + Math.abs(month.return_pct) / 2);
+                      const tone =
+                        month.return_pct > 0 ? "var(--verdict-holds)" : "var(--verdict-fails)";
+                      return (
+                        <td
+                          key={`${year}-${index}`}
+                          title={`${month.bars} bars${month.partial ? "; partial month" : ""}`}
+                          className="border border-[var(--border)] p-2 text-right"
+                          style={{
+                            color:
+                              month.return_pct === 0 ? "var(--muted)" : tone,
+                            backgroundColor:
+                              month.return_pct === 0
+                                ? undefined
+                                : `color-mix(in srgb, ${tone} ${magnitude}%, transparent)`,
+                          }}
+                        >
+                          {fmtPct(month.return_pct, 1)}
+                          {month.partial ? "*" : ""}
+                          <span className="block text-xs text-[var(--muted)]">{month.bars} bars</span>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="text-xs text-[var(--muted)]">
+          * marks an incomplete first or last calendar month. n/a means a positive
+          month-start equity baseline was unavailable. Positive-month share excludes
+          n/a months.
+        </p>
+      </div>
+    );
+  }
+
   const { years, cells } = groupMonthly(monthly);
   if (years.length === 0) {
     return (
@@ -263,17 +379,25 @@ export default function EquityCharts({
   split,
   startMs,
   endMs,
+  analytics,
   mode = "backtest",
 }: {
   equity: number[];
   split: number | null;
   startMs: number | null;
   endMs: number | null;
+  analytics?: PerformanceAnalytics;
   mode?: "backtest" | "agent";
 }) {
   const total = equity.length;
   const curve = downsample(equity, MAX_CHART_POINTS);
-  const dd = downsample(drawdownPct(equity), MAX_CHART_POINTS);
+  const dd = analytics === undefined
+    ? downsample(drawdownPct(equity), MAX_CHART_POINTS)
+    : downsampleNullable(
+        analytics.underwater_curve.map((point) => point.drawdown_pct),
+        MAX_CHART_POINTS,
+      );
+  const drawdownTotal = analytics?.underwater_curve.length ?? total;
   const splitMs =
     split === null || startMs === null || endMs === null
       ? null
@@ -298,11 +422,15 @@ export default function EquityCharts({
         fill={false}
       />
       <LineChart
-        title={mode === "agent" ? "Drawdown" : "Losing stretches"}
-        sub="How far the account fell from its last peak, in percent."
+        title={mode === "agent" ? "Drawdown" : "Underwater curve"}
+        sub={
+          analytics === undefined
+            ? "How far the account fell from its last peak, in percent."
+            : "Engine-calculated drawdown from the running high-water mark."
+        }
         yLabel="percent below peak"
         points={dd}
-        total={total}
+        total={drawdownTotal}
         split={split}
         splitMs={splitMs}
         startMs={startMs}

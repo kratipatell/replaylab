@@ -8,6 +8,7 @@ import {
   defaultForm,
   describeStaleInputs,
   downsample,
+  downsampleNullable,
   drawdownPct,
   estimateCandles,
   formToStrategy,
@@ -87,6 +88,17 @@ describe("downsample", () => {
     expect(sampled.length).toBeLessThanOrEqual(MAX_CHART_POINTS);
     expect(sampled).toContainEqual({ i: 855, v: 0.5 });
     expect(maxDrawdown(valuesOf(sampled))).toBeCloseTo(maxDrawdown(values), 10);
+  });
+});
+
+describe("downsampleNullable", () => {
+  it("skips undefined underwater samples and preserves original indices", () => {
+    expect(downsampleNullable([0, null, 12.5, null, 0], 10)).toEqual([
+      { i: 0, v: 0 },
+      { i: 2, v: 12.5 },
+      { i: 4, v: 0 },
+    ]);
+    expect(downsampleNullable([null, null], 10)).toEqual([]);
   });
 });
 

@@ -139,6 +139,8 @@ pub struct WalkForwardReport {
     pub parameter_stability: Vec<ParameterStability>,
     pub stability_measure: &'static str,
     pub verdict: Verdict,
+    pub analytics: stats::PerformanceAnalytics,
+    pub out_of_sample_stats: Stats,
 }
 
 fn optimize_spec(request: &WalkForwardRequest) -> OptimizeSpec {
@@ -417,6 +419,9 @@ fn run_cancellable_with_hook(
     if candles.is_empty() {
         return Err(WalkForwardError::Invalid("no candles in range".to_string()));
     }
+    let bar_step_ms = crate::feeds::interval_ms(&request.strategy.timeframe).ok_or_else(|| {
+        WalkForwardError::Invalid(format!("unknown timeframe: {}", request.strategy.timeframe))
+    })?;
     let boundaries = window_bounds(candles.len(), request)?;
     let optimizer_spec = optimize_spec(request);
     let objective = optimizer_spec
@@ -432,6 +437,7 @@ fn run_cancellable_with_hook(
     }];
     let mut starting_equity = INITIAL_EQUITY;
     let mut total_optimizer_evaluations = 0;
+    let mut oos_trades = Vec::new();
 
     for (index, bounds) in boundaries.iter().enumerate() {
         if cancellation_requested(cancelled) {
@@ -481,6 +487,7 @@ fn run_cancellable_with_hook(
             bounds.oos_end,
             bars_per_year,
         )?;
+        oos_trades.extend(oos_result.trades.iter().cloned());
         let ending_equity = *oos_result
             .equity_curve
             .get(bounds.oos_end - 1)
@@ -567,6 +574,19 @@ fn run_cancellable_with_hook(
         profitable_oos_share_pct,
         efficiency_ratio,
     );
+    let timestamped_equity: Vec<(i64, f64)> = equity_curve
+        .iter()
+        .map(|point| (point.bar_ts, point.equity))
+        .collect();
+    let analytics = stats::compute_performance_analytics(&timestamped_equity, bar_step_ms);
+    let out_of_sample_stats = stats::compute_stats(
+        &crate::backtest::BacktestResult {
+            trades: oos_trades,
+            equity_curve: equity_curve.iter().map(|point| point.equity).collect(),
+        },
+        &[],
+        bars_per_year,
+    );
     Ok(WalkForwardReport {
         mode: request.mode,
         objective,
@@ -574,6 +594,8 @@ fn run_cancellable_with_hook(
         total_optimizer_evaluations,
         windows,
         stitched_oos_equity_curve: equity_curve,
+        analytics,
+        out_of_sample_stats,
         total_oos_return_pct,
         max_oos_drawdown_pct,
         profitable_oos_windows,
@@ -863,6 +885,22 @@ mod tests {
                 .last()
                 .map(|point| point.equity),
             report.windows.last().map(|window| window.oos_ending_equity)
+        );
+        assert_eq!(
+            report.analytics.underwater_curve.len(),
+            report.stitched_oos_equity_curve.len()
+        );
+        assert_eq!(
+            report.out_of_sample_stats.trades,
+            report
+                .windows
+                .iter()
+                .map(|window| window.oos_stats.trades)
+                .sum::<usize>()
+        );
+        assert!(
+            (report.out_of_sample_stats.max_drawdown_pct - report.max_oos_drawdown_pct).abs()
+                < 1e-12
         );
     }
 

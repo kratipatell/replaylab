@@ -2,7 +2,7 @@
 // each column's trade count, since every figure here depends on it.
 "use client";
 
-import type { Stats } from "@/lib/api";
+import type { PerformanceAnalytics, Stats } from "@/lib/api";
 import { fmtPct, fmtNum, plural } from "@/lib/testlab";
 
 function header(label: string, trades: number | null): string {
@@ -13,22 +13,38 @@ export default function StatsTable({
   full,
   inSample,
   outOfSample,
+  analytics,
+  fullLabel = "Full period",
+  hideBuyAndHold = false,
 }: {
   full: Stats;
   inSample: Stats | null;
   outOfSample: Stats | null;
+  analytics?: PerformanceAnalytics;
+  fullLabel?: string;
+  hideBuyAndHold?: boolean;
 }) {
   const cols: { label: string; stats: Stats | null }[] = [
     { label: header("In-sample", inSample?.trades ?? null), stats: inSample },
     { label: header("Out-of-sample", outOfSample?.trades ?? null), stats: outOfSample },
-    { label: header("Full period", full.trades), stats: full },
+    { label: header(fullLabel, full.trades), stats: full },
   ];
   const cell = (stats: Stats | null, text: (s: Stats) => string): string =>
     stats === null ? "—" : text(stats);
 
-  const rows: { name: string; sub: string; text: (s: Stats) => string }[] = [
+  const allRows: { name: string; sub: string; text: (s: Stats) => string }[] = [
     { name: "Trades", sub: "completed buys and sells", text: (s) => String(s.trades) },
     { name: "Win rate", sub: "share of trades that made money", text: (s) => fmtPct(s.win_rate_pct) },
+    {
+      name: "Average winning trade",
+      sub: "mean return among wins",
+      text: (s) => (s.wins === 0 ? "no winning trades" : fmtPct(s.avg_win_pct)),
+    },
+    {
+      name: "Average losing trade",
+      sub: "mean return among losses",
+      text: (s) => (s.losses === 0 ? "no losing trades" : fmtPct(s.avg_loss_pct)),
+    },
     {
       name: "Profit factor",
       sub: "money won per money lost",
@@ -56,6 +72,9 @@ export default function StatsTable({
       text: (s) => fmtNum(s.sharpe),
     },
   ];
+  const rows = hideBuyAndHold
+    ? allRows.filter((row) => row.name !== "Buy-and-hold return")
+    : allRows;
 
   return (
     <section aria-label="Results by period" className="overflow-x-auto">
@@ -88,6 +107,50 @@ export default function StatsTable({
               ))}
             </tr>
           ))}
+          {analytics !== undefined && (
+            <>
+              <tr>
+                <td className="border border-[var(--border)] p-2">
+                  <span className="font-medium">Longest drawdown</span>
+                  <br />
+                  <span className="text-xs text-[var(--muted)]">
+                    bars from peak to recovery or latest bar
+                  </span>
+                </td>
+                <td className="border border-[var(--border)] p-2 text-center text-[var(--muted)]">
+                  —
+                </td>
+                <td className="border border-[var(--border)] p-2 text-center text-[var(--muted)]">
+                  —
+                </td>
+                <td className="border border-[var(--border)] p-2">
+                  {analytics.longest_drawdown_duration_bars === null
+                    ? "n/a · no positive equity peak"
+                    : `${analytics.longest_drawdown_duration_bars} bars`}
+                </td>
+              </tr>
+              <tr>
+                <td className="border border-[var(--border)] p-2">
+                  <span className="font-medium">Recovery from deepest drawdown</span>
+                  <br />
+                  <span className="text-xs text-[var(--muted)]">
+                    bars from trough back to the prior peak
+                  </span>
+                </td>
+                <td className="border border-[var(--border)] p-2 text-center text-[var(--muted)]">
+                  —
+                </td>
+                <td className="border border-[var(--border)] p-2 text-center text-[var(--muted)]">
+                  —
+                </td>
+                <td className="border border-[var(--border)] p-2">
+                  {analytics.time_to_recover_max_drawdown_bars === null
+                    ? "n/a · not recovered or invalid baseline"
+                    : `${analytics.time_to_recover_max_drawdown_bars} bars`}
+                </td>
+              </tr>
+            </>
+          )}
         </tbody>
       </table>
     </section>

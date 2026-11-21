@@ -87,7 +87,8 @@ export type ExitReason =
   | "Trailing"
   | "SessionEnd"
   | "EndOfData"
-  | "RiskHalt";
+  | "RiskHalt"
+  | "Stopped";
 
 export interface Trade {
   entry_idx: number;
@@ -117,6 +118,37 @@ export interface MetricsV2 {
   drawdown_periods: DrawdownPeriod[];
   monthly: Record<string, number>;
   by_weekday: Record<string, number>;
+  /** Missing on saved runs written before performance analytics were added. */
+  analytics?: PerformanceAnalytics;
+}
+
+export interface UnderwaterPoint {
+  bar_ts: number;
+  drawdown_pct: number | null;
+}
+
+export interface MonthlyReturn {
+  year: number;
+  month: number;
+  return_pct: number | null;
+  bars: number;
+  partial: boolean;
+}
+
+export interface MonthSummary {
+  year: number;
+  month: number;
+  return_pct: number;
+}
+
+export interface PerformanceAnalytics {
+  underwater_curve: UnderwaterPoint[];
+  longest_drawdown_duration_bars: number | null;
+  time_to_recover_max_drawdown_bars: number | null;
+  monthly_returns: MonthlyReturn[];
+  best_month: MonthSummary | null;
+  worst_month: MonthSummary | null;
+  positive_month_share_pct: number | null;
 }
 
 export interface BacktestResponse {
@@ -232,6 +264,8 @@ export interface WalkForwardReport {
   total_optimizer_evaluations: number;
   windows: WalkForwardWindow[];
   stitched_oos_equity_curve: WalkForwardEquityPoint[];
+  analytics: PerformanceAnalytics;
+  out_of_sample_stats: Stats;
   total_oos_return_pct: number;
   max_oos_drawdown_pct: number;
   profitable_oos_windows: number;

@@ -60,6 +60,20 @@ function captureWalkForward(mode: WalkForwardForm["mode"] = "rolling"): WalkForw
   };
 }
 
+function unstableWalkForwardRequest(): WalkForwardRequest {
+  return {
+    ...(requestRolling as WalkForwardRequest),
+    params: [
+      {
+        target: "entry.all.0.right.period",
+        kind: "int",
+        values: [5, 10, 14, 20, 26, 30, 40, 60, 100, 200],
+      },
+    ],
+    objective: "total_return",
+  };
+}
+
 function jsonResponse(value: unknown, status: number): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -95,6 +109,9 @@ describe("captured rolling response", () => {
     expect(report.total_optimizer_evaluations).toBe(9);
     expect(report.windows).toHaveLength(3);
     expect(report.stitched_oos_equity_curve).toHaveLength(451);
+    expect(report.analytics.underwater_curve).toHaveLength(451);
+    expect(report.out_of_sample_stats.trades).toBeGreaterThanOrEqual(0);
+    expect(report.analytics.monthly_returns.length).toBeGreaterThan(0);
     expect(report.verdict.grade).toBe("not_enough_data");
 
     // Efficiency is JSON null here: the in-sample return per bar is negative.
@@ -146,7 +163,7 @@ describe("captured anchored response", () => {
 describe("captured unstable-parameter response", () => {
   it("reports the parameter as unstable with its modal share", async () => {
     stubEngine(responseUnstable);
-    const report = await postWalkForward(requestRolling as WalkForwardRequest);
+    const report = await postWalkForward(unstableWalkForwardRequest());
     expect(report.parameter_stability).toEqual([
       expect.objectContaining({
         parameter: "entry.all.0.right.period",

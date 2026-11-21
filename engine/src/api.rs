@@ -2335,6 +2335,17 @@ mod tests {
         assert!(v["stats"]["trades"].as_u64().unwrap() > 0);
         let candle_count = v["candle_count"].as_u64().unwrap() as usize;
         assert_eq!(v["equity_curve"].as_array().unwrap().len(), candle_count);
+        let analytics = &v["metrics"]["analytics"];
+        assert_eq!(
+            analytics["underwater_curve"]
+                .as_array()
+                .expect("underwater curve")
+                .len(),
+            candle_count
+        );
+        assert!(analytics["monthly_returns"].as_array().is_some());
+        assert!(!v.to_string().contains("NaN"));
+        assert!(!v.to_string().contains("Infinity"));
         assert!(v["in_sample"].is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -643,6 +643,22 @@ export function downsample(values: number[], max: number): SeriesPoint[] {
   return out;
 }
 
+export function downsampleNullable(values: (number | null)[], max: number): SeriesPoint[] {
+  const valid = values.flatMap((value, i) =>
+    value !== null && Number.isFinite(value) ? [{ i, v: value }] : [],
+  );
+  if (valid.length <= max) {
+    return valid;
+  }
+  return downsample(
+    valid.map((point) => point.v),
+    max,
+  ).flatMap((point) => {
+    const original = valid[point.i];
+    return original === undefined ? [] : [{ i: original.i, v: point.v }];
+  });
+}
+
 export function drawdownPct(equity: number[]): number[] {
   let peak = Number.NEGATIVE_INFINITY;
   return equity.map((e) => {
@@ -698,6 +714,8 @@ export function exitReasonLabel(reason: ExitReason): string {
       return "End of data";
     case "RiskHalt":
       return "Risk limit";
+    case "Stopped":
+      return "Agent stopped";
   }
 }
 
@@ -717,6 +735,8 @@ export function exitReasonHelp(reason: ExitReason): string {
       return "The data ran out while the trade was still open.";
     case "RiskHalt":
       return "A risk limit was reached; the agent flattened at the next bar's open.";
+    case "Stopped":
+      return "The agent stopped with an open position, which was closed at the last processed close.";
   }
 }
 
