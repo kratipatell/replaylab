@@ -12,6 +12,7 @@ import type {
   Rules,
   Side,
   Strategy,
+  StrategyTemplate,
 } from "./api";
 
 export const ASSETS = [
@@ -464,7 +465,7 @@ function operandToState(o: Operand): RuleOperandState {
     mode: "indicator",
     num: "",
     ind: o.ind,
-    period: o.period === undefined ? "" : String(o.period),
+    period: o.period == null ? "" : String(o.period),
   };
 }
 
@@ -537,16 +538,29 @@ export function strategyToForm(strategy: Strategy): FormMapping {
       entry: groupFromRules(strategy.entry, "Entry", notes),
       exit: groupFromRules(strategy.exit, "Exit", notes),
       stopLoss:
-        strategy.stop_loss_pct === undefined
-          ? ""
-          : String(strategy.stop_loss_pct),
+        strategy.stop_loss_pct == null ? "" : String(strategy.stop_loss_pct),
       takeProfit:
-        strategy.take_profit_pct === undefined
-          ? ""
-          : String(strategy.take_profit_pct),
+        strategy.take_profit_pct == null ? "" : String(strategy.take_profit_pct),
       preset,
     },
     notes,
+  };
+}
+
+export function applyTemplateStrategy(
+  form: TestLabForm,
+  template: StrategyTemplate,
+): TestLabForm {
+  const mapped = strategyToForm(template.strategy).form;
+  return {
+    ...form,
+    asset: mapped.asset,
+    timeframe: mapped.timeframe,
+    side: mapped.side,
+    entry: mapped.entry,
+    exit: mapped.exit,
+    stopLoss: mapped.stopLoss,
+    takeProfit: mapped.takeProfit,
   };
 }
 

@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { ApiError, type WalkForwardRequest } from "./api";
+import { ApiError, type StrategyTemplate, type WalkForwardRequest } from "./api";
 import { sampleWindow, segment } from "./walkforward.fixture";
+import templateResponse from "./__fixtures__/templates/response.json";
 import {
   WF_MAX_EVALUATIONS,
   buildWalkForwardRequest,
   classifyWalkForwardError,
+  applyTemplateGrid,
   createParamRow,
   defaultWalkForwardForm,
   formatEfficiency,
@@ -53,6 +55,48 @@ function wfWith(targetValues: [string, string][], overrides: Partial<WalkForward
     ...overrides,
   };
 }
+
+describe("applyTemplateGrid", () => {
+  it("fills suggested parameter values while preserving the other walk-forward fields", () => {
+    const templates = templateResponse as unknown as { templates: StrategyTemplate[] };
+    const template = templates.templates[0];
+    if (template === undefined) {
+      throw new Error("template fixture is empty");
+    }
+    const initial = wfWith([], {
+      mode: "anchored",
+      windows: "3",
+      isBars: "450",
+      oosBars: "120",
+      objective: "total_return",
+    });
+
+    const loaded = applyTemplateGrid(
+      initial,
+      template.suggested_walk_forward_parameter_grid,
+    );
+
+    expect(loaded.params.map(({ target, values }) => ({ target, values }))).toEqual(
+      template.suggested_walk_forward_parameter_grid.map((parameter) => ({
+        target: parameter.target,
+        values: parameter.values.join(", "),
+      })),
+    );
+    expect(loaded.mode).toBe("anchored");
+    expect(loaded.windows).toBe("3");
+    expect(loaded.isBars).toBe("450");
+    expect(loaded.oosBars).toBe("120");
+    expect(loaded.objective).toBe("total_return");
+
+    const edited = {
+      ...loaded,
+      params: loaded.params.map((param, index) =>
+        index === 0 ? { ...param, values: "5, 11" } : param,
+      ),
+    };
+    expect(edited.params[0]?.values).toBe("5, 11");
+  });
+});
 
 describe("tuneTargets", () => {
   it("offers a numeric threshold on the right side of an entry rule", () => {

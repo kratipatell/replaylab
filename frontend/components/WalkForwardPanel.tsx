@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   postWalkForward,
+  type StrategyTemplate,
   type WalkForwardReport,
   type WalkForwardRequest,
 } from "@/lib/api";
@@ -15,6 +16,7 @@ import {
 import {
   buildWalkForwardRequest,
   classifyWalkForwardError,
+  applyTemplateGrid,
   defaultWalkForwardForm,
   sameWalkForwardInputs,
   targetLabels,
@@ -62,9 +64,11 @@ export function RunProblemNotice({ problem }: { problem: RunProblem }) {
 export default function WalkForwardPanel({
   form,
   onFormChange,
+  templateSelection = null,
 }: {
   form: TestLabForm;
   onFormChange: (next: TestLabForm) => void;
+  templateSelection?: { template: StrategyTemplate } | null;
 }) {
   const [wf, setWf] = useState<WalkForwardForm>(defaultWalkForwardForm);
   const [attempted, setAttempted] = useState(false);
@@ -83,6 +87,30 @@ export default function WalkForwardPanel({
       controllerRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (templateSelection === null) {
+      return;
+    }
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) {
+        return;
+      }
+      setWf((current) =>
+        applyTemplateGrid(
+          current,
+          templateSelection.template.suggested_walk_forward_parameter_grid,
+        ),
+      );
+      setAttempted(false);
+      setClientErrors([]);
+      setProblem(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [templateSelection]);
 
   const submit = useCallback(async (): Promise<void> => {
     if (controllerRef.current !== null) {

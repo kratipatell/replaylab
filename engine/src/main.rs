@@ -14,6 +14,7 @@ mod session;
 mod sizing;
 mod stats;
 mod strategy;
+mod templates;
 mod types;
 mod validation;
 mod verdict;

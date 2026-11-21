@@ -7,6 +7,7 @@ import {
   ApiError,
   type Objective,
   type ParamSpec,
+  type SuggestedTemplateParameter,
   type WalkForwardEquityPoint,
   type WalkForwardMode,
   type WalkForwardRequest,
@@ -96,6 +97,18 @@ export function defaultWalkForwardForm(): WalkForwardForm {
     oosBars: String(WF_DEFAULT_OOS_BARS),
     objective: "sharpe",
     params: [],
+  };
+}
+
+export function applyTemplateGrid(
+  form: WalkForwardForm,
+  grid: SuggestedTemplateParameter[],
+): WalkForwardForm {
+  return {
+    ...form,
+    params: grid.map((parameter) =>
+      createParamRow(parameter.target, parameter.values.map(formatValue).join(", ")),
+    ),
   };
 }
 

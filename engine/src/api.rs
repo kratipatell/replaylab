@@ -217,6 +217,8 @@ pub enum ApiError {
     BadOrigin(String, String),
     #[error("range would hold {0} candles, limit is 100000")]
     TooMany(i128),
+    #[error(transparent)]
+    Templates(#[from] crate::templates::TemplateCatalogError),
 }
 
 #[cfg(test)]
@@ -240,10 +242,19 @@ pub fn app_with_origin(state: AppState, origin: &str) -> Result<Router, ApiError
 pub fn app_with_limits(state: AppState, origins: &str, limits: Limits) -> Result<Router, ApiError> {
     let headers = crate::config::parse_origins(origins)
         .map_err(|msg| ApiError::BadOrigin(origins.to_string(), msg))?;
-    Ok(router(state, headers, limits))
+    router(state, headers, limits)
 }
 
-fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router {
+fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Result<Router, ApiError> {
+    router_with_template_json(state, origins, limits, include_str!("../templates.json"))
+}
+
+fn router_with_template_json(
+    state: AppState,
+    origins: Vec<HeaderValue>,
+    limits: Limits,
+    template_json: &str,
+) -> Result<Router, ApiError> {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST])
@@ -251,8 +262,11 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
             axum::http::header::CONTENT_TYPE,
             HeaderName::from_static(ADMIN_HEADER),
         ]);
-    Router::new()
+    let templates = Arc::new(crate::templates::TemplateCatalog::from_json(template_json)?);
+    Ok(Router::new()
         .route("/health", get(health))
+        .route("/templates", get(list_templates))
+        .route("/templates/{id}", get(get_template))
         .route("/candles", get(get_candles))
         .route("/backtest", post(post_backtest))
         .route("/validate", post(post_validate))
@@ -272,9 +286,10 @@ fn router(state: AppState, origins: Vec<HeaderValue>, limits: Limits) -> Router 
         .route("/kill-switch", post(kill_switch))
         .route("/kill-switch/clear", post(clear_kill_switch))
         .with_state(state)
+        .layer(Extension(templates))
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(Extension(Arc::new(limits)))
-        .layer(cors)
+        .layer(cors))
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
@@ -311,6 +326,26 @@ impl ApiFailure {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn list_templates(
+    Extension(templates): Extension<Arc<crate::templates::TemplateCatalog>>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({ "templates": templates.all() }))
+}
+
+async fn get_template(
+    Extension(templates): Extension<Arc<crate::templates::TemplateCatalog>>,
+    Path(id): Path<String>,
+) -> Response {
+    match templates.get(&id) {
+        Some(template) => (StatusCode::OK, Json(template)).into_response(),
+        None => err_json(
+            StatusCode::NOT_FOUND,
+            format!("unknown strategy template: {id}"),
+        )
+        .into_response(),
+    }
 }
 
 /// Compare without returning early on the first differing byte.
@@ -2256,6 +2291,78 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         assert_eq!(v["status"], "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn templates_list_detail_and_not_found_are_read_only() {
+        let dir = temp_dir("templates_routes");
+        let router = app(test_state(dir.clone()));
+
+        let res = router
+            .clone()
+            .oneshot(Request::get("/templates").body(Body::empty()).unwrap())
+            .await
+            .expect("list templates");
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let templates = body["templates"].as_array().expect("template list");
+        assert_eq!(templates.len(), 6);
+        let ids: std::collections::HashSet<&str> = templates
+            .iter()
+            .map(|template| template["id"].as_str().expect("template ID"))
+            .collect();
+        assert_eq!(ids.len(), templates.len());
+        assert!(templates.iter().all(|template| {
+            template["strategy"].is_object()
+                && template["suggested_walk_forward_parameter_grid"].is_array()
+        }));
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get("/templates/ema-crossover-trend")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("get template");
+        assert_eq!(res.status(), StatusCode::OK);
+        let detail = body_json(res).await;
+        assert_eq!(detail["id"], "ema-crossover-trend");
+        assert_eq!(detail["strategy"]["entry"]["all"][0]["left"]["ind"], "ema");
+
+        let res = router
+            .oneshot(
+                Request::get("/templates/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unknown template");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(res).await["error"],
+            "unknown strategy template: does-not-exist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_template_catalog_prevents_router_startup() {
+        let dir = temp_dir("invalid_templates");
+        let mut templates: serde_json::Value =
+            serde_json::from_str(include_str!("../templates.json")).expect("template data");
+        templates[0]["strategy"]["entry"] = serde_json::json!({"all": [], "any": []});
+        let headers = crate::config::parse_origins(DEFAULT_ORIGIN).expect("valid origin");
+
+        let startup = router_with_template_json(
+            test_state(dir.clone()),
+            headers,
+            Limits::default(),
+            &templates.to_string(),
+        );
+        assert!(matches!(startup, Err(ApiError::Templates(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

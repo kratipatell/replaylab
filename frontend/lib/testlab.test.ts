@@ -4,6 +4,7 @@ import {
   MAX_CHART_POINTS,
   PARTIAL_LOAD_NOTE,
   type SeriesPoint,
+  applyTemplateStrategy,
   buildRequest,
   defaultForm,
   describeStaleInputs,
@@ -16,7 +17,8 @@ import {
   seriesX,
   strategyToForm,
 } from "./testlab";
-import type { Strategy } from "./api";
+import type { Strategy, StrategyTemplate } from "./api";
+import templateResponse from "./__fixtures__/templates/response.json";
 
 function maxDrawdown(values: number[]): number {
   return Math.max(...drawdownPct(values));
@@ -99,6 +101,45 @@ describe("downsampleNullable", () => {
       { i: 4, v: 0 },
     ]);
     expect(downsampleNullable([null, null], 10)).toEqual([]);
+  });
+});
+
+describe("applyTemplateStrategy", () => {
+  it("loads strategy fields while preserving dates, costs, and hold-back settings", () => {
+    const templates = templateResponse as unknown as { templates: StrategyTemplate[] };
+    const template = templates.templates[0];
+    if (template === undefined) {
+      throw new Error("template fixture is empty");
+    }
+    const current = {
+      ...defaultForm(),
+      preset: "custom" as const,
+      customStart: "2025-01-01T00:00",
+      customEnd: "2025-06-01T00:00",
+      split: "20",
+      feeBps: "12",
+      slippageBps: "9",
+    };
+
+    const loaded = applyTemplateStrategy(current, template);
+
+    expect(loaded.asset).toBe(template.strategy.asset);
+    expect(loaded.timeframe).toBe(template.recommended_timeframe);
+    expect(loaded.side).toBe(template.strategy.side);
+    expect(loaded.entry.all).toHaveLength(template.strategy.entry.all.length);
+    expect(loaded.stopLoss).toBe("");
+    expect(loaded.takeProfit).toBe("");
+    expect(loaded.entry.all.every((rule) => rule.left.period !== "null")).toBe(true);
+    expect(loaded.preset).toBe("custom");
+    expect(loaded.customStart).toBe(current.customStart);
+    expect(loaded.customEnd).toBe(current.customEnd);
+    expect(loaded.split).toBe("20");
+    expect(loaded.feeBps).toBe("12");
+    expect(loaded.slippageBps).toBe("9");
+
+    const edited = { ...loaded, stopLoss: "2.5" };
+    expect(edited.stopLoss).toBe("2.5");
+    expect(edited.feeBps).toBe(current.feeBps);
   });
 });
 

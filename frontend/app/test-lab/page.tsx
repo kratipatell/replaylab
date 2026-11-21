@@ -7,13 +7,16 @@ import {
   listRuns,
   postBacktest,
   postValidate,
+  listTemplates,
   type BacktestRequest,
   type BacktestResponse,
   type CrossMarket,
   type RunSummary,
   type SavedRun,
+  type StrategyTemplate,
 } from "@/lib/api";
 import {
+  applyTemplateStrategy,
   buildRequest,
   defaultForm,
   describeStaleInputs,
@@ -33,6 +36,7 @@ import EquityCharts, { MonthlyTable } from "@/components/EquityCharts";
 import SavedRuns from "@/components/SavedRuns";
 import StatsTable from "@/components/StatsTable";
 import TradesTable from "@/components/TradesTable";
+import TemplatePicker from "@/components/TemplatePicker";
 import VerdictCard from "@/components/VerdictCard";
 import WalkForwardPanel from "@/components/WalkForwardPanel";
 
@@ -66,6 +70,50 @@ export default function TestLab() {
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedError, setSavedError] = useState<string | null>(null);
   const [loadNote, setLoadNote] = useState<string | null>(null);
+  const [templates, setTemplates] = useState<StrategyTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [templateSelection, setTemplateSelection] = useState<{
+    template: StrategyTemplate;
+  } | null>(null);
+
+  const refreshTemplates = useCallback(async (): Promise<void> => {
+    setTemplatesLoading(true);
+    setTemplatesError(null);
+    try {
+      setTemplates(await listTemplates());
+    } catch (e) {
+      setTemplates([]);
+      setTemplatesError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTemplatesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    listTemplates()
+      .then((loaded) => {
+        if (!cancelled) {
+          setTemplates(loaded);
+        }
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setTemplates([]);
+          setTemplatesError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTemplatesLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshRuns = useCallback(async (): Promise<void> => {
     setRunsLoading(true);
@@ -167,6 +215,13 @@ export default function TestLab() {
     }
   };
 
+  const handleTemplateSelect = (template: StrategyTemplate): void => {
+    setForm((current) => applyTemplateStrategy(current, template));
+    setSelectedTemplateId(template.id);
+    setTemplateSelection({ template });
+    setLoadNote(null);
+  };
+
   const selectRun = useCallback(async (id: number): Promise<void> => {
     setMode("single");
     setSelectedId(id);
@@ -241,6 +296,15 @@ export default function TestLab() {
         </p>
       )}
 
+      <TemplatePicker
+        templates={templates}
+        loading={templatesLoading}
+        error={templatesError}
+        selectedId={selectedTemplateId}
+        onSelect={handleTemplateSelect}
+        onRetry={() => void refreshTemplates()}
+      />
+
       <div role="tablist" aria-label="Test type" className="flex gap-2 border-b border-[var(--border)]">
         {MODE_TABS.map((tab) => (
           <button
@@ -268,7 +332,11 @@ export default function TestLab() {
         aria-labelledby="tab-walk-forward"
         hidden={mode !== "walk-forward"}
       >
-        <WalkForwardPanel form={form} onFormChange={handleFormChange} />
+        <WalkForwardPanel
+          form={form}
+          onFormChange={handleFormChange}
+          templateSelection={templateSelection}
+        />
       </div>
 
       {mode === "single" && (

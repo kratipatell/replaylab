@@ -55,6 +55,23 @@ export interface BacktestRequest {
   split?: number;
 }
 
+export interface SuggestedTemplateParameter {
+  target: string;
+  kind: "int" | "float";
+  values: number[];
+}
+
+export interface StrategyTemplate {
+  id: string;
+  name: string;
+  description: string;
+  market_idea: string;
+  typical_failure_mode: string;
+  recommended_timeframe: string;
+  suggested_walk_forward_parameter_grid: SuggestedTemplateParameter[];
+  strategy: Strategy;
+}
+
 export interface Stats {
   trades: number;
   wins: number;
@@ -454,6 +471,15 @@ export function postBacktest(
     body: JSON.stringify(body),
     signal,
   });
+}
+
+export async function listTemplates(): Promise<StrategyTemplate[]> {
+  const body = await request<{ templates: StrategyTemplate[] }>("/templates");
+  return body.templates;
+}
+
+export function getTemplate(id: string): Promise<StrategyTemplate> {
+  return request<StrategyTemplate>(`/templates/${encodeURIComponent(id)}`);
 }
 
 export function postValidate(

@@ -2,13 +2,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   createAgent,
+  getTemplate,
   getAgentDecisions,
   getAllAgentEquity,
+  listTemplates,
   listAgents,
   postWalkForward,
   type WalkForwardRequest,
+  type StrategyTemplate,
 } from "./api";
 import { sampleWalkForwardReport } from "./walkforward.fixture";
+import capturedTemplates from "./__fixtures__/templates/response.json";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -183,5 +187,28 @@ describe("walk-forward API client", () => {
     const controller = new AbortController();
     controller.abort();
     await expect(postWalkForward(body, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+describe("strategy template API client", () => {
+  const templates = (capturedTemplates as unknown as { templates: StrategyTemplate[] }).templates;
+
+  it("lists templates from the engine response wrapper", async () => {
+    const fetchMock = stubFetch(async () => jsonResponse({ templates }));
+    await expect(listTemplates()).resolves.toEqual(templates);
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(String(url)).toMatch(/\/templates$/);
+    expect(init?.method).toBeUndefined();
+  });
+
+  it("loads one template by its encoded ID", async () => {
+    const template = templates[0];
+    if (template === undefined) {
+      throw new Error("captured template response is empty");
+    }
+    const fetchMock = stubFetch(async () => jsonResponse(template));
+    await expect(getTemplate(template.id)).resolves.toEqual(template);
+    const [url] = fetchMock.mock.calls[0] ?? [];
+    expect(String(url)).toMatch(new RegExp(`/templates/${template.id}$`));
   });
 });

@@ -1,0 +1,416 @@
+{
+  "templates": [
+    {
+      "description": "A long-only trend template that enters when a faster exponential average crosses above a slower one and exits on the reverse cross. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "ema-crossover-trend",
+      "market_idea": "A sustained move may keep the fast average above the slow average after a trend begins.",
+      "name": "EMA crossover trend",
+      "recommended_timeframe": "4h",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "ema",
+                "period": 12
+              },
+              "op": "crosses_above",
+              "right": {
+                "ind": "ema",
+                "period": 26
+              }
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [
+            {
+              "left": {
+                "ind": "ema",
+                "period": 12
+              },
+              "op": "crosses_below",
+              "right": {
+                "ind": "ema",
+                "period": 26
+              }
+            }
+          ],
+          "any": []
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "4h"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.left.period",
+          "values": [
+            8.0,
+            12.0,
+            16.0
+          ]
+        },
+        {
+          "kind": "int",
+          "target": "entry.all.0.right.period",
+          "values": [
+            20.0,
+            26.0,
+            40.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "Sideways prices can create repeated crossovers and whipsaw losses; both averages also react after price has already moved."
+    },
+    {
+      "description": "A long-only trend template that enters when a faster simple average crosses above a slower simple average and exits on the reverse cross. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "sma-crossover-trend",
+      "market_idea": "A broad price move may persist long enough for the faster average to lead the slower average.",
+      "name": "SMA crossover trend",
+      "recommended_timeframe": "1d",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "sma",
+                "period": 10
+              },
+              "op": "crosses_above",
+              "right": {
+                "ind": "sma",
+                "period": 30
+              }
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [
+            {
+              "left": {
+                "ind": "sma",
+                "period": 10
+              },
+              "op": "crosses_below",
+              "right": {
+                "ind": "sma",
+                "period": 30
+              }
+            }
+          ],
+          "any": []
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "1d"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.left.period",
+          "values": [
+            8.0,
+            10.0,
+            15.0
+          ]
+        },
+        {
+          "kind": "int",
+          "target": "entry.all.0.right.period",
+          "values": [
+            20.0,
+            30.0,
+            50.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "Moving averages lag turning points and can alternate rapidly when price has no sustained direction."
+    },
+    {
+      "description": "A long-only mean-reversion template that enters below an RSI threshold and exits after RSI rises through a higher threshold. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "rsi-mean-reversion",
+      "market_idea": "A sharp decline may partly reverse when recent losses ease and momentum returns toward its middle range.",
+      "name": "RSI oversold reversion",
+      "recommended_timeframe": "1h",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": "<",
+              "right": 30.0
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": ">",
+              "right": 55.0
+            }
+          ],
+          "any": []
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "1h"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.left.period",
+          "values": [
+            7.0,
+            14.0,
+            21.0
+          ]
+        },
+        {
+          "kind": "float",
+          "target": "entry.all.0.right",
+          "values": [
+            20.0,
+            25.0,
+            30.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "A persistent decline can keep RSI oversold while the position continues losing; an oversold reading alone does not establish a floor."
+    },
+    {
+      "description": "A long-only momentum template that enters when RSI crosses above a center threshold and exits when it crosses back below. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "rsi-midline-momentum",
+      "market_idea": "Momentum moving from below to above a chosen center can be used as a simple direction filter.",
+      "name": "RSI midline momentum",
+      "recommended_timeframe": "1h",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": "crosses_above",
+              "right": 50.0
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": "crosses_below",
+              "right": 50.0
+            }
+          ],
+          "any": []
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "1h"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.left.period",
+          "values": [
+            7.0,
+            14.0,
+            21.0
+          ]
+        },
+        {
+          "kind": "float",
+          "target": "entry.all.0.right",
+          "values": [
+            45.0,
+            50.0,
+            55.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "The center-line signal can lag abrupt reversals and produce false starts when price oscillates around the threshold."
+    },
+    {
+      "description": "A long-only pullback template that requires price above a long simple average while RSI is below a pullback threshold; it exits if the trend filter fails or RSI reaches its exit threshold. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "trend-filtered-rsi-pullback",
+      "market_idea": "A temporary momentum dip inside a longer-term uptrend may be a continuation setup rather than a trend reversal.",
+      "name": "Trend-filtered RSI pullback",
+      "recommended_timeframe": "4h",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "close",
+                "period": null
+              },
+              "op": ">",
+              "right": {
+                "ind": "sma",
+                "period": 50
+              }
+            },
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": "<",
+              "right": 40.0
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [],
+          "any": [
+            {
+              "left": {
+                "ind": "close",
+                "period": null
+              },
+              "op": "crosses_below",
+              "right": {
+                "ind": "sma",
+                "period": 50
+              }
+            },
+            {
+              "left": {
+                "ind": "rsi",
+                "period": 14
+              },
+              "op": "crosses_above",
+              "right": 60.0
+            }
+          ]
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "4h"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.right.period",
+          "values": [
+            30.0,
+            50.0,
+            100.0
+          ]
+        },
+        {
+          "kind": "int",
+          "target": "entry.all.1.left.period",
+          "values": [
+            7.0,
+            14.0,
+            21.0
+          ]
+        },
+        {
+          "kind": "float",
+          "target": "entry.all.1.right",
+          "values": [
+            35.0,
+            40.0,
+            45.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "The trend filter can turn down late, and a pullback can deepen into a full reversal before RSI recovers."
+    },
+    {
+      "description": "A long-only mean-reversion template that enters when price crosses below its simple average and exits after price crosses back above it. Use it as a starting point; backtest results are simulations, not promises of future performance.",
+      "id": "price-sma-reversion",
+      "market_idea": "A move back toward a recent average can provide a simple reference for testing short-horizon reversions.",
+      "name": "Price-to-SMA reversion",
+      "recommended_timeframe": "1h",
+      "strategy": {
+        "asset": "BTCUSDT",
+        "claim": null,
+        "entry": {
+          "all": [
+            {
+              "left": {
+                "ind": "close",
+                "period": null
+              },
+              "op": "crosses_below",
+              "right": {
+                "ind": "sma",
+                "period": 20
+              }
+            }
+          ],
+          "any": []
+        },
+        "exit": {
+          "all": [
+            {
+              "left": {
+                "ind": "close",
+                "period": null
+              },
+              "op": "crosses_above",
+              "right": {
+                "ind": "sma",
+                "period": 20
+              }
+            }
+          ],
+          "any": []
+        },
+        "side": "long",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "timeframe": "1h"
+      },
+      "suggested_walk_forward_parameter_grid": [
+        {
+          "kind": "int",
+          "target": "entry.all.0.right.period",
+          "values": [
+            10.0,
+            20.0,
+            30.0
+          ]
+        }
+      ],
+      "typical_failure_mode": "In a sustained selloff, price may remain below its average or continue falling before it crosses back."
+    }
+  ]
+}
