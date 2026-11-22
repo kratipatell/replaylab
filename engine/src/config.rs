@@ -14,6 +14,7 @@ pub struct Config {
     pub max_optimizer_jobs: usize,
     pub backtest_timeout_secs: u64,
     pub admin_token: Option<String>,
+    pub demo_mode: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +29,9 @@ pub fn parse_origins(raw: &str) -> Result<Vec<HeaderValue>, String> {
         .map(|part| {
             if part.is_empty() {
                 return Err(format!("empty origin in {raw:?}"));
+            }
+            if part.contains('*') {
+                return Err("wildcard origins are not allowed; list explicit origins".to_string());
             }
             part.parse()
                 .map_err(|e: axum::http::header::InvalidHeaderValue| e.to_string())
@@ -45,6 +49,19 @@ fn parse_u64_in(raw: Option<String>, default: u64, min: u64, max: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_bool(raw: Option<String>, default: bool) -> bool {
+    match raw
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("true" | "1" | "yes" | "on") => true,
+        Some("false" | "0" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Config, ConfigError> {
         Self::from_lookup(|key| std::env::var(key).ok())
@@ -57,7 +74,7 @@ impl Config {
         let db_path = get("DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| cache_dir.join("runs.db"));
-        let base_url = get("BINANCE_BASE_URL");
+        let base_url = get("BINANCE_BASE_URL").filter(|value| !value.trim().is_empty());
         let origins_raw =
             get("ALLOWED_ORIGINS").unwrap_or_else(|| "http://localhost:3000".to_string());
         parse_origins(&origins_raw).map_err(ConfigError::BadOrigins)?;
@@ -76,6 +93,7 @@ impl Config {
             max_optimizer_jobs: parse_or(get("MAX_OPTIMIZER_JOBS"), 2),
             backtest_timeout_secs: parse_u64_in(get("BACKTEST_TIMEOUT_SECS"), 60, 5, 600),
             admin_token,
+            demo_mode: parse_bool(get("DEMO_MODE"), false),
         })
     }
 }
@@ -106,6 +124,7 @@ mod tests {
         assert_eq!(cfg.optimize_per_min, 5);
         assert_eq!(cfg.max_optimizer_jobs, 2);
         assert_eq!(cfg.admin_token, None);
+        assert!(!cfg.demo_mode);
     }
 
     #[test]
@@ -121,6 +140,7 @@ mod tests {
             ("OPTIMIZE_RATE_PER_MIN", "3"),
             ("MAX_OPTIMIZER_JOBS", "4"),
             ("ADMIN_TOKEN", "s3cret"),
+            ("DEMO_MODE", "true"),
         ]))
         .expect("overrides");
         assert_eq!(cfg.host, "0.0.0.0");
@@ -133,6 +153,7 @@ mod tests {
         assert_eq!(cfg.optimize_per_min, 3);
         assert_eq!(cfg.max_optimizer_jobs, 4);
         assert_eq!(cfg.admin_token.as_deref(), Some("s3cret"));
+        assert!(cfg.demo_mode);
     }
 
     #[test]
@@ -168,6 +189,22 @@ mod tests {
     fn empty_origin_is_rejected() {
         let cfg = Config::from_lookup(lookup(&[("ALLOWED_ORIGINS", "http://ok.example,")]));
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn wildcard_origin_is_rejected() {
+        for origin in ["*", "https://*.example.com"] {
+            let cfg = Config::from_lookup(lookup(&[("ALLOWED_ORIGINS", origin)]));
+            assert!(matches!(cfg, Err(ConfigError::BadOrigins(_))), "{origin}");
+        }
+    }
+
+    #[test]
+    fn invalid_demo_mode_fails_closed() {
+        for raw in ["", "maybe", "enabled"] {
+            let cfg = Config::from_lookup(lookup(&[("DEMO_MODE", raw)])).expect("defaults");
+            assert!(!cfg.demo_mode, "raw = {raw:?}");
+        }
     }
 
     #[test]

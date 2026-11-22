@@ -39,6 +39,7 @@ pub struct AgentSummary {
     pub last_price: Option<f64>,
     pub last_ts: Option<i64>,
     pub last_error: Option<String>,
+    pub is_sample: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,23 @@ pub struct AgentStopWrite<'a> {
     pub last_price: f64,
     pub last_ts: i64,
     pub snapshot: &'a str,
+    pub decisions: &'a [DecisionEvent],
+    pub equity_points: &'a [crate::agent::EquityPoint],
+}
+
+pub struct DemoAgentSeed<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub created_at: i64,
+    pub started_at: i64,
+    pub stopped_at: i64,
+    pub strategy: &'a serde_json::Value,
+    pub initial_equity: f64,
+    pub equity: f64,
+    pub last_price: f64,
+    pub last_ts: i64,
+    pub snapshot: &'a str,
+    pub risk: &'a RiskLimits,
     pub decisions: &'a [DecisionEvent],
     pub equity_points: &'a [crate::agent::EquityPoint],
 }
@@ -135,7 +153,8 @@ CREATE TABLE IF NOT EXISTS agents (
     last_error TEXT,
     owner_id TEXT NOT NULL DEFAULT 'local',
     risk TEXT NOT NULL DEFAULT '',
-    kill_switch INTEGER NOT NULL DEFAULT 0
+    kill_switch INTEGER NOT NULL DEFAULT 0,
+    is_sample INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -176,6 +195,8 @@ const ADD_AGENTS_ERROR: &str = "ALTER TABLE agents ADD COLUMN last_error TEXT";
 const ADD_AGENTS_RISK: &str = "ALTER TABLE agents ADD COLUMN risk TEXT NOT NULL DEFAULT ''";
 const ADD_AGENTS_KILL: &str =
     "ALTER TABLE agents ADD COLUMN kill_switch INTEGER NOT NULL DEFAULT 0";
+const ADD_AGENTS_SAMPLE: &str =
+    "ALTER TABLE agents ADD COLUMN is_sample INTEGER NOT NULL DEFAULT 0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -324,6 +345,7 @@ impl Db {
         add_column(conn, "agents", "last_error", ADD_AGENTS_ERROR)?;
         add_column(conn, "agents", "risk", ADD_AGENTS_RISK)?;
         add_column(conn, "agents", "kill_switch", ADD_AGENTS_KILL)?;
+        add_column(conn, "agents", "is_sample", ADD_AGENTS_SAMPLE)?;
         // Every existing agent trades under the default caps.
         let default_risk = serde_json::to_string(&RiskLimits::default())
             .map_err(|e| DbError::Init(e.to_string()))?;
@@ -508,6 +530,53 @@ impl Db {
         Ok(())
     }
 
+    pub fn seed_demo_agent(&self, seed: DemoAgentSeed<'_>) -> Result<bool, DbError> {
+        let risk_json =
+            serde_json::to_string(seed.risk).map_err(|e| DbError::CreateAgent(e.to_string()))?;
+        let mut conn = self.conn.lock().map_err(|e| DbError::Lock(e.to_string()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DbError::CreateAgent(e.to_string()))?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO agents
+                    (id, name, status, strategy, run_id, created_at, started_at,
+                     stopped_at, equity, initial_equity, last_price, last_ts,
+                     snapshot, owner_id, risk, kill_switch, is_sample)
+                 VALUES (?1, ?2, 'stopped', ?3, NULL, ?4, ?5, ?6, ?7, ?8,
+                         ?9, ?10, ?11, 'local', ?12, 0, 1)",
+                params![
+                    seed.id,
+                    seed.name,
+                    seed.strategy.to_string(),
+                    seed.created_at,
+                    seed.started_at,
+                    seed.stopped_at,
+                    seed.equity,
+                    seed.initial_equity,
+                    seed.last_price,
+                    seed.last_ts,
+                    seed.snapshot,
+                    risk_json,
+                ],
+            )
+            .map_err(|e| DbError::CreateAgent(e.to_string()))?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        for decision in seed.decisions {
+            insert_agent_decision(&tx, seed.id, decision, decision.seq)
+                .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        }
+        replace_agent_equity(&tx, seed.id, seed.equity_points)
+            .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        trim_agent_decisions(&tx, seed.id).map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        trim_agent_equity(&tx, seed.id).map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| DbError::AgentHistory(e.to_string()))?;
+        Ok(true)
+    }
+
     fn agent_summary_from_row(row: &rusqlite::Row) -> rusqlite::Result<AgentSummary> {
         let strategy_txt: String = row.get(3)?;
         let strategy: serde_json::Value =
@@ -534,6 +603,7 @@ impl Db {
             last_price: row.get(9)?,
             last_ts: row.get(10)?,
             last_error: row.get(11)?,
+            is_sample: row.get(12)?,
         })
     }
 
@@ -542,7 +612,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, status, strategy, run_id, created_at, started_at,
-                        stopped_at, equity, last_price, last_ts, last_error
+                        stopped_at, equity, last_price, last_ts, last_error, is_sample
                  FROM agents ORDER BY created_at DESC, id DESC",
             )
             .map_err(|e| DbError::ListAgents(e.to_string()))?;
@@ -562,7 +632,7 @@ impl Db {
             .prepare(
                 "SELECT id, name, status, strategy, run_id, created_at, started_at,
                         stopped_at, equity, last_price, last_ts, last_error,
-                        initial_equity, snapshot, risk, kill_switch
+                        is_sample, initial_equity, snapshot, risk, kill_switch
                  FROM agents WHERE id = ?1",
             )
             .map_err(|e| DbError::GetAgent(e.to_string()))?;
@@ -570,15 +640,15 @@ impl Db {
             .query_map(params![id], |row| {
                 let summary = Self::agent_summary_from_row(row)?;
                 let strategy_txt: String = row.get(3)?;
-                let risk_txt: String = row.get(14)?;
+                let risk_txt: String = row.get(15)?;
                 Ok(AgentRow {
                     summary,
                     strategy: serde_json::from_str(&strategy_txt)
                         .unwrap_or(serde_json::Value::Null),
-                    initial_equity: row.get(12)?,
-                    snapshot: row.get(13)?,
+                    initial_equity: row.get(13)?,
+                    snapshot: row.get(14)?,
                     risk: serde_json::from_str(&risk_txt).unwrap_or_default(),
-                    kill_switch: row.get::<_, i64>(15)? != 0,
+                    kill_switch: row.get::<_, i64>(16)? != 0,
                 })
             })
             .map_err(|e| DbError::GetAgent(e.to_string()))?;
@@ -952,10 +1022,12 @@ mod tests {
         assert_eq!(agents[0].symbol, "BTCUSDT");
         assert_eq!(agents[0].interval, "1h");
         assert_eq!(agents[0].equity, 10_000.0);
+        assert!(!agents[0].is_sample);
 
         let row = db.get_agent("ag-1").expect("get").expect("exists");
         assert_eq!(row.strategy, strategy_json());
         assert_eq!(row.initial_equity, 10_000.0);
+        assert!(!row.summary.is_sample);
         assert!(row.snapshot.is_none());
         assert_eq!(row.risk, RiskLimits::default());
         assert!(!row.kill_switch);

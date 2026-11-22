@@ -368,7 +368,7 @@ export default function TestLab() {
 
           {engineError !== null && !loading && (
             <div role="alert" className="flex flex-col gap-1 rounded border border-[var(--verdict-fails)] p-3 text-sm">
-              <p className="font-semibold">The test engine rejected this idea:</p>
+              <p className="font-semibold">The test engine could not complete this request:</p>
               <p>{engineError}</p>
               <p className="text-[var(--muted)]">{fixHint(engineError)}</p>
             </div>

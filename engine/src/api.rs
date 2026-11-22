@@ -1,9 +1,11 @@
 use axum::{
+    body::Body,
     extract::{
         rejection::JsonRejection, rejection::QueryRejection, ConnectInfo, DefaultBodyLimit,
         Extension, Path, Query, State,
     },
-    http::{request::Parts, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{request::Parts, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -37,6 +39,7 @@ pub struct Limits {
     pub optimize: Arc<RateLimiter>,
     pub max_optimizer_jobs: usize,
     pub backtest_timeout: Duration,
+    pub demo_mode: bool,
 }
 
 struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
@@ -54,11 +57,17 @@ impl Limits {
             optimize: Arc::new(RateLimiter::per_minute(optimize_per_min)),
             max_optimizer_jobs,
             backtest_timeout: Duration::from_secs(DEFAULT_BACKTEST_TIMEOUT_SECS),
+            demo_mode: false,
         }
     }
 
     pub fn with_backtest_timeout(mut self, secs: u64) -> Self {
         self.backtest_timeout = Duration::from_secs(secs);
+        self
+    }
+
+    pub fn with_demo_mode(mut self, enabled: bool) -> Self {
+        self.demo_mode = enabled;
         self
     }
 }
@@ -289,6 +298,7 @@ fn router_with_template_json(
         .layer(Extension(templates))
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(Extension(Arc::new(limits)))
+        .layer(middleware::from_fn(log_request))
         .layer(cors))
 }
 
@@ -325,7 +335,74 @@ impl ApiFailure {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn route_label(path: &str) -> &'static str {
+    match path {
+        "/health" => "/health",
+        "/templates" => "/templates",
+        "/candles" => "/candles",
+        "/backtest" => "/backtest",
+        "/validate" => "/validate",
+        "/walk-forward" => "/walk-forward",
+        "/optimize" => "/optimize",
+        "/runs" => "/runs",
+        "/agents" => "/agents",
+        "/kill-switch" => "/kill-switch",
+        "/kill-switch/clear" => "/kill-switch/clear",
+        path if path.starts_with("/templates/") => "/templates/{id}",
+        path if path.starts_with("/optimize/") => "/optimize/{job_id}",
+        path if path.starts_with("/runs/") => "/runs/{id}",
+        path if path.starts_with("/agents/") && path.ends_with("/decisions") => {
+            "/agents/{id}/decisions"
+        }
+        path if path.starts_with("/agents/") && path.ends_with("/equity") => "/agents/{id}/equity",
+        path if path.starts_with("/agents/") && path.ends_with("/start") => "/agents/{id}/start",
+        path if path.starts_with("/agents/") && path.ends_with("/stop") => "/agents/{id}/stop",
+        path if path.starts_with("/agents/") && path.ends_with("/advance") => {
+            "/agents/{id}/advance"
+        }
+        path if path.starts_with("/agents/") && path.ends_with("/reset") => "/agents/{id}/reset",
+        path if path.starts_with("/agents/") => "/agents/{id}",
+        _ => "/unmatched",
+    }
+}
+
+fn log_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+async fn log_request(request: Request<Body>, next: Next) -> Response {
+    let method = log_method(request.method());
+    let route = route_label(request.uri().path());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "http_request",
+            "method": method,
+            "route": route,
+            "status": response.status().as_u16(),
+            "duration_ms": started.elapsed().as_millis(),
+        })
+    );
+    response
+}
+
+fn demo_read_only(limits: &Limits) -> Option<Response> {
+    limits
+        .demo_mode
+        .then(|| err_json(StatusCode::FORBIDDEN, "Demo mode: agents are read-only").into_response())
 }
 
 async fn list_templates(
@@ -1521,8 +1598,12 @@ async fn get_agent_equity(
 
 async fn post_agent(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
     body: Result<Json<CreateAgentBody>, JsonRejection>,
 ) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     let body = match body {
         Ok(Json(body)) => body,
         Err(e) => return err_json(e.status(), e.to_string()).into_response(),
@@ -1596,6 +1677,9 @@ async fn start_agent(
     Path(id): Path<String>,
     body: Result<Json<StartAgentBody>, JsonRejection>,
 ) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     let body = match body {
         Ok(Json(body)) => body,
         Err(e) => return err_json(e.status(), e.to_string()).into_response(),
@@ -1794,7 +1878,14 @@ async fn start_agent(
     }
 }
 
-async fn stop_agent(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn stop_agent(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     let row = match agent_or_404(&state, &id) {
         Ok(row) => row,
         Err(e) => return e.into_response(),
@@ -1856,6 +1947,9 @@ async fn advance_agent(
     Path(id): Path<String>,
     body: Result<Json<AdvanceAgentBody>, JsonRejection>,
 ) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     let body = match body {
         Ok(Json(body)) => body,
         Err(e) => return err_json(e.status(), e.to_string()).into_response(),
@@ -2043,7 +2137,14 @@ fn update_snapshot(
 
 /// Operator stop for every agent. Open positions flatten at the next open:
 /// a frozen position is risk the operator cannot see or close.
-async fn kill_switch(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn kill_switch(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     if let Err(e) = admin_gate(&state, &headers) {
         return e.into_response();
     }
@@ -2075,7 +2176,14 @@ async fn kill_switch(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 /// Lift the kill switch. Other halts (daily loss, drawdown) keep their state.
-async fn clear_kill_switch(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn clear_kill_switch(
+    State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     if let Err(e) = admin_gate(&state, &headers) {
         return e.into_response();
     }
@@ -2110,9 +2218,13 @@ async fn clear_kill_switch(State(state): State<AppState>, headers: HeaderMap) ->
 /// halt. A scheduled flatten is left alone.
 async fn reset_agent(
     State(state): State<AppState>,
+    Extension(limits): Extension<Arc<Limits>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    if let Some(response) = demo_read_only(&limits) {
+        return response;
+    }
     if let Err(e) = admin_gate(&state, &headers) {
         return e.into_response();
     }
@@ -2291,7 +2403,135 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v.as_object().map(serde_json::Map::len), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn demo_mode_blocks_agent_mutations_but_keeps_reads_available() {
+        let dir = temp_dir("demo_mode");
+        let router = app_with_limits(
+            test_state(dir.clone()),
+            DEFAULT_ORIGIN,
+            Limits::default().with_demo_mode(true),
+        )
+        .expect("demo router");
+        let mutations = [
+            ("POST", "/agents"),
+            ("POST", "/agents/demo-agent/start"),
+            ("POST", "/agents/demo-agent/stop"),
+            ("POST", "/agents/demo-agent/advance"),
+            ("POST", "/agents/demo-agent/reset"),
+            ("POST", "/kill-switch"),
+            ("POST", "/kill-switch/clear"),
+        ];
+        for (method, path) in mutations {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(
+                body_json(response).await["error"],
+                "Demo mode: agents are read-only",
+                "{method} {path}"
+            );
+        }
+
+        for path in [
+            "/agents",
+            "/agents/demo-agent",
+            "/agents/demo-agent/decisions",
+            "/agents/demo-agent/equity",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_ne!(response.status(), StatusCode::FORBIDDEN, "GET {path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sample_marker_is_serialized_for_seeded_agents_in_list_and_detail() {
+        let dir = temp_dir("sample_marker");
+        let state = test_state(dir.clone());
+        crate::demo::seed_demo_agents(&state.db).expect("seed sample agents");
+        state
+            .db
+            .create_agent(
+                "ordinary-agent",
+                "Ordinary agent",
+                &valid_strategy(),
+                None,
+                crate::agent::DEFAULT_INITIAL_EQUITY,
+                &crate::risk::RiskLimits::default(),
+            )
+            .expect("create regular agent");
+        let router = app(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/agents")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let summaries = body_json(response).await["agents"]
+            .as_array()
+            .expect("agents list")
+            .clone();
+        let sample = summaries
+            .iter()
+            .find(|agent| agent["id"] == "demo-ema-trend")
+            .expect("sample summary");
+        let ordinary = summaries
+            .iter()
+            .find(|agent| agent["id"] == "ordinary-agent")
+            .expect("ordinary summary");
+        assert_eq!(sample["is_sample"], true);
+        assert_eq!(ordinary["is_sample"], false);
+
+        for (id, expected) in [("demo-ema-trend", true), ("ordinary-agent", false)] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/agents/{id}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["agent"]["is_sample"], expected);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_log_route_labels_never_include_path_values() {
+        assert_eq!(route_label("/agents/private-token"), "/agents/{id}");
+        assert_eq!(
+            route_label("/agents/private-token/decisions"),
+            "/agents/{id}/decisions"
+        );
+        assert_eq!(route_label("/unknown/private-token"), "/unmatched");
+        assert_eq!(
+            log_method(&Method::from_bytes(b"PRIVATE-TOKEN").unwrap()),
+            "OTHER"
+        );
     }
 
     #[tokio::test]

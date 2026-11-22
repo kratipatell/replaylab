@@ -1,0 +1,9 @@
+.git
+target
+**/target
+**/node_modules
+frontend/.next
+**/.cache
+**/.env
+**/.env.*
+!**/.env.example
