@@ -25,7 +25,11 @@ import {
 import { fmtDateTime, fmtNum } from "../lib/testlab";
 import DecisionLog from "./DecisionLog";
 import EquityCharts from "./EquityCharts";
-import { AgentHaltSummary, AgentStatusBadge } from "./AgentStatus";
+import {
+  AgentHaltSummary,
+  AgentSampleBadge,
+  AgentStatusBadge,
+} from "./AgentStatus";
 
 type Action = "start" | "stop" | "advance";
 
@@ -188,6 +192,7 @@ export default function AgentDetailView({ id }: { id: string }) {
           <div className="flex flex-col gap-1">
             <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-xl font-bold">{agent.agent.name}</h1>
+              <AgentSampleBadge isSample={agent.agent.is_sample} />
               <AgentStatusBadge status={agent.agent.status} halt={agent.halt} />
             </div>
             <p className="text-sm text-[var(--muted)]">{strategyDescription(agent.strategy)}</p>

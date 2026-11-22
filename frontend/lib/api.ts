@@ -346,6 +346,7 @@ export interface AgentSummary {
   last_price: number | null;
   last_ts: number | null;
   last_error: string | null;
+  is_sample: boolean;
 }
 
 export interface AgentPosition {

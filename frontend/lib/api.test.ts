@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   createAgent,
+  getAgent,
   getTemplate,
   getAgentDecisions,
   getAllAgentEquity,
@@ -10,9 +11,13 @@ import {
   postWalkForward,
   type WalkForwardRequest,
   type StrategyTemplate,
+  type AgentDetail,
+  type AgentSummary,
 } from "./api";
 import { sampleWalkForwardReport } from "./walkforward.fixture";
 import capturedTemplates from "./__fixtures__/templates/response.json";
+import capturedSampleAgentDetail from "./__fixtures__/agents/detail-sample.json";
+import capturedSampleAgentList from "./__fixtures__/agents/list.json";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -49,6 +54,7 @@ describe("agent API client", () => {
           last_price: 102,
           last_ts: 3,
           last_error: null,
+          is_sample: false,
         }],
       }),
     );
@@ -57,6 +63,25 @@ describe("agent API client", () => {
     expect(agents).toHaveLength(1);
     expect(agents[0]?.status).toBe("running");
     expect(agents[0]?.equity).toBe(10_200);
+  });
+
+  it("reads sample markers from captured engine list and detail responses", async () => {
+    const summaries = (
+      capturedSampleAgentList as unknown as { agents: AgentSummary[] }
+    ).agents;
+    const detail = capturedSampleAgentDetail as unknown as AgentDetail;
+    const fetchMock = stubFetch(async (input) =>
+      String(input).endsWith("/agents")
+        ? jsonResponse({ agents: summaries })
+        : jsonResponse(detail),
+    );
+
+    await expect(listAgents()).resolves.toEqual(summaries);
+    await expect(getAgent("demo-ema-trend")).resolves.toEqual(detail);
+    expect(summaries).toHaveLength(3);
+    expect(summaries.every((agent) => agent.is_sample)).toBe(true);
+    expect(detail.agent.is_sample).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("posts typed creation data and parses the created detail", async () => {
@@ -210,5 +235,17 @@ describe("strategy template API client", () => {
     await expect(getTemplate(template.id)).resolves.toEqual(template);
     const [url] = fetchMock.mock.calls[0] ?? [];
     expect(String(url)).toMatch(new RegExp(`/templates/${template.id}$`));
+  });
+});
+
+describe("engine connectivity errors", () => {
+  it("explains how to recover when the configured engine URL is unreachable", async () => {
+    stubFetch(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+
+    await expect(listAgents()).rejects.toThrow(
+      /Could not reach the test engine at http:\/\/127\.0\.0\.1:8080\. Is it running\?/,
+    );
   });
 });

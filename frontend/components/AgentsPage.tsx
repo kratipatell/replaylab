@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import AgentForm from "./AgentForm";
-import { AgentStatusBadge } from "./AgentStatus";
+import { AgentSampleBadge, AgentStatusBadge } from "./AgentStatus";
 import { createAgent, getAgent, listAgents, type AgentSummary, type HaltLimit, type Strategy } from "../lib/api";
 import { strategyDescription } from "../lib/agents";
 import { fmtNum } from "../lib/testlab";
@@ -135,7 +135,10 @@ export default function AgentsPage() {
                   className="flex min-h-24 flex-col gap-3 rounded border border-[var(--border)] bg-[var(--surface)] p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)] sm:flex-row sm:items-center sm:justify-between"
                 >
                   <div className="flex min-w-0 flex-col gap-1">
-                    <span className="font-semibold">{summary.name}</span>
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold">{summary.name}</span>
+                      <AgentSampleBadge isSample={summary.is_sample} />
+                    </span>
                     <span className="truncate text-sm text-[var(--muted)]">
                       {strategy === null
                         ? `${summary.symbol} · ${summary.interval}`

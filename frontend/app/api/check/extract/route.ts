@@ -33,6 +33,13 @@ function stripFences(raw: string): string {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  if (process.env.CHECK_API_ENABLED !== "true") {
+    return error(
+      "Check is disabled on this deployment. Enable it on the server to use Gemini.",
+      503,
+    );
+  }
+
   const ip = forwardedIp(req.headers.get("x-forwarded-for"));
   const decision = takeDailyHit(Date.now(), hits, ip, dailyLimit());
   if (!decision.allowed) {

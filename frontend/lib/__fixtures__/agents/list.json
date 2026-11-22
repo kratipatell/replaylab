@@ -1,0 +1,52 @@
+{
+    "agents": [
+        {
+            "created_at": 1700000000,
+            "equity": 10000.0,
+            "id": "demo-trend-pullback",
+            "interval": "4h",
+            "is_sample": true,
+            "last_error": null,
+            "last_price": 116.75130949715391,
+            "last_ts": 1701292400000,
+            "name": "Demo \u00b7 Trend pullback",
+            "run_id": null,
+            "started_at": 1700000000,
+            "status": "stopped",
+            "stopped_at": 1701292400,
+            "symbol": "BTCUSDT"
+        },
+        {
+            "created_at": 1700000000,
+            "equity": 16609.98625280608,
+            "id": "demo-rsi-reversion",
+            "interval": "1h",
+            "is_sample": true,
+            "last_error": null,
+            "last_price": 116.75130949715391,
+            "last_ts": 1701292400000,
+            "name": "Demo \u00b7 RSI reversion",
+            "run_id": null,
+            "started_at": 1700000000,
+            "status": "stopped",
+            "stopped_at": 1701292400,
+            "symbol": "BTCUSDT"
+        },
+        {
+            "created_at": 1700000000,
+            "equity": 7997.949894033079,
+            "id": "demo-ema-trend",
+            "interval": "4h",
+            "is_sample": true,
+            "last_error": null,
+            "last_price": 116.75130949715391,
+            "last_ts": 1701292400000,
+            "name": "Demo \u00b7 EMA trend",
+            "run_id": null,
+            "started_at": 1700000000,
+            "status": "stopped",
+            "stopped_at": 1701292400,
+            "symbol": "BTCUSDT"
+        }
+    ]
+}

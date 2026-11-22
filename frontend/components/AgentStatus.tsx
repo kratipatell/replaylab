@@ -25,6 +25,17 @@ export function AgentStatusBadge({
   );
 }
 
+export function AgentSampleBadge({ isSample }: { isSample: boolean }) {
+  if (!isSample) {
+    return null;
+  }
+  return (
+    <span className="inline-flex min-h-8 items-center rounded border border-[var(--verdict-fragile)] px-2 text-xs font-semibold text-[var(--verdict-fragile)]">
+      Sample data, not a live run
+    </span>
+  );
+}
+
 function configuredLimit(risk: RiskLimits, halt: HaltLimit): number | null {
   switch (halt) {
     case "DailyLoss":
