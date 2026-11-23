@@ -16,7 +16,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::Duration,
@@ -26,6 +26,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::ratelimit::RateLimiter;
 
 const DEFAULT_BACKTEST_TIMEOUT_SECS: u64 = 60;
+const MARKET_DATA_LOADING: &str = "market data is still loading, retry shortly";
 const BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const ADMIN_HEADER: &str = "x-admin-token";
 const DEFAULT_DECISIONS_LIMIT: i64 = 100;
@@ -40,6 +41,7 @@ pub struct Limits {
     pub max_optimizer_jobs: usize,
     pub backtest_timeout: Duration,
     pub demo_mode: bool,
+    pub prewarm_done: Arc<AtomicBool>,
 }
 
 struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
@@ -58,6 +60,7 @@ impl Limits {
             max_optimizer_jobs,
             backtest_timeout: Duration::from_secs(DEFAULT_BACKTEST_TIMEOUT_SECS),
             demo_mode: false,
+            prewarm_done: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -68,6 +71,11 @@ impl Limits {
 
     pub fn with_demo_mode(mut self, enabled: bool) -> Self {
         self.demo_mode = enabled;
+        self
+    }
+
+    pub fn with_prewarm_done(mut self, done: Arc<AtomicBool>) -> Self {
+        self.prewarm_done = done;
         self
     }
 }
@@ -334,10 +342,12 @@ impl ApiFailure {
     }
 }
 
-async fn health() -> impl IntoResponse {
+async fn health(Extension(limits): Extension<Arc<Limits>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "demo_mode": limits.demo_mode,
+        "prewarm_done": limits.prewarm_done.load(Ordering::Acquire),
     }))
 }
 
@@ -690,16 +700,23 @@ fn run_backtest(
     source: &dyn crate::feeds::KlineSource,
     strategy: &crate::strategy::Strategy,
     req: &SimRequest,
+    fetch_complete: Option<&AtomicBool>,
 ) -> Result<BacktestParts, BacktestFailure> {
-    let candles = crate::feeds::load_or_fetch(
+    if let Some(fetch_complete) = fetch_complete {
+        fetch_complete.store(false, Ordering::Release);
+    }
+    let loaded = crate::feeds::load_or_fetch(
         cache_dir,
         source,
         &req.symbol,
         &req.interval,
         req.start,
         req.end,
-    )
-    .map_err(|e| BacktestFailure::Upstream(e.to_string()))?;
+    );
+    if let Some(fetch_complete) = fetch_complete {
+        fetch_complete.store(true, Ordering::Release);
+    }
+    let candles = loaded.map_err(|e| BacktestFailure::Upstream(e.to_string()))?;
     if candles.is_empty() {
         return Err(BacktestFailure::BadRequest(
             "no candles in range".to_string(),
@@ -751,6 +768,7 @@ fn run_validation(
     strategy: &crate::strategy::Strategy,
     params: &SimParams,
     symbols: &[String],
+    fetch_complete: &AtomicBool,
 ) -> Result<crate::validation::CrossMarket, BacktestFailure> {
     let mut markets = Vec::with_capacity(symbols.len());
     let mut unchecked = Vec::new();
@@ -760,7 +778,7 @@ fn run_validation(
         let mut per_market = strategy.clone();
         per_market.asset = symbol.clone();
         let req = params.request_for(symbol);
-        match run_backtest(cache_dir, source, &per_market, &req) {
+        match run_backtest(cache_dir, source, &per_market, &req, Some(fetch_complete)) {
             Ok(parts) => markets.push(crate::validation::MarketCheck {
                 symbol: symbol.clone(),
                 candle_count: parts.candle_count,
@@ -865,20 +883,29 @@ async fn post_backtest(
     let cache_dir = state.cache_dir.clone();
     let strategy = req.strategy.clone();
     let timeout = limits.backtest_timeout;
+    let fetch_complete = Arc::new(AtomicBool::new(false));
+    let worker_fetch_complete = fetch_complete.clone();
     let computed = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || {
-            run_backtest(&cache_dir, source.as_ref(), &strategy, &sim)
+            run_backtest(
+                &cache_dir,
+                source.as_ref(),
+                &strategy,
+                &sim,
+                Some(&worker_fetch_complete),
+            )
         }),
     )
     .await;
     let parts = match computed {
         Err(_) => {
-            return err_json(
-                StatusCode::REQUEST_TIMEOUT,
-                format!("backtest timed out after {}s", timeout.as_secs()),
-            )
-            .into_response();
+            let message = if fetch_complete.load(Ordering::Acquire) {
+                format!("backtest timed out after {}s", timeout.as_secs())
+            } else {
+                MARKET_DATA_LOADING.to_string()
+            };
+            return err_json(StatusCode::REQUEST_TIMEOUT, message).into_response();
         }
         Ok(Err(join)) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, join.to_string()).into_response();
@@ -984,20 +1011,30 @@ async fn post_validate(
     let cache_dir = state.cache_dir.clone();
     let strategy = req.strategy;
     let timeout = limits.backtest_timeout;
+    let fetch_complete = Arc::new(AtomicBool::new(false));
+    let worker_fetch_complete = fetch_complete.clone();
     let computed = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || {
-            run_validation(&cache_dir, source.as_ref(), &strategy, &params, &symbols)
+            run_validation(
+                &cache_dir,
+                source.as_ref(),
+                &strategy,
+                &params,
+                &symbols,
+                &worker_fetch_complete,
+            )
         }),
     )
     .await;
     let cross = match computed {
         Err(_) => {
-            return err_json(
-                StatusCode::REQUEST_TIMEOUT,
-                format!("validation timed out after {}s", timeout.as_secs()),
-            )
-            .into_response();
+            let message = if fetch_complete.load(Ordering::Acquire) {
+                format!("validation timed out after {}s", timeout.as_secs())
+            } else {
+                MARKET_DATA_LOADING.to_string()
+            };
+            return err_json(StatusCode::REQUEST_TIMEOUT, message).into_response();
         }
         Ok(Err(join)) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, join.to_string()).into_response();
@@ -1059,9 +1096,12 @@ async fn post_walk_forward(
     let timeout = limits.backtest_timeout;
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let fetch_complete = Arc::new(AtomicBool::new(false));
+    let worker_fetch_complete = fetch_complete.clone();
     let computed = tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || {
+            worker_fetch_complete.store(false, Ordering::Release);
             let candles = crate::feeds::load_or_fetch(
                 &cache_dir,
                 source.as_ref(),
@@ -1071,6 +1111,7 @@ async fn post_walk_forward(
                 end,
             )
             .map_err(|error| BacktestFailure::Upstream(error.to_string()))?;
+            worker_fetch_complete.store(true, Ordering::Release);
             if candles.is_empty() {
                 return Err(BacktestFailure::BadRequest(
                     "no candles in range".to_string(),
@@ -1089,11 +1130,12 @@ async fn post_walk_forward(
     .await;
     let report = match computed {
         Err(_) => {
-            return err_json(
-                StatusCode::REQUEST_TIMEOUT,
-                format!("walk-forward timed out after {}s", timeout.as_secs()),
-            )
-            .into_response();
+            let message = if fetch_complete.load(Ordering::Acquire) {
+                format!("walk-forward timed out after {}s", timeout.as_secs())
+            } else {
+                MARKET_DATA_LOADING.to_string()
+            };
+            return err_json(StatusCode::REQUEST_TIMEOUT, message).into_response();
         }
         Ok(Err(error)) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
@@ -1445,7 +1487,7 @@ async fn load_agent_candles(
     match loaded {
         Err(_) => Err(ApiFailure::new(
             StatusCode::REQUEST_TIMEOUT,
-            format!("agent request timed out after {}s", timeout.as_secs()),
+            MARKET_DATA_LOADING,
         )),
         Ok(Err(join)) => Err(ApiFailure::internal(join.to_string())),
         Ok(Ok(Err(e))) => Err(ApiFailure::new(StatusCode::BAD_GATEWAY, e.to_string())),
@@ -2404,7 +2446,94 @@ mod tests {
         let v = body_json(res).await;
         assert_eq!(v["status"], "ok");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(v.as_object().map(serde_json::Map::len), Some(2));
+        assert_eq!(v["demo_mode"], false);
+        assert_eq!(v["prewarm_done"], true);
+        assert_eq!(v.as_object().map(serde_json::Map::len), Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn health_reports_demo_mode_and_pending_prewarm() {
+        let dir = temp_dir("health_flags");
+        let limits = Limits::default()
+            .with_demo_mode(true)
+            .with_prewarm_done(Arc::new(AtomicBool::new(false)));
+        let response = app_with_limits(test_state(dir.clone()), DEFAULT_ORIGIN, limits)
+            .expect("router")
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["demo_mode"], true);
+        assert_eq!(body["prewarm_done"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cold_backtest_timeout_keeps_fetched_page_and_asks_client_to_retry() {
+        let dir = temp_dir("cold_backtest_timeout");
+        let start = 1_700_000_000_000_i64;
+        let candles: Vec<crate::types::Candle> = (0..300)
+            .map(|index| {
+                let close = 100.0 + (index as f64 * 0.2).sin() * 5.0;
+                crate::types::Candle {
+                    ts: start + index * 3_600_000,
+                    open: close,
+                    high: close + 1.0,
+                    low: close - 1.0,
+                    close,
+                }
+            })
+            .collect();
+        let source_started = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(DelayedSource {
+            candles: candles.clone(),
+            started: source_started.clone(),
+        });
+        let mut state = test_state(dir.clone());
+        state.source = source;
+        let limits = Limits {
+            backtest_timeout: Duration::from_millis(25),
+            ..Limits::default()
+        };
+        let router = app_with_limits(state, DEFAULT_ORIGIN, limits).expect("router");
+        let body = serde_json::json!({
+            "strategy": valid_strategy(),
+            "start_ms": candles.first().expect("first candle").ts,
+            "end_ms": candles.last().expect("last candle").ts,
+        });
+        let request = Request::post("/backtest")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let pending = tokio::spawn(async move { router.oneshot(request).await.expect("response") });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !source_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fetch started");
+        let response = pending.await.expect("request task");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body_json(response).await["error"], MARKET_DATA_LOADING);
+
+        let cache_path = dir.join("BTCUSDT_1h.csv");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cache_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking fetch completes and persists the page");
+        let cached = std::fs::read_to_string(&cache_path).expect("cached candles");
+        assert_eq!(cached.lines().count().saturating_sub(1), candles.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2947,6 +3076,32 @@ mod tests {
             _limit: usize,
         ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
             Err(crate::feeds::FeedError::Request("boom".to_string()))
+        }
+    }
+
+    struct DelayedSource {
+        candles: Vec<crate::types::Candle>,
+        started: Arc<AtomicBool>,
+    }
+
+    impl crate::feeds::KlineSource for DelayedSource {
+        fn fetch(
+            &self,
+            _symbol: &str,
+            _interval: &str,
+            start_ms: i64,
+            end_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<crate::types::Candle>, crate::feeds::FeedError> {
+            self.started.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(self
+                .candles
+                .iter()
+                .filter(|candle| candle.ts >= start_ms && candle.ts <= end_ms)
+                .take(limit)
+                .copied()
+                .collect())
         }
     }
 

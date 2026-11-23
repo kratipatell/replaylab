@@ -36,6 +36,27 @@ export function AgentSampleBadge({ isSample }: { isSample: boolean }) {
   );
 }
 
+export function DemoModeBanner() {
+  return (
+    <div
+      role="status"
+      className="rounded border border-[var(--verdict-fragile)] bg-[var(--surface)] p-3 text-sm"
+    >
+      Demo mode is on. Agent data is read-only; create, start, stop, and advance
+      are disabled.
+    </div>
+  );
+}
+
+export function AgentWarmupNote() {
+  return (
+    <p className="text-xs text-[var(--muted)]">
+      Trades made during warm-up are not in the decision log; it starts when the
+      agent starts.
+    </p>
+  );
+}
+
 function configuredLimit(risk: RiskLimits, halt: HaltLimit): number | null {
   switch (halt) {
     case "DailyLoss":

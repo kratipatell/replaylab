@@ -3,6 +3,7 @@ import {
   ApiError,
   createAgent,
   getAgent,
+  getHealth,
   getTemplate,
   getAgentDecisions,
   getAllAgentEquity,
@@ -18,6 +19,7 @@ import { sampleWalkForwardReport } from "./walkforward.fixture";
 import capturedTemplates from "./__fixtures__/templates/response.json";
 import capturedSampleAgentDetail from "./__fixtures__/agents/detail-sample.json";
 import capturedSampleAgentList from "./__fixtures__/agents/list.json";
+import capturedHealth from "./__fixtures__/health/response.json";
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -247,5 +249,21 @@ describe("engine connectivity errors", () => {
     await expect(listAgents()).rejects.toThrow(
       /Could not reach the test engine at http:\/\/127\.0\.0\.1:8080\. Is it running\?/,
     );
+  });
+});
+
+describe("engine health API", () => {
+  it("reads demo and prewarm state from a captured engine response", async () => {
+    const health = capturedHealth as {
+      status: "ok";
+      version: string;
+      demo_mode: boolean;
+      prewarm_done: boolean;
+    };
+    stubFetch(async () => jsonResponse(health));
+
+    await expect(getHealth()).resolves.toEqual(health);
+    expect(health.demo_mode).toBe(true);
+    expect(health.prewarm_done).toBe(true);
   });
 });

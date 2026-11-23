@@ -4,8 +4,16 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import AgentForm from "./AgentForm";
-import { AgentSampleBadge, AgentStatusBadge } from "./AgentStatus";
-import { createAgent, getAgent, listAgents, type AgentSummary, type HaltLimit, type Strategy } from "../lib/api";
+import { AgentSampleBadge, AgentStatusBadge, DemoModeBanner } from "./AgentStatus";
+import {
+  createAgent,
+  getAgent,
+  getHealth,
+  listAgents,
+  type AgentSummary,
+  type HaltLimit,
+  type Strategy,
+} from "../lib/api";
 import { strategyDescription } from "../lib/agents";
 import { fmtNum } from "../lib/testlab";
 
@@ -23,12 +31,23 @@ export default function AgentsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [demoMode, setDemoMode] = useState<boolean | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
     setLoading(true);
     setLoadError(null);
     try {
-      const summaries = await listAgents();
+      const [summariesResult, healthResult] = await Promise.allSettled([
+        listAgents(),
+        getHealth(),
+      ]);
+      setDemoMode(
+        healthResult.status === "fulfilled" ? healthResult.value.demo_mode : null,
+      );
+      if (summariesResult.status === "rejected") {
+        throw summariesResult.reason;
+      }
+      const summaries = summariesResult.value;
       const loaded = await Promise.all(
         summaries.map(async (summary): Promise<AgentListRow> => {
           try {
@@ -69,6 +88,7 @@ export default function AgentsPage() {
   }, [refresh]);
 
   async function handleCreate(body: Parameters<typeof createAgent>[0]): Promise<void> {
+    if (demoMode !== false) return;
     setCreating(true);
     setCreateError(null);
     try {
@@ -98,7 +118,24 @@ export default function AgentsPage() {
         </button>
       </header>
 
-      <AgentForm creating={creating} error={createError} onCreate={(body) => void handleCreate(body)} />
+      {demoMode === true && <DemoModeBanner />}
+      {demoMode === null && (
+        <p role="status" className="text-sm text-[var(--muted)]">
+          Checking engine mode; agent controls are disabled until it is confirmed.
+        </p>
+      )}
+
+      <AgentForm
+        creating={creating}
+        disabled={demoMode !== false}
+        disabledReason={
+          demoMode === true
+            ? "Agent creation is disabled in demo mode."
+            : "Checking engine mode; agent creation is disabled until confirmed."
+        }
+        error={createError}
+        onCreate={(body) => void handleCreate(body)}
+      />
 
       <section className="flex flex-col gap-3" aria-labelledby="agent-list-heading">
         <h2 id="agent-list-heading" className="text-base font-semibold">Your agents</h2>

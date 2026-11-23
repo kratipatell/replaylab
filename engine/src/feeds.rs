@@ -1,5 +1,29 @@
 use crate::types::Candle;
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+pub const DEFAULT_BINANCE_BASE_URL: &str = "https://api.binance.com";
+const YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1_000;
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrewarmSpec {
+    pub symbol: String,
+    pub interval: String,
+    pub years: u32,
+}
+
+pub fn base_host(base_url: &str) -> String {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "invalid".to_string())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {
@@ -71,6 +95,8 @@ pub enum FeedError {
     BadWrite(String),
     #[error("failed to create cache dir: {0}")]
     BadDir(String),
+    #[error("failed to lock cache writes: {0}")]
+    CacheLock(String),
 }
 
 pub fn interval_ms(interval: &str) -> Option<i64> {
@@ -237,7 +263,7 @@ pub struct BinanceSource {
 impl BinanceSource {
     pub fn new() -> Self {
         Self {
-            base_url: "https://api.binance.com".to_string(),
+            base_url: DEFAULT_BINANCE_BASE_URL.to_string(),
         }
     }
 }
@@ -258,6 +284,7 @@ impl KlineSource for BinanceSource {
         limit: usize,
     ) -> Result<Vec<Candle>, FeedError> {
         let url = format!("{}/api/v3/klines", self.base_url.trim_end_matches('/'));
+        let host = base_host(&self.base_url);
         let client = reqwest::blocking::Client::new();
         let resp = client
             .get(&url)
@@ -269,7 +296,11 @@ impl KlineSource for BinanceSource {
                 ("limit", limit.to_string()),
             ])
             .send()
-            .map_err(|e| FeedError::Request(e.to_string()))?;
+            .map_err(|_| {
+                FeedError::Request(format!(
+                    "market data host {host} could not be reached; check BINANCE_BASE_URL"
+                ))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();
@@ -280,6 +311,7 @@ impl KlineSource for BinanceSource {
     }
 }
 
+#[cfg(test)]
 pub fn fetch_range(
     source: &dyn KlineSource,
     symbol: &str,
@@ -287,6 +319,26 @@ pub fn fetch_range(
     start_ms: i64,
     end_ms: i64,
     page_limit: usize,
+) -> Result<Vec<Candle>, FeedError> {
+    fetch_range_with_page_callback(
+        source,
+        symbol,
+        interval,
+        start_ms,
+        end_ms,
+        page_limit,
+        |_| Ok(()),
+    )
+}
+
+fn fetch_range_with_page_callback(
+    source: &dyn KlineSource,
+    symbol: &str,
+    interval: &str,
+    start_ms: i64,
+    end_ms: i64,
+    page_limit: usize,
+    mut on_page: impl FnMut(&[Candle]) -> Result<(), FeedError>,
 ) -> Result<Vec<Candle>, FeedError> {
     validate_symbol(symbol)?;
     let step = interval_ms(interval).ok_or_else(|| FeedError::BadInterval(interval.to_string()))?;
@@ -301,6 +353,7 @@ pub fn fetch_range(
         if page.is_empty() {
             break;
         }
+        on_page(&page)?;
         let n = page.len();
         let last_ts = page.last().map(|c| c.ts).unwrap_or(next_start);
         all.extend(page);
@@ -408,6 +461,58 @@ fn write_cache_file(path: &Path, candles: &[Candle]) -> Result<(), FeedError> {
     Ok(())
 }
 
+fn normalize_candles(candles: &mut Vec<Candle>) {
+    candles.sort_by_key(|candle| candle.ts);
+    candles.dedup_by_key(|candle| candle.ts);
+}
+
+fn persist_cache_page(
+    path: &Path,
+    cached: &mut Vec<Candle>,
+    page: &[Candle],
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<(), FeedError> {
+    let mut page: Vec<Candle> = page
+        .iter()
+        .copied()
+        .filter(|candle| candle.ts >= start_ms && candle.ts <= end_ms)
+        .collect();
+    normalize_candles(&mut page);
+    validate_candles(&page)?;
+    if page.is_empty() {
+        return Ok(());
+    }
+    let _guard = CACHE_WRITE_LOCK
+        .lock()
+        .map_err(|error| FeedError::CacheLock(error.to_string()))?;
+    let mut merged = read_cache_file(path).unwrap_or_else(|_| cached.clone());
+    merged.extend(page);
+    normalize_candles(&mut merged);
+    validate_candles(&merged)?;
+    write_cache_file(path, &merged)?;
+    *cached = merged;
+    Ok(())
+}
+
+fn missing_ranges(cached: &[Candle], start_ms: i64, end_ms: i64, step: i64) -> Vec<(i64, i64)> {
+    let (Some(first), Some(last)) = (cached.first(), cached.last()) else {
+        return vec![(start_ms, end_ms)];
+    };
+    let mut ranges = Vec::with_capacity(2);
+    if first.ts > start_ms {
+        let prefix_end = first.ts.saturating_sub(step).min(end_ms);
+        if start_ms <= prefix_end {
+            ranges.push((start_ms, prefix_end));
+        }
+    }
+    let suffix_start = last.ts.saturating_add(step).max(start_ms);
+    if suffix_start <= end_ms {
+        ranges.push((suffix_start, end_ms));
+    }
+    ranges
+}
+
 pub fn load_or_fetch(
     cache_dir: &Path,
     source: &dyn KlineSource,
@@ -429,33 +534,107 @@ pub fn load_or_fetch(
     }
     std::fs::create_dir_all(cache_dir).map_err(|e| FeedError::BadDir(e.to_string()))?;
     let path = cache_path(cache_dir, symbol, interval);
-    if path.exists() {
-        if let Ok(cached) = read_cache_file(&path) {
-            if !cached.is_empty() {
-                let first = cached.first().map(|c| c.ts).unwrap_or(i64::MAX);
-                let last = cached.last().map(|c| c.ts).unwrap_or(i64::MIN);
-                if first <= start_ms && last.saturating_add(step) >= effective_end {
-                    let sliced: Vec<Candle> = cached
-                        .into_iter()
-                        .filter(|c| c.ts >= start_ms && c.ts <= effective_end)
-                        .collect();
-                    return Ok(sliced);
+    let mut cached = path
+        .exists()
+        .then(|| read_cache_file(&path).ok())
+        .flatten()
+        .unwrap_or_default();
+    if let (Some(first), Some(last)) = (cached.first(), cached.last()) {
+        if first.ts <= start_ms && last.ts.saturating_add(step) >= effective_end {
+            return Ok(cached
+                .into_iter()
+                .filter(|candle| candle.ts >= start_ms && candle.ts <= effective_end)
+                .collect());
+        }
+    }
+    for (missing_start, missing_end) in missing_ranges(&cached, start_ms, effective_end, step) {
+        fetch_range_with_page_callback(
+            source,
+            symbol,
+            interval,
+            missing_start,
+            missing_end,
+            1000,
+            |page| persist_cache_page(&path, &mut cached, page, missing_start, missing_end),
+        )?;
+    }
+    Ok(cached
+        .into_iter()
+        .filter(|candle| candle.ts >= start_ms && candle.ts <= effective_end)
+        .collect())
+}
+
+pub fn prewarm_cache(
+    cache_dir: &Path,
+    source: &dyn KlineSource,
+    spec: &PrewarmSpec,
+) -> Result<usize, FeedError> {
+    let end_ms = now_ms();
+    let years_ms = (spec.years as i64).saturating_mul(YEAR_MS);
+    let candles = load_or_fetch(
+        cache_dir,
+        source,
+        &spec.symbol,
+        &spec.interval,
+        end_ms.saturating_sub(years_ms),
+        end_ms,
+    )?;
+    Ok(candles.len())
+}
+
+pub fn spawn_prewarm(
+    cache_dir: PathBuf,
+    source: Arc<dyn KlineSource + Send + Sync>,
+    specs: Vec<PrewarmSpec>,
+) -> Arc<AtomicBool> {
+    let done = Arc::new(AtomicBool::new(specs.is_empty()));
+    if specs.is_empty() {
+        return done;
+    }
+    let task_done = done.clone();
+    drop(tokio::task::spawn_blocking(move || {
+        let mut succeeded = true;
+        for spec in specs {
+            match prewarm_cache(&cache_dir, source.as_ref(), &spec) {
+                Ok(count) => println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "cache_prewarm_complete",
+                        "symbol": spec.symbol,
+                        "interval": spec.interval,
+                        "candles": count,
+                    })
+                ),
+                Err(error) => {
+                    succeeded = false;
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "cache_prewarm_failed",
+                            "symbol": spec.symbol,
+                            "interval": spec.interval,
+                            "error": error.to_string(),
+                        })
+                    );
                 }
             }
         }
-    }
-    let fetched = fetch_range(source, symbol, interval, start_ms, effective_end, 1000)?;
-    if fetched.is_empty() {
-        return Ok(fetched);
-    }
-    write_cache_file(&path, &fetched)?;
-    Ok(fetched)
+        task_done.store(succeeded, Ordering::Release);
+    }));
+    done
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        },
+        time::Duration,
+    };
 
     struct FakeSource {
         data: Vec<Candle>,
@@ -491,6 +670,73 @@ mod tests {
         }
     }
 
+    struct PageSource {
+        data: Vec<Candle>,
+        calls: AtomicUsize,
+        fail_on_call: Option<usize>,
+    }
+
+    impl PageSource {
+        fn new(data: Vec<Candle>, fail_on_call: Option<usize>) -> Self {
+            Self {
+                data,
+                calls: AtomicUsize::new(0),
+                fail_on_call,
+            }
+        }
+    }
+
+    impl KlineSource for PageSource {
+        fn fetch(
+            &self,
+            _symbol: &str,
+            _interval: &str,
+            start_ms: i64,
+            end_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fail_on_call == Some(call) {
+                return Err(FeedError::Request("temporary page failure".to_string()));
+            }
+            Ok(self
+                .data
+                .iter()
+                .filter(|candle| candle.ts >= start_ms && candle.ts <= end_ms)
+                .take(limit)
+                .copied()
+                .collect())
+        }
+    }
+
+    struct BarrierSource {
+        data: Vec<Candle>,
+        calls: AtomicUsize,
+        barrier: Arc<Barrier>,
+    }
+
+    impl KlineSource for BarrierSource {
+        fn fetch(
+            &self,
+            _symbol: &str,
+            _interval: &str,
+            start_ms: i64,
+            end_ms: i64,
+            limit: usize,
+        ) -> Result<Vec<Candle>, FeedError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.barrier.wait();
+            }
+            Ok(self
+                .data
+                .iter()
+                .filter(|candle| candle.ts >= start_ms && candle.ts <= end_ms)
+                .take(limit)
+                .copied()
+                .collect())
+        }
+    }
+
     fn mk_candle(ts: i64, open: f64) -> Candle {
         Candle {
             ts,
@@ -505,6 +751,28 @@ mod tests {
         (0..10)
             .map(|i| mk_candle(i * 60_000, 100.0 + i as f64))
             .collect()
+    }
+
+    #[test]
+    fn unreachable_binance_error_names_host_and_configuration_override() {
+        let source = BinanceSource {
+            base_url: "http://127.0.0.1:1".to_string(),
+        };
+        let error = source
+            .fetch("BTCUSDT", "1h", 1_700_000_000_000, 1_700_003_600_000, 1)
+            .expect_err("closed local port");
+        let message = error.to_string();
+        assert!(message.contains("127.0.0.1"), "{message}");
+        assert!(message.contains("BINANCE_BASE_URL"), "{message}");
+    }
+
+    #[test]
+    fn base_host_omits_credentials_and_path() {
+        assert_eq!(
+            base_host("https://user:secret@data-api.binance.vision/custom/path"),
+            "data-api.binance.vision"
+        );
+        assert_eq!(base_host("not a url"), "invalid");
     }
 
     #[test]
@@ -629,6 +897,75 @@ mod tests {
             calls_after_first,
             "second call should not hit the source"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_fetch_persists_each_page_and_retry_resumes_from_the_cache() {
+        let data: Vec<Candle> = (0..2_005)
+            .map(|index| mk_candle(index * 60_000, 100.0 + index as f64))
+            .collect();
+        let end = data.last().expect("fixture candle").ts;
+        let dir =
+            std::env::temp_dir().join(format!("marketdata_incremental_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let interrupted = PageSource::new(data.clone(), Some(2));
+
+        let failure = load_or_fetch(&dir, &interrupted, "BTCUSDT", "1m", 0, end)
+            .expect_err("second page fails");
+        assert!(failure.to_string().contains("temporary page failure"));
+        let cached = read_cache_file(&dir.join("BTCUSDT_1m.csv")).expect("partial cache");
+        assert_eq!(cached.len(), 1_000);
+        assert_eq!(cached.last().map(|candle| candle.ts), Some(999 * 60_000));
+
+        let retry = PageSource::new(data, None);
+        let candles = load_or_fetch(&dir, &retry, "BTCUSDT", "1m", 0, end)
+            .expect("retry fills the remaining pages");
+        assert_eq!(candles.len(), 2_005);
+        assert_eq!(retry.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(candles.first().map(|candle| candle.ts), Some(0));
+        assert_eq!(candles.last().map(|candle| candle.ts), Some(end));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prewarm_runs_in_background_and_cache_hits_are_idempotent() {
+        let step = 86_400_000_i64;
+        let latest_closed = latest_closed_open_ts(now_ms(), step);
+        let first = latest_closed - 366 * step;
+        let data: Vec<Candle> = (0..=366)
+            .map(|index| mk_candle(first + index * step, 100.0 + index as f64))
+            .collect();
+        let barrier = Arc::new(Barrier::new(2));
+        let source = Arc::new(BarrierSource {
+            data,
+            calls: AtomicUsize::new(0),
+            barrier: barrier.clone(),
+        });
+        let source_for_prewarm: Arc<dyn KlineSource + Send + Sync> = source.clone();
+        let dir = std::env::temp_dir().join(format!("marketdata_prewarm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = PrewarmSpec {
+            symbol: "BTCUSDT".to_string(),
+            interval: "1d".to_string(),
+            years: 1,
+        };
+
+        let done = spawn_prewarm(dir.clone(), source_for_prewarm, vec![spec.clone()]);
+        assert!(!done.load(Ordering::Acquire));
+        barrier.wait();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !done.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prewarm completes");
+
+        let calls_after_prewarm = source.calls.load(Ordering::Relaxed);
+        assert!(calls_after_prewarm > 0);
+        assert!(prewarm_cache(&dir, source.as_ref(), &spec).expect("cache hit") > 0);
+        assert_eq!(source.calls.load(Ordering::Relaxed), calls_after_prewarm);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -101,6 +101,11 @@ describe("agent form validation", () => {
       stop: false,
       advance: false,
     });
+    expect(agentControlAvailability("running", null, false, true)).toEqual({
+      start: false,
+      stop: false,
+      advance: false,
+    });
   });
 
   it("updates from a successful action and then refetches the detail views", async () => {

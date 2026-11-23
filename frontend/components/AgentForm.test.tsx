@@ -16,4 +16,19 @@ describe("AgentForm server validation feedback", () => {
       .replaceAll("&amp;", "&");
     expect(visibleText).toContain(message);
   });
+
+  it("disables the create controls when the engine is in demo mode", () => {
+    const html = renderToStaticMarkup(
+      <AgentForm
+        creating={false}
+        disabled
+        disabledReason="Agent creation is disabled in demo mode."
+        error={null}
+        onCreate={() => undefined}
+      />,
+    );
+    expect(html).toContain("Agent creation is disabled in demo mode.");
+    expect(html).toContain('id="agent-name"');
+    expect(html).toContain("disabled=\"\"");
+  });
 });

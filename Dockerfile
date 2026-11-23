@@ -23,10 +23,12 @@ RUN apt-get update \
 
 COPY --from=builder --chown=replaylab:replaylab /app/target/release/engine /usr/local/bin/engine
 
+# Override BINANCE_BASE_URL with https://data-api.binance.vision if api.binance.com is blocked.
 ENV HOST=0.0.0.0 \
     PORT=8080 \
     CACHE_DIR=/data/cache \
-    DB_PATH=/data/runs.db
+    DB_PATH=/data/runs.db \
+    BINANCE_BASE_URL=https://api.binance.com
 
 VOLUME ["/data"]
 EXPOSE 8080

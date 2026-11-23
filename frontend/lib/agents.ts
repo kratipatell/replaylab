@@ -115,12 +115,13 @@ export function agentControlAvailability(
   status: AgentStatus,
   halt: HaltLimit | null,
   busy: boolean,
+  readOnly = false,
 ): AgentControlAvailability {
   const running = status === "running";
   return {
-    start: !busy && !running && halt === null,
-    stop: !busy && running,
-    advance: !busy && running,
+    start: !readOnly && !busy && !running && halt === null,
+    stop: !readOnly && !busy && running,
+    advance: !readOnly && !busy && running,
   };
 }
 

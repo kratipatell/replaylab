@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use axum::http::HeaderValue;
@@ -15,12 +16,17 @@ pub struct Config {
     pub backtest_timeout_secs: u64,
     pub admin_token: Option<String>,
     pub demo_mode: bool,
+    pub prewarm: Vec<crate::feeds::PrewarmSpec>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("invalid ALLOWED_ORIGINS: {0}")]
     BadOrigins(String),
+    #[error(
+        "invalid PREWARM entry {0:?}; expected SYMBOL:interval:years with at most 100000 candles"
+    )]
+    BadPrewarm(String),
 }
 
 pub fn parse_origins(raw: &str) -> Result<Vec<HeaderValue>, String> {
@@ -62,6 +68,43 @@ fn parse_bool(raw: Option<String>, default: bool) -> bool {
     }
 }
 
+fn parse_prewarm(raw: Option<String>) -> Result<Vec<crate::feeds::PrewarmSpec>, ConfigError> {
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    let mut specs = Vec::new();
+    for entry in raw.split(',').map(str::trim) {
+        let mut fields = entry.split(':').map(str::trim);
+        let symbol = fields.next().unwrap_or_default();
+        let interval = fields.next().unwrap_or_default();
+        let years = fields.next().and_then(|value| value.parse::<u32>().ok());
+        if fields.next().is_some()
+            || crate::feeds::validate_symbol(symbol).is_err()
+            || crate::feeds::interval_ms(interval).is_none()
+        {
+            return Err(ConfigError::BadPrewarm(entry.to_string()));
+        }
+        let Some(years) = years.filter(|years| *years > 0) else {
+            return Err(ConfigError::BadPrewarm(entry.to_string()));
+        };
+        let step = crate::feeds::interval_ms(interval).unwrap_or_default() as u128;
+        let candles = years as u128 * 365 * 24 * 60 * 60 * 1_000 / step;
+        if candles > 100_000 {
+            return Err(ConfigError::BadPrewarm(entry.to_string()));
+        }
+        let spec = crate::feeds::PrewarmSpec {
+            symbol: symbol.to_string(),
+            interval: interval.to_string(),
+            years,
+        };
+        if seen.insert(spec.clone()) {
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
+}
+
 impl Config {
     pub fn from_env() -> Result<Config, ConfigError> {
         Self::from_lookup(|key| std::env::var(key).ok())
@@ -75,6 +118,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| cache_dir.join("runs.db"));
         let base_url = get("BINANCE_BASE_URL").filter(|value| !value.trim().is_empty());
+        let prewarm = parse_prewarm(get("PREWARM"))?;
         let origins_raw =
             get("ALLOWED_ORIGINS").unwrap_or_else(|| "http://localhost:3000".to_string());
         parse_origins(&origins_raw).map_err(ConfigError::BadOrigins)?;
@@ -94,6 +138,7 @@ impl Config {
             backtest_timeout_secs: parse_u64_in(get("BACKTEST_TIMEOUT_SECS"), 60, 5, 600),
             admin_token,
             demo_mode: parse_bool(get("DEMO_MODE"), false),
+            prewarm,
         })
     }
 }
@@ -125,6 +170,7 @@ mod tests {
         assert_eq!(cfg.max_optimizer_jobs, 2);
         assert_eq!(cfg.admin_token, None);
         assert!(!cfg.demo_mode);
+        assert!(cfg.prewarm.is_empty());
     }
 
     #[test]
@@ -204,6 +250,45 @@ mod tests {
         for raw in ["", "maybe", "enabled"] {
             let cfg = Config::from_lookup(lookup(&[("DEMO_MODE", raw)])).expect("defaults");
             assert!(!cfg.demo_mode, "raw = {raw:?}");
+        }
+    }
+
+    #[test]
+    fn parses_and_deduplicates_prewarm_entries() {
+        let cfg = Config::from_lookup(lookup(&[(
+            "PREWARM",
+            "BTCUSDT:1h:5, ETHUSDT:4h:2, BTCUSDT:1h:5",
+        )]))
+        .expect("valid prewarm list");
+        assert_eq!(
+            cfg.prewarm,
+            vec![
+                crate::feeds::PrewarmSpec {
+                    symbol: "BTCUSDT".to_string(),
+                    interval: "1h".to_string(),
+                    years: 5,
+                },
+                crate::feeds::PrewarmSpec {
+                    symbol: "ETHUSDT".to_string(),
+                    interval: "4h".to_string(),
+                    years: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_prewarm_entries() {
+        for raw in [
+            "BTCUSDT",
+            "btc:1h:1",
+            "BTCUSDT:2h:1",
+            "BTCUSDT:1m:1",
+            "BTCUSDT:1h:0",
+            "BTCUSDT:1h:many",
+        ] {
+            let cfg = Config::from_lookup(lookup(&[("PREWARM", raw)]));
+            assert!(matches!(cfg, Err(ConfigError::BadPrewarm(_))), "{raw}");
         }
     }
 

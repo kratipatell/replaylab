@@ -7,6 +7,7 @@ import {
   getAgent,
   getAgentDecisions,
   getAllAgentEquity,
+  getHealth,
   startAgent,
   stopAgent,
   type AgentDecision,
@@ -26,9 +27,11 @@ import { fmtDateTime, fmtNum } from "../lib/testlab";
 import DecisionLog from "./DecisionLog";
 import EquityCharts from "./EquityCharts";
 import {
+  DemoModeBanner,
   AgentHaltSummary,
   AgentSampleBadge,
   AgentStatusBadge,
+  AgentWarmupNote,
 } from "./AgentStatus";
 
 type Action = "start" | "stop" | "advance";
@@ -56,6 +59,7 @@ export default function AgentDetailView({ id }: { id: string }) {
   const [busyAction, setBusyAction] = useState<Action | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [demoMode, setDemoMode] = useState<boolean | null>(null);
 
   const loadAgent = useCallback(async (): Promise<void> => {
     setDetailLoading(true);
@@ -107,6 +111,9 @@ export default function AgentDetailView({ id }: { id: string }) {
       loadAgent(),
       loadEquity(),
       loadDecisions(undefined, false),
+      getHealth()
+        .then((health) => setDemoMode(health.demo_mode))
+        .catch(() => setDemoMode(null)),
     ]);
     setRefreshing(false);
   }, [loadAgent, loadDecisions, loadEquity]);
@@ -122,7 +129,7 @@ export default function AgentDetailView({ id }: { id: string }) {
   }, [refreshAll]);
 
   async function runAction(action: Action): Promise<void> {
-    if (agent === null) return;
+    if (agent === null || demoMode !== false) return;
     setBusyAction(action);
     setActionError(null);
     try {
@@ -176,7 +183,12 @@ export default function AgentDetailView({ id }: { id: string }) {
   }
 
   const halted = agent.halt !== null;
-  const controls = agentControlAvailability(agent.agent.status, agent.halt, busyAction !== null);
+  const controls = agentControlAvailability(
+    agent.agent.status,
+    agent.halt,
+    busyAction !== null,
+    demoMode !== false,
+  );
   const haltEvent = findHaltEvent(decisions, agent.halt);
   const decisionRetry = (): void => {
     void loadDecisions(decisionRequest.before, decisionRequest.append);
@@ -210,6 +222,13 @@ export default function AgentDetailView({ id }: { id: string }) {
           </button>
         </div>
       </header>
+
+      {demoMode === true && <DemoModeBanner />}
+      {demoMode === null && (
+        <p role="status" className="text-sm text-[var(--muted)]">
+          Checking engine mode; agent controls are disabled until it is confirmed.
+        </p>
+      )}
 
       {detailError !== null && (
         <div role="alert" className="flex flex-col items-start gap-2 rounded border border-[var(--verdict-fails)] p-3 text-sm">
@@ -255,6 +274,7 @@ export default function AgentDetailView({ id }: { id: string }) {
         <p className="text-xs text-[var(--muted)]">
           Start warms up on at most 100,000 closed bars, within one year of history.
         </p>
+        <AgentWarmupNote />
         {halted && (
           <p className="text-sm text-[var(--verdict-fragile)]">
             {agent.halt === "KillSwitch" ? "Trading is paused by an administrator." : "Risk limits are holding this agent flat."}

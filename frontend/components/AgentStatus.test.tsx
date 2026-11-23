@@ -5,6 +5,8 @@ import {
   AgentHaltSummary,
   AgentSampleBadge,
   AgentStatusBadge,
+  AgentWarmupNote,
+  DemoModeBanner,
 } from "./AgentStatus";
 
 const risk: RiskLimits = {
@@ -49,5 +51,18 @@ describe("agent status UI", () => {
 
     expect(sample).toContain("Sample data, not a live run");
     expect(ordinary).toBe("");
+  });
+
+  it("explains that warm-up trades are omitted from the decision log", () => {
+    const html = renderToStaticMarkup(<AgentWarmupNote />);
+    expect(html).toContain(
+      "Trades made during warm-up are not in the decision log; it starts when the agent starts.",
+    );
+  });
+
+  it("explains that agent controls are disabled in demo mode", () => {
+    const html = renderToStaticMarkup(<DemoModeBanner />);
+    expect(html).toContain("Demo mode is on");
+    expect(html).toContain("create, start, stop, and advance are disabled");
   });
 });

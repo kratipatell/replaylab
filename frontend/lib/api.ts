@@ -72,6 +72,13 @@ export interface StrategyTemplate {
   strategy: Strategy;
 }
 
+export interface EngineHealth {
+  status: "ok";
+  version: string;
+  demo_mode: boolean;
+  prewarm_done: boolean;
+}
+
 export interface Stats {
   trades: number;
   wins: number;
@@ -428,6 +435,10 @@ export class ApiError extends Error {
     this.name = "ApiError";
     this.status = status;
   }
+}
+
+export function getHealth(): Promise<EngineHealth> {
+  return request<EngineHealth>("/health");
 }
 
 async function readError(res: Response): Promise<string> {

@@ -29,10 +29,14 @@ const labelClass = "flex flex-col gap-1.5 text-sm font-medium";
 export default function AgentForm({
   creating,
   error,
+  disabled = false,
+  disabledReason = "Agent creation is disabled until the engine confirms demo mode is off.",
   onCreate,
 }: {
   creating: boolean;
   error: string | null;
+  disabled?: boolean;
+  disabledReason?: string;
   onCreate: (body: CreateAgentRequest) => void;
 }) {
   const [name, setName] = useState("");
@@ -49,6 +53,7 @@ export default function AgentForm({
 
   function submit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
+    if (disabled) return;
     setAttempted(true);
     const trimmedName = name.trim();
     const nextNameError = trimmedName === "" ? "Agent name must not be empty." : null;
@@ -95,6 +100,12 @@ export default function AgentForm({
         </p>
       </div>
 
+      {disabled && (
+        <p role="status" className="text-sm text-[var(--muted)]">
+          {disabledReason}
+        </p>
+      )}
+
       <label className={labelClass} htmlFor="agent-name">
         Name <span className="text-[var(--muted)]">(required)</span>
         <input
@@ -104,6 +115,7 @@ export default function AgentForm({
           autoComplete="name"
           spellCheck={false}
           value={name}
+          disabled={disabled}
           aria-invalid={nameError !== null}
           aria-describedby={nameError === null ? undefined : "agent-name-error"}
           onChange={(event) => {
@@ -119,6 +131,7 @@ export default function AgentForm({
       </label>
 
       <fieldset
+        disabled={disabled}
         className="flex flex-col gap-4"
         aria-invalid={strategyError !== null}
         aria-describedby={strategyError === null ? undefined : "agent-strategy-error"}
@@ -211,7 +224,7 @@ export default function AgentForm({
         </div>
       </fieldset>
 
-      <fieldset className="flex flex-col gap-3 rounded border border-[var(--border)] p-3">
+      <fieldset disabled={disabled} className="flex flex-col gap-3 rounded border border-[var(--border)] p-3">
         <legend className="px-1 text-sm font-semibold">Risk limits</legend>
         <label className="flex min-h-10 items-center gap-2 text-sm">
           <input
@@ -264,7 +277,7 @@ export default function AgentForm({
 
       <button
         type="submit"
-        disabled={creating}
+        disabled={disabled || creating}
         className="min-h-10 w-fit rounded bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent-foreground)] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
       >
         {creating ? "Creating agent…" : "Create agent"}

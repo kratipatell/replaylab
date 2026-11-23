@@ -41,6 +41,17 @@ async fn main() {
         }),
         None => Arc::new(feeds::BinanceSource::new()),
     };
+    let base_url = cfg
+        .base_url
+        .as_deref()
+        .unwrap_or(feeds::DEFAULT_BINANCE_BASE_URL);
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "market_data_source",
+            "host": feeds::base_host(base_url),
+        })
+    );
     let db = match crate::db::Db::open(&cfg.db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -60,6 +71,8 @@ async fn main() {
             }
         }
     }
+    let prewarm_done =
+        feeds::spawn_prewarm(cfg.cache_dir.clone(), source.clone(), cfg.prewarm.clone());
     let state = AppState {
         source,
         cache_dir: cfg.cache_dir.clone(),
@@ -76,7 +89,8 @@ async fn main() {
             cfg.max_optimizer_jobs,
         )
         .with_backtest_timeout(cfg.backtest_timeout_secs)
-        .with_demo_mode(cfg.demo_mode),
+        .with_demo_mode(cfg.demo_mode)
+        .with_prewarm_done(prewarm_done),
     ) {
         Ok(router) => router,
         Err(e) => {

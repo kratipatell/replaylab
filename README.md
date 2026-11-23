@@ -68,7 +68,14 @@ docker run -d --name replaylab-engine --restart unless-stopped \
 Set `ALLOWED_ORIGINS` to the exact HTTPS origin serving the frontend. Put the
 engine behind HTTPS using your hosting provider or reverse proxy, and set
 `NEXT_PUBLIC_API_URL` to that public engine URL. The engine exposes `/health`
-for container health checks.
+for container health checks; it reports the version, demo mode, and whether
+configured cache prewarming has completed.
+
+The container defaults to `BINANCE_BASE_URL=https://api.binance.com`. If that
+host is blocked from your deployment network, set
+`BINANCE_BASE_URL=https://data-api.binance.vision`, Binance's market-data-only
+endpoint. `PREWARM` can start optional cache fills in the background during
+engine startup.
 
 Run **one engine instance only** for a given SQLite database and candle cache.
 SQLite is local-file storage and this deployment is not configured for
@@ -91,13 +98,14 @@ use a `NEXT_PUBLIC_` prefix.
 | `ALLOWED_ORIGINS` | Engine | `http://localhost:3000` | Comma-separated, explicit browser origins. Wildcards are rejected. |
 | `CACHE_DIR` | Engine | `.cache` | Candle cache directory. |
 | `DB_PATH` | Engine | `$CACHE_DIR/runs.db` | SQLite database path. |
-| `BINANCE_BASE_URL` | Engine | Binance public API | Optional Binance-compatible API mirror. |
+| `BINANCE_BASE_URL` | Engine | `https://api.binance.com` | Binance market-data endpoint. Use `https://data-api.binance.vision` when the default host is blocked. |
 | `BACKTEST_RATE_PER_MIN` | Engine | `30` | Backtest requests per minute per IP. |
 | `OPTIMIZE_RATE_PER_MIN` | Engine | `5` | Optimizer requests per minute per IP. |
 | `MAX_OPTIMIZER_JOBS` | Engine | `2` | Concurrent optimizer jobs. |
 | `BACKTEST_TIMEOUT_SECS` | Engine | `60` | Backtest/agent candle-load timeout; accepted range is 5–600. |
 | `ADMIN_TOKEN` | Engine | unset | Enables admin routes when set; send it in `x-admin-token`. Unset means fail closed. |
 | `DEMO_MODE` | Engine | `false` | Seeds three deterministic sample paper agents and rejects agent mutations. |
+| `PREWARM` | Engine | unset | Optional comma-separated `SYMBOL:interval:years` cache requests, e.g. `BTCUSDT:1h:5`. Runs in the background; each entry is capped at 100,000 candles. |
 | `NEXT_PUBLIC_API_URL` | Frontend | `http://127.0.0.1:8080` | Public engine base URL used by browser requests; baked in at build time. |
 | `LLM_PROVIDER` | Frontend server | `gemini` | Check-page provider; only Gemini is supported. |
 | `GEMINI_API_KEY` | Frontend server | unset | Google AI Studio credential for Check. Keep server-side only. |
